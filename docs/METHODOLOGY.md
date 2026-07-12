@@ -97,64 +97,101 @@ So the label uses **only data from `[t+1, t+horizon]`**. By construction, no fea
 
 ## 📐 The split protocol
 
-### Chronological, not random
+> **⚠️ Protocol revision (2026-07-12).** An external audit found the previous
+> evaluation protocol invalid: the split was row-based (one calendar date
+> could appear in two splits — confirmed for 2025-11-10), negatives were
+> undersampled *before* splitting (val/test measured at an artificial 4:1
+> base rate, not natural prevalence), calibration was fit on data the final
+> model had been refit on, the deployment threshold was selected on the test
+> set, tail rows carried false-negative labels, and the cell universe leaked
+> hindsight. All of this is fixed below. **Every metric published before
+> this revision is superseded and must not be quoted**; new numbers are
+> produced by the next training run under the repaired protocol.
+
+### Date-grouped chronological split with purge (whole dates, 4-way)
 
 ```python
-sorted_df = df.sort_values("date")
-n = len(sorted_df)
-train = sorted_df.iloc[: int(n * 0.6)]
-val   = sorted_df.iloc[int(n * 0.6) : int(n * 0.8)]
-test  = sorted_df.iloc[int(n * 0.8) :]
+from eval_protocol import date_grouped_split
+split = date_grouped_split(dates, val_fraction=0.15,
+                           calib_fraction=0.10, test_fraction=0.15,
+                           purge_days=7)
+# [ train ][7d purge][ val ][7d purge][ calib ][7d purge][ test ]
 ```
 
-- **Train:** earliest 60% of timeline (~2025-01-31 → 2025-11-08)
-- **Val:** next 20% (~2025-11-09 → 2026-02-10) — used for early stopping + Platt calibration
-- **Test:** final 20% (~2026-02-11 → 2026-05-14) — never seen during tuning or selection
+- Splits on **whole calendar dates** (fractions of unique-date count) — a
+  date belongs to exactly one split, asserted at runtime.
+- **7 calendar days are dropped entirely** before every boundary, so a
+  training row's 3-day forward label window can never overlap the next
+  split's period.
+- Roles: **train** = fitting (undersampled, weighted) · **val** = early
+  stopping · **calib** = calibration + threshold selection ·
+  **test** = evaluated exactly once, last.
+- Tail rows whose 3-day label window extends past the last observed date
+  are **censored** (removed from all supervised use — their "no fire"
+  labels would really mean "future not observed").
 
-### Time-series cross-validation with gap
+### Purged date-grouped cross-validation
 
 During hyperparameter search:
 
 ```python
-cv = TimeSeriesSplit(n_splits=5, gap=7)
+from eval_protocol import purged_date_folds
+cv = purged_date_folds(train_dates, n_splits=5, purge_days=7)
 ```
 
-- 5 folds, each fold's train-end and val-start separated by **7 days**
-- Prevents leakage from features that look back ≤ 6 days
+sklearn's `TimeSeriesSplit(gap=7)` is **not used**: its `gap` counts *rows*,
+and with thousands of cells per date a 7-row gap is a ~0-day purge. The
+replacement folds are expanding windows over whole dates with a true
+7-calendar-day purge.
 
-### Negative undersampling (training only, never test)
+### Negative undersampling (train partition ONLY)
 
-Positive class is rare (~5% globally). To make training tractable:
+Positive class is rare. To make training tractable:
 
 ```python
-NEG_TO_POS_RATIO = 4   # keep 4 negatives per 1 positive in train+val
+NEG_TO_POS_RATIO = 4   # keep 4 negatives per 1 positive — in TRAIN only
 ```
 
-Test set keeps the **real class distribution** (~3.43%) so reported metrics
-reflect production reality, not the training mix.
+**val, calib, and test are never resampled** — they keep natural prevalence
+so precision, PR-AUC, calibration, and Brier reflect production reality.
+
+### Prediction universe (causal)
+
+A grid cell enters the dataset **from its first FIRMS detection onward**.
+The previous version included every historically-active cell across the full
+date range, which encoded hindsight ("this cell will burn eventually") into
+early negative rows. Documented limitation: cells that have never burned are
+outside the universe — the model cannot flag first-ever fires.
 
 ## 🔧 Calibration
 
-Raw probabilities from the LightGBM ensemble are **not calibrated** — "0.7" might mean "45% in practice". Phase 0.5 added Platt scaling:
+Raw probabilities from the LightGBM ensemble are **not calibrated** — "0.7" might mean "45% in practice". Platt scaling is fit on the **calib partition**: chronologically after val, disjoint from all fitting data, natural prevalence:
 
 ```python
 calibrator = LogisticRegression(C=1.0, solver="lbfgs", max_iter=200)
-calibrator.fit(val_raw_probabilities.reshape(-1, 1), val_labels)
+calibrator.fit(calib_raw_probabilities.reshape(-1, 1), calib_labels)
 # Inference: model.predict_proba(X) → calibrator.predict_proba(raw)
 ```
 
-ECE on validation dropped from **0.3059 → 0.0057** after calibration.
-ECE on held-out test: **0.0216** (excellent — < 0.05).
-
-This means the probability output is **meaningful as a percentage**: a cell at 0.7 probability has a ~70% chance of burning within 3 days, validated on data the calibrator never saw.
+The deployment threshold (F1-optimal) and the map's HIGH/MEDIUM tier cutoffs
+are also selected on calib and **locked before test is touched**. ECE is
+reported on calib (fit quality) and on test (honest generalization measure).
 
 ## 📈 Validation
 
-### 1. Held-out test (single best snapshot)
+### 1. Held-out test (single pass, natural prevalence)
 
-| | AUC | ECE | F1@deploy | Recall@deploy |
-|---|---|---|---|---|
-| Value | **0.8451** | **0.0216** | 0.194 | 0.765 |
+> **Numbers pending.** The values previously published here (AUC 0.8451,
+> ECE 0.0216, …) were measured under the invalidated protocol (undersampled
+> test set, test-selected threshold, leaky split) and have been withdrawn.
+> This table is regenerated by the first training run under the repaired
+> protocol; read the live values from `dataset_info.json → model.test_metrics`.
+
+Reported per run: ROC-AUC, PR-AUC (with the natural base rate alongside),
+Brier score, ECE, precision/recall/F1 at the calib-locked deployment
+threshold, precision@top-K%, and **baseline comparisons** (persistence:
+fired-in-last-3d/7d; per-cell train-period climatology) so the model's
+uplift over trivial strategies is explicit.
 
 ### 2. Rolling monthly evaluation (17 months)
 
@@ -162,13 +199,7 @@ This means the probability output is **meaningful as a percentage**: a cell at 0
 python scripts/rolling_eval.py
 ```
 
-Computes AUC, ECE, F1, precision, recall on a 1-month sliding window across the entire dataset. Output: `outputs/metadata/rolling_eval.json`.
-
-| | AUC mean | std | min | max |
-|---|---|---|---|---|
-| Value | **0.9152** | 0.0640 | 0.8044 | 0.9845 |
-
-This is the **strongest evidence the model isn't overfit to a single time window**.
+Computes AUC, ECE, F1, precision, recall on a 1-month sliding window across the entire dataset. Output: `outputs/metadata/rolling_eval.json`. (Historical rolling numbers predating the protocol revision share the old protocol's flaws — regenerate before quoting.)
 
 ### 3. Retrospective validation (live)
 
@@ -193,12 +224,12 @@ This is why the dashboard headlines **AUC**, **ECE**, **stability**, and **watch
 
 ## 🚫 Things we explicitly do NOT do
 
-- ❌ **No tuning on test data** — best threshold reported is descriptive only; deployment threshold is locked
-- ❌ **No fold mixing** — TimeSeriesSplit ensures temporal order
-- ❌ **No look-ahead in features** — `# CAUSAL` audit on every feature
-- ❌ **No feature engineering on full dataset** — features computed before split
-- ❌ **No oversampling minorities** — only undersampling majorities (preserves true signal)
-- ❌ **No metric cherry-picking** — both binary metrics and legacy regression metrics are saved; the misleading legacy metrics are flagged as such in the frontend
+- ❌ **No tuning on test data** — deployment threshold + tier cutoffs are selected on calib and locked; test is evaluated exactly once (enforced by pipeline structure)
+- ❌ **No date straddling folds** — whole-date splits with 7-day purges; disjointness is hard-asserted and unit-tested (`src/tests/test_eval_protocol.py`)
+- ❌ **No resampling outside train** — val/calib/test stay at natural prevalence
+- ❌ **No look-ahead in features** — `# CAUSAL` audit on every feature; cells enter the universe only after their first detection
+- ❌ **No censored labels in supervision** — tail rows with unobservable label windows are excluded
+- ❌ **No exact-date claims** — the output is P(fire within 3 days); day buckets on the dashboard are probability ranks, not date forecasts
 
 ## 🔁 Reproducibility
 

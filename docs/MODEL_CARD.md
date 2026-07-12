@@ -2,6 +2,16 @@
 
 > Following the [Google Model Cards](https://modelcards.withgoogle.com/about) framework.
 
+> **⚠️ METRICS WITHDRAWN — protocol revision 2026-07-12.** All performance
+> numbers on this card were measured under an evaluation protocol later
+> found invalid (row-based split with date leakage, negatives undersampled
+> before splitting so test prevalence was artificial, deployment threshold
+> selected on the test set, calibration fit in-sample, censored tail labels,
+> hindsight cell universe). The pipeline has been repaired — see
+> `docs/METHODOLOGY.md` § "Protocol revision" — and this card will be
+> refreshed from the first retrain under the new protocol. Until then, do
+> not quote the numbers below.
+
 ## 🎯 Model Details
 
 - **Name:** Thailand Wildfire Imminence Predictor
@@ -32,8 +42,9 @@
 - ❌ **Use outside Thailand** — trained only on Thailand BBOX
 
 ### Operational threshold
-- **Deployment threshold:** `0.05` (best-F1 on held-out test set)
-- At this threshold: Precision ≈ 11%, Recall ≈ 77%
+- **Deployment threshold:** selected as best-F1 **on the calibration split**
+  (never on test) and locked before the single test evaluation; persisted in
+  `dataset_info.json → probability_tier_thresholds`
 - Watch-list mode preferred over alert mode given the precision/recall trade-off
 
 ## 📊 Performance
@@ -88,21 +99,22 @@ If a real source is unavailable for a column, the column is simply absent.
 ### Pre-processing
 1. **Cleaning** — drop FRP outliers (top 0.1%), confidence < threshold
 2. **Grid snap** — 0.1° lat/lon
-3. **Densification** — fill no-fire days with zeros within active-cell range
+3. **Causal densification** — fill no-fire days with zeros, each cell entering the universe from its **first detection onward** (no hindsight)
 4. **Urban filter** — drop hotspots inside curated Thai city polygons
 5. **Tree cover merge** — Hansen GFC per-cell aggregates
 6. **Weather merge** — ERA5 where available (38% coverage)
-7. **Float32 cast + class-balance undersample** — memory-frugal pipeline
+7. **Float32 cast + tail censoring** — rows whose 3-day label window is unobserved are excluded from supervision
+8. **Undersampling** — negatives 4:1, **train partition only** (val/calib/test at natural prevalence)
 
 ## 🧠 Model
 
 ### Architecture
 - **Base:** LightGBM `LGBMClassifier(objective="binary")`
 - **Ensemble:** 3 models with different random seeds, averaged probabilities
-- **Calibrator:** Platt sigmoid (LogisticRegression on validation set's raw probabilities)
-- **Inference output:** Calibrated probability → optional pseudo-days mapping for dashboard tiers
+- **Calibrator:** Platt sigmoid (LogisticRegression on the calibration split's raw probabilities — disjoint from all fitting data)
+- **Inference output:** Calibrated probability; dashboard tiers use absolute calib-selected probability cutoffs
 
-### Hyperparameters (best from BayesSearchCV on TimeSeriesSplit(5, gap=7))
+### Hyperparameters (best from BayesSearchCV on purged date-grouped CV, 7-day purge)
 ```
 n_estimators: 400
 max_depth: 8

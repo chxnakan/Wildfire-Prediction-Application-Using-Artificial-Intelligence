@@ -109,30 +109,33 @@ firms_all.parquet                      lag/roll)                    ▼
 
 `train.py` is self-contained — it does **not** use `model.py`'s multi-candidate helpers. Flow:
 
-1. **Load + features** — `load_and_prepare` → `build_features`. Output: ~4.4M rows × ~134 features (or ~164 with weather), densified across active cells × full date range.
-2. **Memory-frugal label + downcast** — drop unused columns, cast features to **float32** (halves RAM), build binary label `y = (days_until_fire ∈ {1..IMMINENT_DAYS=3})`.
-3. **Undersample negatives globally** — keep all positives (~5%) + random sample of negatives at `NEG_TO_POS_RATIO=4`. ~4.4M → ~1.2M rows. **Done before the split** so the full-densified frame never lives in memory through the split (a prior run OOM'd at ~12 GB precisely there). Then `del feats; gc.collect()`.
-4. **Chronological 60/20/20 train/val/test split** by date.
-5. **Sample weights** — recency decay (halflife 45 d) × inverse class frequency × gentle 1.5×/1.3×/1.1× boost on days 1/2/3-5. Heavier boosting (used in earlier runs) destabilized the model.
-6. **LightGBM tuning** — `BayesSearchCV` (or `RandomizedSearchCV` fallback) with `TimeSeriesSplit(n_splits, gap=7)`, `scoring="roc_auc"`. `scale_pos_weight = neg_count / pos_count` corrects residual imbalance. **Outer CV `n_jobs=1`, inner LGBM `n_jobs=-1`** — setting both to -1 spawns cores² threads and load average pegs at ~50 (each fit 4–5× slower).
-7. **Ensemble refit on train+val** — `n_ensemble=3..10` LGBM models with different seeds at best hyperparameters. Early stopping uses the tail 10% of train+val as `eval_set`, `eval_metric=["binary_logloss", "auc"]`. Wrapped in `_EnsembleRegressor`.
-8. **Test evaluation** — binary metrics (ROC-AUC, average precision, accuracy, precision, recall, F1, P@top-K%) at the default 0.5 threshold AND at the F1-optimal threshold (descriptive only, not deployed).
-9. **Persist** — `outputs/models/lgbm_fire_date_model.pkl` + `outputs/models/history/{UTC_TIMESTAMP}_lightgbm.pkl` + `outputs/metadata/dataset_info.json` + matplotlib PNG report.
-10. **risk_map.run()** is called at the end to refresh the GeoJSON.
+1. **Load + features** — `load_and_prepare` → `build_features`, densified **causally**: a cell enters the universe only from its first FIRMS detection onward (pre-first-detection rows would encode hindsight).
+2. **Label + downcast + censor** — drop unused columns, cast to **float32**, build binary label `y = (days_until_fire ∈ {1..IMMINENT_DAYS=3})`, then **censor the dataset tail**: rows whose 3-day label window extends past the last observed date are removed from all supervised use (`days_ahead_observed < 3` — their "negative" labels would mean "future not observed").
+3. **Date-grouped 4-way split with purge** — `eval_protocol.date_grouped_split` → train/val/calib/test on **whole calendar dates** (default 60/15/10/15 by date count) with a **7-day purge** dropped before each boundary. Disjointness + purge width are hard-asserted. The old row-based split let one date land in two splits (confirmed leakage) — never reintroduce it.
+4. **Undersample negatives in TRAIN ONLY** at `NEG_TO_POS_RATIO=4`. val/calib/test keep **natural prevalence** — undersampling them corrupted every prevalence-sensitive metric (precision, AP, calibration) reported previously.
+5. **Sample weights** (train only) — recency decay (halflife 45 d) × inverse class frequency × gentle multi-sat boost.
+6. **LightGBM tuning** — `BayesSearchCV` (fallback `RandomizedSearchCV`) with `eval_protocol.purged_date_folds` (whole-date expanding-window CV, 7-day purge; sklearn's `TimeSeriesSplit(gap=7)` purges 7 *rows*, not days — banned). **Outer CV `n_jobs=1`, inner LGBM `n_jobs=-1`** — both -1 spawns cores² threads.
+7. **Ensemble fit on train, early stopping on val** — `n_ensemble` seeds at best params, `eval_metric=["binary_logloss", "auc"]`. Wrapped in `_EnsembleRegressor`.
+8. **Calibration + thresholds on calib** — Platt sigmoid fit on the calib partition (model never trained on it, natural prevalence). Deployment threshold = F1-optimal **on calib**; MEDIUM tier cutoff = threshold catching ≥85% of calib fires. Persisted as `probability_tier_thresholds`. Test data is never consulted for any parameter.
+9. **Single test evaluation** — natural prevalence, thresholds locked: ROC-AUC, PR-AUC, **Brier**, ECE, precision/recall/F1 @ deployment threshold, P@top-K%, plus **baselines** (persistence fired-last-3d/7d, per-cell train-period climatology) for honest uplift claims.
+10. **Persist** — model pkl + history + `dataset_info.json` (includes an `evaluation_protocol` audit block: split ranges, purge, prevalences, censored rows, what was selected where) + PNG report.
+11. **risk_map.run()** refreshes the GeoJSON.
+
+Protocol invariants are tested: `cd src && python tests/test_eval_protocol.py` (split disjointness, purge width, tail censoring, natural prevalence outside train, calibration independence).
 
 ### `_EnsembleRegressor` — the inference contract risk_map.py and api.py rely on
 
 The ensemble class in train.py is named `_EnsembleRegressor` for historical reasons; it wraps **binary classifiers**.
 
-- `predict_proba(X)` → 1-D `np.array` of `P(fire in next 3 days)` averaged across the ensemble.
-- `predict(X)` → 1-D pseudo-days array via `_prob_to_days_for_compat`: `days = 1 + (1 − prob) × 6`. Monotone (`prob=1.0 → day 1`, `prob=0.5 → day 4`, `prob=0.0 → day 7`). risk_map.py / api.py call only `.predict()` and don't know the model is binary.
+- `predict_proba(X)` → 1-D `np.array` of **calibrated** `P(fire in next 3 days)` (raw ensemble mean → Platt calibrator fit on the calib split). This is the model's real output and what risk_map uses for tiers, ranking, and display.
+- `predict(X)` → 1-D pseudo-days via `_prob_to_days_for_compat` — monotone-in-probability **display scaffolding only** (the day-selector buckets). The binary target cannot resolve day-of-fire; never present these as date forecasts.
 - `feature_importances_` → averaged across ensemble.
 
-**Changing this mapping shifts the dashboard's CRITICAL/HIGH/MEDIUM/LOW share** — the tier counts are a function of how aggressively probability maps to short pseudo-days.
+Tier counts follow the **absolute** `probability_tier_thresholds` persisted at training time, not the pseudo-days mapping.
 
 ### Densification (required for correctness)
 
-`data_loader.densify_active_cells()` expands the sparse hotspot frame into a dense (active-cell × every-day-in-range) grid, no-fire days filled with zeros. This is what makes lag features (`fire_lag_1` = literally yesterday) and rolling windows (`fire_sum_7d` = past 7 calendar days, past-only) correct. Inactive cells (zero fires ever) are excluded — no signal.
+`data_loader.densify_active_cells()` expands the sparse hotspot frame into a dense (cell × day) grid, no-fire days filled with zeros — **causally**: each cell's rows start at its first detection (the universe at time t = cells that had burned by t; including earlier rows leaked "this cell will eventually burn"). This makes lag features (`fire_lag_1` = literally yesterday) and rolling windows correct. Documented limitation: never-burned cells are outside the prediction universe — the model cannot flag first-ever fires.
 
 ### CAUSAL feature audit (don't break)
 
@@ -154,22 +157,22 @@ The label `days_until_fire` is computed strictly from FUTURE rows, so any featur
 
 If you add or remove features, delete `outputs/models/*.pkl` before retraining or the resolver will silently mispredict.
 
-### Urgency thresholds + risk_map filtering
+### Urgency tiers + risk_map filtering
 
-`train.py` persists fixed-domain cutoffs (`CRITICAL=0, HIGH=2, MEDIUM=4, LOW=7`) into `dataset_info.json["urgency_thresholds"]`. Under the binary→pseudo-days mapping, probabilities ≈ 0.83 land on day 1 (CRITICAL), ≈ 0.5 on day 4 (MEDIUM).
+Tiers use **absolute calibrated-probability cutoffs** from `dataset_info.json["probability_tier_thresholds"]`, selected on the calib split at training time (HIGH = deployment threshold, MEDIUM = ≥85%-recall threshold). A genuinely low-risk day shows zero HIGH cells. Fallbacks, in order: legacy artifacts without persisted cutoffs get per-snapshot percentile **priority ranking** (explicitly labelled relative, not absolute risk); tiny snapshots (<10 cells) get fixed-domain days thresholds.
 
-risk_map.py applies a **fixed-then-quantile fallback**: if the fixed scheme would collapse every cell into one tier (model output band < 1 day), it falls back to per-snapshot 25/50/75 quantile thresholds. The frontend detects this and shows a "Quantile mode" note.
+Output semantics: `probability` = calibrated P(≥1 hotspot within 3 days). `days_until_fire` is a probability-rank display bucket; `predicted_fire_date` is the **risk-window end** (base_date + 3d, same for all cells) — the model never claims an exact fire date.
 
 risk_map.py then runs four filters and persists the funnel:
 1. **History** — min 3 fires in last 30d, min 3 in last 90d, min 3 fire-days/year. Cells failing all three are dropped (climatology-dominated).
 2. **Urban** — drop cells inside curated city polygons + annotate `nearest_urban_area`.
 3. **Country** — drop cells outside Thailand's land border (training data spans the full BBOX so the model learns regional patterns; the dashboard is Thailand-focused).
-4. **Per-day cap** — within each predicted day, sort by `historical_fire_count_30d × 1000 + rounding_proximity` and keep top `MAX_CELLS_PER_DAY` (default 100). Set `MAX_CELLS_PER_DAY=0` to disable.
+4. **Display cap** — within each bucket, keep top `MAX_CELLS_PER_DAY` (default 100) ranked **by model probability** (tie-break: 30d history). The suppressed count is persisted in GeoJSON metadata (`suppressed_by_display_cap`). Set `MAX_CELLS_PER_DAY=0` to disable.
 
 ### Frontend (React SPA in `web/`)
 
 - `App.tsx` — top-level; fetches `/geojson` via relative path so the SPA can be served by any backend that mounts the GeoJSON.
-- `components/MapView.tsx` — Leaflet map, predicted/observed/live-fire layers, marker popups. The predicted-cell popup shows **probability %** (recovered via `prob = 1 − (raw_pred − 1) / 6`) + a Thai risk-tier headline + ground-truth-anchored interpretation ("≈ ใน 10 cell ระดับนี้ ~3 เกิดไฟใน 3 วัน").
+- `components/MapView.tsx` — Leaflet map, predicted/observed/live-fire layers, marker popups. The predicted-cell popup leads with the **calibrated probability %** (persisted `probability` field; legacy snapshots fall back to inverting `raw_prediction`) + a Thai risk-tier headline + ground-truth-anchored interpretation. The date line shows the **risk-window end**, not a per-cell predicted date; the day selector is labelled as probability-rank bands.
 - `components/AccuracyHero.tsx` — operator-facing performance card. Headline is **Recall** (e.g. 97%) = "of fires that actually happened, what fraction did we catch?". Sub-stats: letter grade A–D from ROC-AUC, uplift vs random (P@top-20% / `test_positive_rate`), false alarm rate, watch-list precision. All technical metrics live in InfoModal. Detects task via `metrics.task === "binary_fire_in_3d"` with a legacy regression fallback view.
 - `components/InfoModal.tsx` — glossary modal, task-type-aware metric definitions.
 - `components/Sidebar.tsx` — base-date / province filters, day selector, hit-rate, land-cover breakdown, CSV export.
@@ -214,7 +217,7 @@ All entry points resolve paths via `BASE_DIR = parent-of-src`. `train.py` reads 
 
 ### Gotchas
 
-- **OOM during training** = you didn't downsample before split (memory-frugal step in train.py STEP 3), didn't cast to float32, or `n_ensemble` too high. Recipe: undersample first → cast to float32 → split → ensemble ≤ 5 on a 22 GB laptop.
+- **OOM during training** = you didn't cast to float32, kept too much history, or `n_ensemble` too high. Recipe: float32 downcast → `--max-history-days` to bound the frame → ensemble ≤ 5 on a 22 GB laptop. **Do NOT "fix" memory by undersampling before the split** — that corrupts val/calib/test prevalence and was one of the leakage bugs removed in the protocol repair.
 - **Tuning hangs / extreme load average** = `n_jobs=-1` on both BayesSearchCV outer AND LGBM inner spawns cores² threads. Keep outer `n_jobs=1` (sequential CV folds, parallelism inside the fit).
 - **Test metrics look terrible (MAE 5 d, acc±1 6%)** = you're reading legacy regression keys from `test_metrics` on a binary task. Read `roc_auc`, `f1`, `precision_at_best_thr` instead; check `test_metrics.task` first.
 - **All predictions land in MEDIUM/LOW, no CRITICAL/HIGH** = the binary classifier's probabilities are mostly 0.3–0.5 (uncertain), which under the pseudo-days mapping land in days 4–5. To get more CRITICAL alerts, either improve features (weather completion, drought index) or tune `_prob_to_days_for_compat()`.

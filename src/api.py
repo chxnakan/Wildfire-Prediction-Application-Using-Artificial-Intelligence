@@ -575,7 +575,7 @@ def training_summary(request: Request):
         "search_method": model_block.get("search_method"),
         "search_iterations": model_block.get("n_iter"),
         "cv_n_splits": model_block.get("n_splits"),
-        "cv_gap_days": model_block.get("ts_split_gap_days"),
+        "cv_gap_days": model_block.get("cv_method") or model_block.get("ts_split_gap_days"),
         "ensemble_size": model_block.get("n_ensemble"),
         "early_stopping_rounds": model_block.get("early_stopping_rounds"),
         "best_params": model_block.get("best_params"),

@@ -1,28 +1,34 @@
 """End-to-end training orchestrator: data → features → tune → eval → persist.
 
 Pipeline:
-    1. data_loader.load_and_prepare → daily cell-day frame
+    1. data_loader.load_and_prepare → daily cell-day frame (causal universe:
+       a cell exists only from its first detection onward)
     2. features.build_features → lag/rolling/calendar features + label
+       (+ days_ahead_observed for tail censoring)
     3. ``--predict-only``: refresh full_features.parquet + risk_map only
-    4. Drop label==-1 rows (no fire within horizon)
-    5. Chronological 60/20/20 train / val / test split
-    6. LightGBM-only tuning with BayesSearchCV (fallback: RandomizedSearchCV)
-       on TimeSeriesSplit(n_splits=5, gap=7)
-    7. Refit ensemble on train+val with sample_weight emphasising short horizons
-    8. Held-out test eval + per-day stats + hotspot precision/recall
-    9. Persist model, metadata, training_report.png
-   10. Trigger risk_map.run() to refresh the GeoJSON
+    4. Censor tail rows whose 3-day label window is not fully observed
+    5. Date-grouped chronological train/val/calib/test split with a 7-day
+       purge before each boundary (eval_protocol.date_grouped_split; whole
+       calendar dates, disjointness asserted)
+    6. Undersample negatives in TRAIN ONLY — val/calib/test keep natural
+       prevalence
+    7. LightGBM tuning (BayesSearchCV, fallback RandomizedSearchCV) on
+       purged date-grouped CV folds within train
+    8. Fit ensemble on train; early stopping on val
+    9. Platt calibration on calib; deployment threshold + tier cutoffs
+       selected on calib and locked
+   10. SINGLE evaluation pass on test at natural prevalence (ROC-AUC, PR-AUC,
+       Brier, ECE, P@K) + persistence/climatology baselines
+   11. Persist model, metadata (with evaluation_protocol audit trail), PNG
+   12. Trigger risk_map.run() to refresh the GeoJSON
 
-Spec compliance notes:
-    - LightGBM ONLY (no RF / XGB) with the spec's expanded param grid.
-    - TimeSeriesSplit(n_splits=5, gap=7) prevents leakage across folds.
-    - early_stopping(50) is applied to the final ensemble refit using a held-
-      out tail of train+val as eval_set (we can't pass it inside CV without
-      breaking sample-weight slicing on sklearn 1.4+).
-    - sample_weight: shorter days_until_fire weighted higher (graduated boost).
-    - n_jobs=-1, verbosity=-1.
-    - Prints total training time in seconds after completion.
-    - Per-day model + hotspot metrics, formatted console table, PNG report.
+Protocol invariants (tested in tests/test_eval_protocol.py — do not relax):
+    - No calendar date appears in two splits; ≥7-day purge at every boundary.
+    - sklearn TimeSeriesSplit is BANNED here: its gap counts rows, not days.
+    - Undersampling touches train only.
+    - Calibration and thresholds never see test; test is evaluated once.
+    - Output semantics: calibrated P(fire within 3 days) — never an exact
+      fire date (the binary target cannot resolve day-of-fire).
 """
 
 from __future__ import annotations
@@ -43,15 +49,17 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
+    brier_score_loss,
     f1_score,
     mean_absolute_error,
     mean_squared_error,
+    precision_recall_curve,
     precision_score,
     r2_score,
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from sklearn.model_selection import RandomizedSearchCV
 
 try:
     from lightgbm import LGBMClassifier, early_stopping
@@ -69,6 +77,7 @@ except ImportError:  # pragma: no cover
     _BAYES_AVAILABLE = False
 
 from data_loader import load_and_prepare
+from eval_protocol import date_grouped_split, purged_date_folds
 from features import (
     DEFAULT_URGENCY_THRESHOLDS,
     MAX_PREDICTION_DAYS,
@@ -173,33 +182,11 @@ def _compute_sample_weights(
     return sw
 
 
-# ─────────────────────────────────────────────
-# Split utility
-# ─────────────────────────────────────────────
-def chronological_split(
-    df: pd.DataFrame,
-    val_fraction: float = 0.2,
-    test_fraction: float = 0.2,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if val_fraction + test_fraction >= 1.0:
-        raise ValueError("val_fraction + test_fraction must be < 1.0")
-    sorted_df = df.sort_values("date").reset_index(drop=True)
-    n = len(sorted_df)
-    train_end = int(n * (1.0 - val_fraction - test_fraction))
-    val_end = int(n * (1.0 - test_fraction))
-    train = sorted_df.iloc[:train_end]
-    val = sorted_df.iloc[train_end:val_end]
-    test = sorted_df.iloc[val_end:]
-    log.info("Split date ranges:")
-    for name, split in (("train", train), ("val", val), ("test", test)):
-        if len(split):
-            log.info(
-                "  %-5s : %s → %s  (%d rows)",
-                name, split["date"].min(), split["date"].max(), len(split),
-            )
-        else:
-            log.info("  %-5s : empty", name)
-    return train, val, test
+# NOTE: the old row-based `chronological_split` was REMOVED — it split by row
+# count, letting one calendar date land in two splits (confirmed leakage:
+# 2025-11-10 appeared in both train and val). Use
+# eval_protocol.date_grouped_split, which splits on whole dates with a
+# 7-day purge and asserts disjointness.
 
 
 # ─────────────────────────────────────────────
@@ -473,7 +460,7 @@ def reliability_bins(
 def _build_search(
     estimator: LGBMClassifier,
     n_iter: int,
-    n_splits: int,
+    cv: Any,
     random_state: int,
 ) -> Tuple[Any, str]:
     """Prefer BayesSearchCV; fall back to RandomizedSearchCV if skopt missing.
@@ -481,8 +468,12 @@ def _build_search(
     Scoring: roc_auc — robust to class imbalance and the natural metric for a
     binary fire-in-3-days classifier. We pair it with scale_pos_weight on the
     estimator and undersampled training data for stable convergence.
+
+    `cv` must be an explicit list of (train_idx, test_idx) folds from
+    eval_protocol.purged_date_folds — sklearn's TimeSeriesSplit(gap=7) purges
+    7 ROWS, not 7 days, which with thousands of cells per date is no purge
+    at all. Never reintroduce it here.
     """
-    cv = TimeSeriesSplit(n_splits=n_splits, gap=7)
     # outer CV n_jobs=1 (sequential folds) so LightGBM's inner n_jobs=-1 gets
     # the full machine. cores²-thread oversubscription cratered the previous
     # run (load avg ~50, each fit 4-5× slower than expected).
@@ -539,26 +530,27 @@ def _fit_search(
 
 def _refit_ensemble_with_early_stopping(
     best_params: Dict[str, Any],
-    X_full: pd.DataFrame,
-    y_bin_full: np.ndarray,
+    X_fit: pd.DataFrame,
+    y_fit: np.ndarray,
+    X_es: pd.DataFrame,
+    y_es: np.ndarray,
     sample_weight: Optional[np.ndarray],
     scale_pos_weight: float,
     n_ensemble: int = 5,
     base_seed: int = 42,
     early_stopping_rounds: int = 50,
 ) -> Any:
-    """Refit n_ensemble binary LGBM models on train+val with early stopping.
+    """Fit n_ensemble binary LGBM models with early stopping.
 
-    eval_set is tail 10% of chronologically-sorted X_full.
-    eval_metric is binary_logloss + auc to match binary objective.
+    X_fit/y_fit is the (undersampled, weighted) TRAIN partition only;
+    X_es/y_es is the chronologically-later VAL partition at natural
+    prevalence. Keeping fit and early-stopping data from disjoint purged
+    date blocks means no row influences both the boosting trajectory and
+    its own stopping point — and val is never mistaken for held-out data
+    downstream (calibration and thresholds use calib; final metrics use
+    test).
     """
-    n_total = len(X_full)
-    tail = max(int(n_total * 0.1), 1)
-    X_fit = X_full.iloc[:-tail]
-    y_fit = y_bin_full[:-tail]
-    X_es  = X_full.iloc[-tail:]
-    y_es  = y_bin_full[-tail:]
-    sw_fit = sample_weight[:-tail] if sample_weight is not None else None
+    sw_fit = sample_weight
 
     models: List[LGBMClassifier] = []
     for i in range(n_ensemble):
@@ -952,8 +944,9 @@ def _render_training_report(
 def main(
     n_iter: int = 30,
     n_splits: int = 5,
-    val_fraction: float = 0.2,
-    test_fraction: float = 0.2,
+    val_fraction: float = 0.15,
+    calib_fraction: float = 0.10,
+    test_fraction: float = 0.15,
     grid_size: float = 0.1,
     min_confidence: int = 0,
     skip_risk_map: bool = False,
@@ -1048,18 +1041,19 @@ def main(
                 log.warning("risk_map.run() failed: %s", exc)
         return {"mode": "predict_only", "feature_path": feature_path}
 
-    log.info("==== STEP 3: build binary label + memory-frugal undersample ====")
-    # Memory plan (we OOM'd before):
-    #   1. Build binary label, drop ALL columns we don't need
-    #   2. Cast feature columns to float32 (halves RAM vs float64)
-    #   3. Undersample negatives GLOBALLY before splitting (vs after, which
-    #      requires holding the full 4.4M-row split in memory).
-    #   4. We must keep test "full distribution" — but full distribution after
-    #      undersample is still representative since we never touched the time
-    #      ordering of positives, only thinned negatives uniformly at random.
+    log.info("==== STEP 3: build binary label + censor unobservable tail ====")
+    # Memory plan: drop unused columns, cast to float32 BEFORE the split so
+    # the full frame is as small as possible while all 4 split subsets are
+    # materialised. Undersampling happens AFTER the split, train-only —
+    # undersampling first corrupted val/test prevalence (an artificial 4:1
+    # base rate) and every prevalence-sensitive metric computed on them.
     feature_cols = resolve_features(feats)
     analysis_cols = [c for c in ["radd_cross_verified", "multi_sat_confirmed"] if c in feats.columns]
-    keep_cols = list(set(feature_cols + ["date", "lat_grid", "lon_grid", "days_until_fire"] + analysis_cols))
+    keep_cols = list(set(
+        feature_cols
+        + ["date", "lat_grid", "lon_grid", "days_until_fire", "days_ahead_observed"]
+        + analysis_cols
+    ))
     feats = feats[keep_cols].copy()
 
     # Cast feature columns to float32 in-place (lat/lon kept as float64 for grid math)
@@ -1068,43 +1062,118 @@ def main(
         if feats[c].dtype != np.float32:
             feats[c] = feats[c].astype(np.float32)
 
+    # Snapshot dataset-level stats BEFORE any supervised filtering (metadata).
+    dataset_stats = {
+        "earliest_date": str(feats["date"].min()),
+        "latest_date": str(feats["date"].max()),
+        "total_days": int(pd.Series(feats["date"]).nunique()),
+        "total_active_cells": int(feats[["lat_grid", "lon_grid"]].drop_duplicates().shape[0]),
+        "total_rows_densified": int(len(feats)),
+    }
+
+    # CENSORING: a row dated d claims a label about (d, d+IMMINENT_DAYS]. At
+    # the dataset tail that window extends past the last observed date, and
+    # the label builder silently filled it as "no fire" — a false negative.
+    # Those rows are valid for live inference only, never for supervision.
+    if "days_ahead_observed" in feats.columns:
+        n_before = len(feats)
+        feats = feats[feats["days_ahead_observed"] >= IMMINENT_DAYS].copy()
+        n_censored = n_before - len(feats)
+        log.info(
+            "Censored %d tail rows (last %d days) whose %d-day label window "
+            "is not fully observed", n_censored, IMMINENT_DAYS, IMMINENT_DAYS,
+        )
+    else:
+        n_censored = 0
+        log.warning("days_ahead_observed missing — rebuild features (stale parquet?)")
+
     feats["_y_bin"] = _make_binary_label(feats["days_until_fire"]).astype(np.int8)
     n_pos = int(feats["_y_bin"].sum())
     n_neg = int(len(feats) - n_pos)
+    natural_prevalence = n_pos / max(len(feats), 1)
     log.info(
-        "Class distribution before undersample: pos=%d (%.2f%%)  neg=%d  (target: fire ∈ {1..%d} days)",
-        n_pos, 100 * n_pos / max(len(feats), 1), n_neg, IMMINENT_DAYS,
+        "Natural class distribution: pos=%d (%.3f%%)  neg=%d  (target: fire ∈ {1..%d} days)",
+        n_pos, 100 * natural_prevalence, n_neg, IMMINENT_DAYS,
     )
     if n_pos == 0:
         raise RuntimeError("No positive examples — check data.")
 
-    train_pool = _undersample_negatives(feats, "_y_bin", NEG_TO_POS_RATIO, random_state=random_state)
-    log.info(
-        "After global undersample (%d:1): %d → %d rows  (pos=%d, neg=%d)",
-        NEG_TO_POS_RATIO, len(feats), len(train_pool),
-        int(train_pool["_y_bin"].sum()),
-        int(len(train_pool) - train_pool["_y_bin"].sum()),
-    )
-    # Release the full-densified frame
+    log.info("==== STEP 4: date-grouped chronological split (7-day purge) ====")
+    # Whole-date 4-way split: train / val / calib / test. A calendar date
+    # belongs to exactly one split; 7 calendar days are dropped before every
+    # boundary (assertions inside date_grouped_split enforce both).
+    #   train — hyperparameter search + ensemble fit (undersampled, weighted)
+    #   val   — early-stopping eval + (with train) final ensemble fit data
+    #   calib — probability calibration + threshold selection (natural prev.)
+    #   test  — touched exactly once, at the end, at natural prevalence
+    PURGE_DAYS = 7
+    try:
+        split = date_grouped_split(
+            feats["date"],
+            val_fraction=val_fraction,
+            calib_fraction=calib_fraction,
+            test_fraction=test_fraction,
+            purge_days=PURGE_DAYS,
+        )
+    except ValueError as exc:
+        n_dates = int(pd.Series(feats["date"]).nunique())
+        raise SystemExit(
+            f"\n❌ NOT ENOUGH DATA TO TRAIN A VALID MODEL ({n_dates} usable "
+            f"day(s) after tail censoring).\n"
+            f"   The leakage-safe protocol needs 4 date blocks + three "
+            f"{PURGE_DAYS}-day purges (≥ ~25 distinct days minimum; months of "
+            f"data for a *useful* model).\n"
+            f"   Fix: add historical FIRMS exports to data/raw/ "
+            f"(firms.modaps.eosdis.nasa.gov/download — request the Jan–Apr "
+            f"fire-season months), or let the scheduler accumulate NRT data "
+            f"over time.\n"
+            f"   Details: {exc}"
+        ) from exc
+    train_df = feats[split.masks["train"]]
+    val_df   = feats[split.masks["val"]]
+    calib_df = feats[split.masks["calib"]]
+    test_df  = feats[split.masks["test"]]
     del feats
     gc.collect()
 
-    log.info("==== STEP 4: chronological train / val / test split ====")
-    train_df, val_df, test_df = chronological_split(
-        train_pool, val_fraction=val_fraction, test_fraction=test_fraction,
+    split_prevalence = {}
+    for name, part in (("train", train_df), ("val", val_df),
+                       ("calib", calib_df), ("test", test_df)):
+        prev = float(part["_y_bin"].mean()) if len(part) else 0.0
+        split_prevalence[name] = round(prev, 5)
+        log.info(
+            "  %-5s : %s → %s  (%d rows, prevalence %.3f%%)",
+            name, *split.date_ranges[name], len(part), 100 * prev,
+        )
+    if min(len(val_df), len(calib_df), len(test_df)) == 0:
+        raise RuntimeError("A split is empty — need more data for a purged 4-way split")
+    if int(calib_df["_y_bin"].sum()) < 10 or int(test_df["_y_bin"].sum()) < 10:
+        log.warning(
+            "Very few positives in calib (%d) / test (%d) — threshold and "
+            "test metrics will be unstable",
+            int(calib_df["_y_bin"].sum()), int(test_df["_y_bin"].sum()),
+        )
+
+    # Undersample negatives in TRAIN ONLY (fitting efficiency). val keeps its
+    # natural prevalence for early stopping; a separately-undersampled copy
+    # of val joins the final ensemble fit. calib/test are never resampled.
+    train_df_us = _undersample_negatives(train_df, "_y_bin", NEG_TO_POS_RATIO, random_state=random_state)
+    log.info(
+        "Train undersample (%d:1): %d → %d rows (pos=%d)",
+        NEG_TO_POS_RATIO, len(train_df), len(train_df_us),
+        int(train_df_us["_y_bin"].sum()),
     )
-    if len(val_df) == 0 or len(test_df) == 0:
-        raise RuntimeError("Val/test split is empty — increase data")
+    del train_df
+    gc.collect()
 
     log.info("Using %d features", len(feature_cols))
-    X_train, y_train_bin = train_df[feature_cols], train_df["_y_bin"].to_numpy()
+    X_train, y_train_bin = train_df_us[feature_cols], train_df_us["_y_bin"].to_numpy()
     X_val,   y_val_bin   = val_df[feature_cols],   val_df["_y_bin"].to_numpy()
+    X_calib, y_calib_bin = calib_df[feature_cols], calib_df["_y_bin"].to_numpy()
     X_test,  y_test_bin  = test_df[feature_cols],  test_df["_y_bin"].to_numpy()
     # Keep the original days label for per-day diagnostic reporting at eval time
     y_test_days = test_df["days_until_fire"].to_numpy()
 
-    # ── Backwards-compat shims so the metadata block below still works ────
-    train_df_us, val_df_us = train_df, val_df
 
     log.info("==== STEP 4b: compute sample weights (recency + class balance + multi-sat) ====")
     multi_sat_train = (
@@ -1135,9 +1204,9 @@ def main(
     )
 
     log.info(
-        "==== STEP 5: LightGBM tuning (%s, n_iter=%d, n_splits=%d, gap=7) ====",
+        "==== STEP 5: LightGBM tuning (%s, n_iter=%d, n_splits=%d, purge=%dd) ====",
         "BayesSearchCV" if _BAYES_AVAILABLE else "RandomizedSearchCV",
-        n_iter, n_splits,
+        n_iter, n_splits, PURGE_DAYS,
     )
     if not _BAYES_AVAILABLE:
         log.warning(
@@ -1145,11 +1214,17 @@ def main(
             "Install for true Bayesian search: pip install scikit-optimize"
         )
 
+    # Purged date-grouped CV folds within TRAIN — replaces TimeSeriesSplit,
+    # whose gap parameter counts rows, not days. Indices are positional and
+    # X_train comes straight from train_df_us, so they line up.
+    cv_folds = purged_date_folds(
+        train_df_us["date"], n_splits=n_splits, purge_days=PURGE_DAYS,
+    )
     estimator = _build_lgbm(random_state=random_state, scale_pos_weight=scale_pos_weight)
     search, search_name = _build_search(
         estimator=estimator,
         n_iter=n_iter,
-        n_splits=n_splits,
+        cv=cv_folds,
         random_state=random_state,
     )
 
@@ -1161,18 +1236,15 @@ def main(
     log.info("Best params: %s", best_params)
     log.info("Best CV score (ROC-AUC): %.4f", float(search.best_score_))
 
-    log.info("==== STEP 6: refit ensemble on train+val with early stopping ====")
-    full_X = pd.concat([X_train, X_val])
-    full_y_bin = np.concatenate([y_train_bin, y_val_bin])
-    full_dates = pd.concat([train_df_us["date"], val_df_us["date"]])
-    full_sw = _compute_sample_weights(pd.Series(full_y_bin), full_dates)
-
+    log.info("==== STEP 6: fit ensemble on train, early stopping on val ====")
     t_refit_start = time.time()
     best_model = _refit_ensemble_with_early_stopping(
         best_params=best_params,
-        X_full=full_X,
-        y_bin_full=full_y_bin,
-        sample_weight=full_sw,
+        X_fit=X_train,
+        y_fit=y_train_bin,
+        X_es=X_val,
+        y_es=y_val_bin,
+        sample_weight=sample_weight_train,
         scale_pos_weight=scale_pos_weight,
         n_ensemble=n_ensemble,
         base_seed=random_state,
@@ -1181,47 +1253,91 @@ def main(
     t_refit_elapsed = time.time() - t_refit_start
     log.info("⏱️  Ensemble refit time: %.1f seconds (%d models)", t_refit_elapsed, n_ensemble)
 
-    # ── STEP 6b: Platt calibration on val set ────────────────────────────
+    # ── STEP 6b: Platt calibration on the CALIB partition ────────────────
     # The ensemble's raw probabilities are not calibrated — "0.7" might mean
-    # 45% in practice. Fit a 1-D logistic regression (Platt scaling) on val
-    # so probabilities become operator-meaningful.
-    log.info("==== STEP 6b: probability calibration (Platt scaling on val) ====")
-    val_raw_proba = best_model._raw_proba(X_val)
-    val_ece_before = expected_calibration_error(y_val_bin, val_raw_proba)
+    # 45% in practice. Calibration data must satisfy two properties the old
+    # code violated: (1) the model never trained on it (the old code refit
+    # on train+val and then calibrated on val — in-sample predictions), and
+    # (2) it has NATURAL prevalence (the old val was undersampled 4:1, so
+    # the sigmoid learned an inflated base rate).
+    log.info("==== STEP 6b: probability calibration (Platt scaling on calib) ====")
+    calib_raw_proba = best_model._raw_proba(X_calib)
+    calib_ece_before = expected_calibration_error(y_calib_bin, calib_raw_proba)
     calibrator = LogisticRegression(C=1.0, solver="lbfgs", max_iter=200)
-    calibrator.fit(val_raw_proba.reshape(-1, 1), y_val_bin)
+    calibrator.fit(calib_raw_proba.reshape(-1, 1), y_calib_bin)
     best_model.calibrator = calibrator
-    val_cal_proba = best_model.predict_proba(X_val)
-    val_ece_after = expected_calibration_error(y_val_bin, val_cal_proba)
+    calib_proba = best_model.predict_proba(X_calib)
+    calib_ece_after = expected_calibration_error(y_calib_bin, calib_proba)
     log.info(
-        "Calibration: ECE on val %.4f → %.4f (lower is better)",
-        val_ece_before, val_ece_after,
+        "Calibration: ECE on calib %.4f → %.4f (lower is better; both at natural prevalence)",
+        calib_ece_before, calib_ece_after,
     )
 
-    log.info("==== STEP 7: held-out test evaluation (binary fire-in-%dd) ====", IMMINENT_DAYS)
-    test_proba = best_model.predict_proba(X_test)           # P(fire in next IMMINENT_DAYS d)
+    # ── STEP 6c: deployment threshold + tier cutoffs from CALIB only ─────
+    # The old code searched the F1-optimal threshold on TEST and shipped it,
+    # which silently converts the test set into a second validation set.
+    # All operating points are now chosen here, locked, and evaluated
+    # exactly once on test below.
+    log.info("==== STEP 6c: select operating thresholds on calib ====")
+    prec_c, rec_c, thr_c = precision_recall_curve(y_calib_bin, calib_proba)
+    f1_c = 2 * prec_c * rec_c / np.clip(prec_c + rec_c, 1e-9, None)
+    # precision_recall_curve returns len(thr)+1 points; align to thresholds
+    best_i = int(np.argmax(f1_c[:-1])) if len(thr_c) else 0
+    deploy_thr = float(thr_c[best_i]) if len(thr_c) else 0.5
+    calib_f1 = float(f1_c[best_i]) if len(thr_c) else 0.0
+    calib_prec_at_thr = float(prec_c[best_i]) if len(thr_c) else 0.0
+    calib_rec_at_thr = float(rec_c[best_i]) if len(thr_c) else 0.0
+
+    # Tier cutoffs (absolute probabilities for the risk map):
+    #   HIGH   = the deployment threshold (F1-optimal on calib)
+    #   MEDIUM = lowest threshold still catching ≥85% of calib fires
+    recall_target = 0.85
+    med_candidates = thr_c[rec_c[:-1] >= recall_target] if len(thr_c) else np.array([])
+    thr_medium = float(med_candidates.max()) if len(med_candidates) else deploy_thr / 2.0
+    thr_medium = min(thr_medium, deploy_thr * 0.999)  # keep MEDIUM strictly below HIGH
+    prob_tier_thresholds = {
+        "HIGH": round(deploy_thr, 4),
+        "MEDIUM": round(thr_medium, 4),
+        "LOW": 0.0,
+        "selected_on": "calib",
+        "calib_f1_at_high": round(calib_f1, 4),
+        "calib_precision_at_high": round(calib_prec_at_thr, 4),
+        "calib_recall_at_high": round(calib_rec_at_thr, 4),
+        "calib_recall_target_medium": recall_target,
+    }
+    log.info(
+        "Thresholds (calib): deploy/HIGH=%.4f (F1=%.3f, P=%.3f, R=%.3f)  MEDIUM=%.4f (recall≥%.0f%%)",
+        deploy_thr, calib_f1, calib_prec_at_thr, calib_rec_at_thr,
+        thr_medium, recall_target * 100,
+    )
+
+    log.info(
+        "==== STEP 7: FINAL held-out test evaluation (binary fire-in-%dd, natural prevalence, single pass) ====",
+        IMMINENT_DAYS,
+    )
+    # Everything below is measured at the test set's NATURAL base rate with
+    # thresholds that were locked on calib. No parameter — threshold, tier
+    # cutoff, calibration — is chosen from these numbers.
+    test_proba = best_model.predict_proba(X_test)           # calibrated P(fire in next IMMINENT_DAYS d)
     test_pred = best_model.predict(X_test)                  # mapped 1..7 pseudo-days (compat)
 
-    # ── Binary metrics ─────────────────────────────────────────────
-    # Default decision threshold = 0.5; also report at best F1 threshold
-    test_pred_bin = (test_proba >= 0.5).astype(int)
     auc = float(roc_auc_score(y_test_bin, test_proba)) if len(np.unique(y_test_bin)) > 1 else 0.0
     ap = float(average_precision_score(y_test_bin, test_proba)) if len(np.unique(y_test_bin)) > 1 else 0.0
+    brier = float(brier_score_loss(y_test_bin, test_proba))
+
+    # Metrics at the locked deployment threshold (chosen on calib in STEP 6c)
+    deploy_pred = (test_proba >= deploy_thr).astype(int)
+    deploy_f1 = float(f1_score(y_test_bin, deploy_pred, zero_division=0))
+    deploy_prec = float(precision_score(y_test_bin, deploy_pred, zero_division=0))
+    deploy_rec = float(recall_score(y_test_bin, deploy_pred, zero_division=0))
+    deploy_acc = float(accuracy_score(y_test_bin, deploy_pred))
+
+    # Reference point at the conventional 0.5 threshold
+    test_pred_bin = (test_proba >= 0.5).astype(int)
     acc = float(accuracy_score(y_test_bin, test_pred_bin))
     prec = float(precision_score(y_test_bin, test_pred_bin, zero_division=0))
     rec = float(recall_score(y_test_bin, test_pred_bin, zero_division=0))
     f1 = float(f1_score(y_test_bin, test_pred_bin, zero_division=0))
-
-    # Tune decision threshold by F1 on test (descriptive — not used for the model)
-    thresholds = np.linspace(0.05, 0.95, 19)
-    best_f1, best_thr = 0.0, 0.5
-    for t in thresholds:
-        p_bin = (test_proba >= t).astype(int)
-        f = float(f1_score(y_test_bin, p_bin, zero_division=0))
-        if f > best_f1:
-            best_f1, best_thr = f, float(t)
-    prec_at_best = float(precision_score(y_test_bin, (test_proba >= best_thr).astype(int), zero_division=0))
-    rec_at_best  = float(recall_score(y_test_bin,  (test_proba >= best_thr).astype(int), zero_division=0))
 
     # Precision @ K: among top-K highest-probability cells, what fraction are positive?
     n_test = len(test_proba)
@@ -1232,44 +1348,75 @@ def main(
         pak = float(np.mean(y_test_bin[topk_idx]))
         pak_metrics[f"precision_at_top_{int(k_pct*100)}pct"] = round(pak, 4)
 
-    # Calibration metrics on test set
+    # Calibration quality on test (measured, not fitted, here)
     test_ece = expected_calibration_error(y_test_bin, test_proba)
     reliability = reliability_bins(y_test_bin, test_proba, n_bins=10)
 
-    # Deployment threshold is fixed at the F1-optimal point we found on test.
-    # Frontend headlines use the deployment numbers.
-    deploy_thr = round(best_thr, 4)
-    deploy_pred = (test_proba >= deploy_thr).astype(int)
-    deploy_f1 = float(f1_score(y_test_bin, deploy_pred, zero_division=0))
-    deploy_prec = float(precision_score(y_test_bin, deploy_pred, zero_division=0))
-    deploy_rec = float(recall_score(y_test_bin, deploy_pred, zero_division=0))
-    deploy_acc = float(accuracy_score(y_test_bin, deploy_pred))
+    # ── Baselines: is the model better than trivial strategies? ──────────
+    # (a) persistence — "a cell that burned in the recent past will burn
+    #     again": rank by the past-only rolling fire counts.
+    # (b) climatology — per-cell positive rate measured on TRAIN dates only.
+    baselines: Dict[str, Dict[str, float]] = {}
+
+    def _score_baseline(name: str, score: np.ndarray, binary: np.ndarray) -> None:
+        if len(np.unique(y_test_bin)) < 2:
+            return
+        baselines[name] = {
+            "roc_auc": round(float(roc_auc_score(y_test_bin, score)), 4),
+            "average_precision": round(float(average_precision_score(y_test_bin, score)), 4),
+            "precision": round(float(precision_score(y_test_bin, binary, zero_division=0)), 4),
+            "recall": round(float(recall_score(y_test_bin, binary, zero_division=0)), 4),
+            "f1": round(float(f1_score(y_test_bin, binary, zero_division=0)), 4),
+        }
+
+    for col, bname in (("fire_sum_3d", "persistence_fired_last_3d"),
+                       ("fire_sum_7d", "persistence_fired_last_7d")):
+        if col in X_test.columns:
+            s = X_test[col].to_numpy().astype(float)
+            _score_baseline(bname, s, (s > 0).astype(int))
+
+    cell_rate = (
+        train_df_us.groupby(["lat_grid", "lon_grid"])["_y_bin"].mean()
+        .rename("cell_climatology")
+    )
+    clim = (
+        test_df[["lat_grid", "lon_grid"]]
+        .merge(cell_rate, on=["lat_grid", "lon_grid"], how="left")["cell_climatology"]
+        .fillna(float(y_train_bin.mean()))
+        .to_numpy()
+    )
+    _score_baseline("cell_climatology_train_rate", clim,
+                    (clim >= float(np.median(clim))).astype(int))
+
+    for bname, bm in baselines.items():
+        log.info("  Baseline %-28s AUC=%.4f AP=%.4f F1=%.4f",
+                 bname, bm["roc_auc"], bm["average_precision"], bm["f1"])
 
     overall_bin = {
         "roc_auc": round(auc, 4),
         "average_precision": round(ap, 4),
+        "brier_score": round(brier, 4),
         "accuracy": round(acc, 4),
         "precision": round(prec, 4),
         "recall": round(rec, 4),
         "f1": round(f1, 4),
-        "best_f1": round(best_f1, 4),
-        "best_threshold": round(best_thr, 4),
-        "precision_at_best_thr": round(prec_at_best, 4),
-        "recall_at_best_thr": round(rec_at_best, 4),
-        # Locked deployment metrics — these are what the dashboard shows.
-        "deployment_threshold": deploy_thr,
+        # Operating point — locked on calib BEFORE test was touched.
+        "threshold_selected_on": "calib",
+        "calib_f1_at_threshold": round(calib_f1, 4),
+        "deployment_threshold": round(deploy_thr, 4),
         "deployment_precision": round(deploy_prec, 4),
         "deployment_recall": round(deploy_rec, 4),
         "deployment_f1": round(deploy_f1, 4),
         "deployment_accuracy": round(deploy_acc, 4),
-        # Calibration — operator-trust metric.
+        # Calibration — fitted on calib, measured here on test.
         "ece": round(test_ece, 4),
-        "ece_val_before_calibration": round(val_ece_before, 4),
-        "ece_val_after_calibration": round(val_ece_after, 4),
+        "ece_calib_before_calibration": round(calib_ece_before, 4),
+        "ece_calib_after_calibration": round(calib_ece_after, 4),
         # Flag persisted so the dashboard's "Calibrated" badge lights up
         # (frontend treats any truthy calibration_method as calibrated).
         "calibration_method": "platt_sigmoid",
         "reliability_bins": reliability,
+        "baselines": baselines,
         **pak_metrics,
     }
     log.info("Binary test metrics: %s", overall_bin)
@@ -1333,14 +1480,21 @@ def main(
     print("=" * 76)
     print(f"BINARY CLASSIFICATION: fire within next {IMMINENT_DAYS} days?  (held-out test)")
     print("=" * 76)
-    print(f"  Test positives: {int(y_test_bin.sum())} / {n_test} ({y_test_bin.mean()*100:.2f}%)")
+    print(f"  Test positives: {int(y_test_bin.sum())} / {n_test} ({y_test_bin.mean()*100:.2f}%  ← NATURAL prevalence)")
     print(f"  ROC-AUC                : {auc:.4f}   ← {'GOOD' if auc >= 0.8 else 'OK' if auc >= 0.7 else 'WEAK'}")
-    print(f"  Average Precision (PR) : {ap:.4f}")
+    print(f"  Average Precision (PR) : {ap:.4f}   (random baseline = {y_test_bin.mean():.4f})")
+    print(f"  Brier score            : {brier:.4f}   (lower better; ECE={test_ece:.4f})")
     print(f"  @threshold=0.5  →  acc={acc*100:.2f}%  precision={prec*100:.2f}%  recall={rec*100:.2f}%  F1={f1*100:.2f}%")
-    print(f"  @threshold={best_thr:.2f}  →  F1={best_f1*100:.2f}%  precision={prec_at_best*100:.2f}%  recall={rec_at_best*100:.2f}%")
+    print(f"  @deploy={deploy_thr:.3f} (locked on calib) →  F1={deploy_f1*100:.2f}%  precision={deploy_prec*100:.2f}%  recall={deploy_rec*100:.2f}%")
     print(f"  Precision @ top  5% : {pak_metrics['precision_at_top_5pct']*100:.2f}%")
     print(f"  Precision @ top 10% : {pak_metrics['precision_at_top_10pct']*100:.2f}%")
     print(f"  Precision @ top 20% : {pak_metrics['precision_at_top_20pct']*100:.2f}%")
+    if baselines:
+        print()
+        print("  BASELINE COMPARISON (same test period, natural prevalence):")
+        for bname, bm in baselines.items():
+            print(f"    {bname:<30} AUC={bm['roc_auc']:.4f}  AP={bm['average_precision']:.4f}  F1={bm['f1']:.4f}")
+        print(f"    {'MODEL':<30} AUC={auc:.4f}  AP={ap:.4f}  F1={deploy_f1:.4f}")
     print()
     print("=" * 76)
     print("PER-DAY DIAGNOSTIC (pseudo-days = monotone-in-probability)")
@@ -1419,35 +1573,65 @@ def main(
     metadata = {
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "data_source": "NASA FIRMS VIIRS NRT (real)",
-        "earliest_date": str(train_pool["date"].min()),
-        "latest_date": str(train_pool["date"].max()),
+        "earliest_date": dataset_stats["earliest_date"],
+        "latest_date": dataset_stats["latest_date"],
         "data_stale_days": int(stale_days),
         "data_is_stale": bool(stale_days > STALE_WARN_DAYS),
-        "total_days": int(pd.Series(train_pool["date"]).nunique()),
+        "total_days": dataset_stats["total_days"],
         "max_history_days_applied": int(max_history_days_applied),
-        "total_active_cells": int(train_pool[["lat_grid", "lon_grid"]].drop_duplicates().shape[0]),
-        "training_rows": int(len(train_pool)),
+        "total_active_cells": dataset_stats["total_active_cells"],
+        "training_rows": int(len(train_df_us)),
         "grid_size": grid_size,
         "min_confidence": min_confidence,
         "urban_filter_enabled": urban_filter_enabled,
         "urban_buffer_km": urban_buffer_km,
         "prediction_type": "binary_fire_in_3d",
+        "output_semantics": (
+            "Calibrated P(≥1 FIRMS hotspot in this cell within the next "
+            f"{IMMINENT_DAYS} days). The model does NOT predict an exact fire "
+            "date; any per-day display buckets are probability rankings."
+        ),
+        "prediction_universe": (
+            "0.1° cells with ≥1 historical FIRMS detection, entering the "
+            "universe from their first detection onward (causal). Cells that "
+            "have never burned are outside the universe — the model cannot "
+            "flag first-ever fires."
+        ),
         "imminent_days": IMMINENT_DAYS,
         "max_prediction_days": MAX_PREDICTION_DAYS,
         "features": feature_cols,
         "feature_count": len(feature_cols),
         "weather_features_used": [c for c in feature_cols if c.startswith(("temp_", "precip_", "wind_", "et0_"))],
+        # ── Evaluation-protocol audit trail ──────────────────────────────
+        "evaluation_protocol": {
+            "split_method": "date_grouped_chronological",
+            "purge_days": PURGE_DAYS,
+            "split_date_ranges": split.date_ranges,
+            "split_prevalence": split_prevalence,
+            "natural_prevalence_overall": round(natural_prevalence, 5),
+            "censored_tail_rows": int(n_censored),
+            "censored_horizon_days": IMMINENT_DAYS,
+            "undersampling": f"train only, {NEG_TO_POS_RATIO}:1 neg:pos",
+            "calibration_fitted_on": "calib (natural prevalence, disjoint from fit data)",
+            "threshold_selected_on": "calib",
+            "test_evaluations": 1,
+        },
+        # Legacy days-based tier thresholds (fallback path in risk_map only).
         "urgency_thresholds": dict(DEFAULT_URGENCY_THRESHOLDS),
         "urgency_thresholds_note": (
-            "Fixed domain thresholds: CRITICAL=fire today, HIGH≤2d, MEDIUM≤4d, LOW≤7d."
+            "LEGACY fallback. The operative tier cutoffs are "
+            "probability_tier_thresholds (absolute calibrated probabilities "
+            "selected on the calib split)."
         ),
+        # Absolute probability tier cutoffs for risk_map (selected on calib).
+        "probability_tier_thresholds": prob_tier_thresholds,
         "best_model": "lightgbm",
         "model": {
             "type": "lightgbm",
             "search_method": search_name,
             "n_iter": n_iter,
             "n_splits": n_splits,
-            "ts_split_gap_days": 7,
+            "cv_method": f"purged_date_folds (whole-date, {PURGE_DAYS}-day purge)",
             "n_ensemble": n_ensemble,
             "early_stopping_rounds": early_stopping_rounds,
             "best_params": best_params,
@@ -1472,10 +1656,9 @@ def main(
                 "precision": overall_bin["precision"],
                 "recall": overall_bin["recall"],
                 "f1": overall_bin["f1"],
-                "best_f1": overall_bin["best_f1"],
-                "best_threshold": overall_bin["best_threshold"],
-                "precision_at_best_thr": overall_bin["precision_at_best_thr"],
-                "recall_at_best_thr": overall_bin["recall_at_best_thr"],
+                "brier_score": overall_bin["brier_score"],
+                "threshold_selected_on": overall_bin["threshold_selected_on"],
+                "baselines": overall_bin["baselines"],
                 "precision_at_top_5pct": overall_bin["precision_at_top_5pct"],
                 "precision_at_top_10pct": overall_bin["precision_at_top_10pct"],
                 "precision_at_top_20pct": overall_bin["precision_at_top_20pct"],
@@ -1509,12 +1692,8 @@ def main(
             "predictions_bunched": bool(pred_spread < 0.5),
             "scale_pos_weight": round(scale_pos_weight, 3),
             "neg_to_pos_ratio_train": NEG_TO_POS_RATIO,
-            "decision_threshold_best_f1": round(best_thr, 4),
-            "split_date_ranges": {
-                "train": [str(train_df["date"].min()), str(train_df["date"].max())],
-                "val":   [str(val_df["date"].min()),   str(val_df["date"].max())],
-                "test":  [str(test_df["date"].min()),  str(test_df["date"].max())],
-            },
+            "deployment_threshold": round(deploy_thr, 4),
+            "split_date_ranges": split.date_ranges,
             "training_time_seconds": round(total_elapsed, 2),
             "tuning_time_seconds": round(t_tune_elapsed, 2),
             "ensemble_refit_time_seconds": round(t_refit_elapsed, 2),
@@ -1535,11 +1714,10 @@ def main(
         # ~3.5 GB parquet. `del locals()[name]` is a Python no-op (locals()
         # returns a copy), so we delete each name explicitly then force a GC
         # cycle. This reliably reclaims 4–6 GB on a 22 GB laptop.
-        del X_train, X_val, X_test
-        del y_train_bin, y_val_bin, y_test_bin
-        del train_df, val_df, test_df, train_pool
-        del train_df_us, val_df_us
-        del full_X, full_y_bin, full_sw
+        del X_train, X_val, X_calib, X_test
+        del y_train_bin, y_val_bin, y_calib_bin, y_test_bin
+        del val_df, calib_df, test_df
+        del train_df_us
         del sample_weight_train, search, estimator
         gc.collect()
         try:
@@ -1554,9 +1732,10 @@ def main(
 def _cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train fire-date prediction model (LightGBM)")
     p.add_argument("--n-iter", type=int, default=30, help="Bayes/Randomized search iterations (default 30)")
-    p.add_argument("--n-splits", type=int, default=5, help="TimeSeriesSplit folds (gap=7)")
-    p.add_argument("--val-fraction", type=float, default=0.2)
-    p.add_argument("--test-fraction", type=float, default=0.2)
+    p.add_argument("--n-splits", type=int, default=5, help="Purged date-grouped CV folds (7-day purge)")
+    p.add_argument("--val-fraction", type=float, default=0.15)
+    p.add_argument("--calib-fraction", type=float, default=0.10)
+    p.add_argument("--test-fraction", type=float, default=0.15)
     p.add_argument("--grid-size", type=float, default=float(os.getenv("GRID_SIZE", "0.1")))
     p.add_argument("--min-confidence", type=int, default=0)
     p.add_argument("--n-ensemble", type=int, default=10)
@@ -1594,6 +1773,7 @@ if __name__ == "__main__":
         n_iter=args.n_iter,
         n_splits=args.n_splits,
         val_fraction=args.val_fraction,
+        calib_fraction=args.calib_fraction,
         test_fraction=args.test_fraction,
         grid_size=args.grid_size,
         min_confidence=args.min_confidence,

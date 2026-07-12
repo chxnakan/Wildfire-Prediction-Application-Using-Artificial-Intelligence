@@ -13,14 +13,20 @@ Services (no auth required):
 
 Note: GISTDA does not expose FRP or brightness temperature. Those columns
 are filled with NaN so the output file remains join-compatible with
-data/firms/firms_all.parquet. In data_loader.py the two sources are kept
-separate; frp/brightness features come exclusively from FIRMS.
+data/firms/firms_all.parquet.
 
-Unique value-add over FIRMS:
-  • ``lu_name`` — Thai land-use category per detection (national forest,
-    conservation forest, agriculture, etc.). Lets data_loader compute
-    "fraction of historic fires that were agricultural burns" per cell.
-  • Thai administrative names already attached (pv_tn/ap_tn/tb_tn).
+ROLE (explicit): GISTDA is an EXTERNAL VALIDATION + ANNOTATION source. It is
+NOT wired into model training, and its detections must never be concatenated
+with FIRMS as extra training rows — both reprocess the same VIIRS/MODIS
+overpasses, so blind concatenation double-counts the same physical fires.
+Appropriate uses:
+  • Live dashboard layer (independent Thai-official view of today's fires).
+  • External validation reference: compare model hits against GISTDA with an
+    explicit spatial (~1 cell) and temporal (~±1 day) matching tolerance.
+  • ``lu_name`` land-use + Thai admin annotation (pv_tn/ap_tn/tb_tn) for
+    display and analysis.
+If a future change wants GISTDA-derived model features, it must first
+deduplicate against FIRMS detections in space-time.
 
 Output schema:
   latitude, longitude, acq_datetime, frp (NaN), bright_ti4 (NaN),

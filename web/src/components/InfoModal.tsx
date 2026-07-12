@@ -360,17 +360,14 @@ export default function InfoModal(props: Props) {
               <dt>Validation MAE vs Test MAE</dt>
               <dd>Validation is the slice used during hyperparameter tuning; test is the held-out final 20% the model has never seen. If validation is dramatically worse than test, the validation window was unusually hard (often: off-peak fire season).</dd>
 
-              <dt>Urgency tiers (CRITICAL / HIGH / MEDIUM / LOW)</dt>
-              <dd>Buckets of <code>days_until_fire</code>: CRITICAL = fire today, HIGH ≤ 2 days, MEDIUM ≤ 4 days, LOW ≤ 7 days. Used for at-a-glance prioritisation; thresholds are listed under "Urgency distribution" above.</dd>
+              <dt>Urgency tiers (HIGH / MEDIUM / LOW)</dt>
+              <dd>Absolute cutoffs on the calibrated probability, selected on a held-out calibration period during training (HIGH = the deployment threshold; MEDIUM = the threshold catching ≥85% of calibration-period fires). Because they are absolute, a low-risk day can legitimately show zero HIGH cells.</dd>
 
-              <dt>days_until_fire (the model's actual output)</dt>
-              <dd>An integer 0–7 returned per grid cell — "the model thinks this cell will burn N days from the base date". 0 = today, 7 = end of the prediction horizon.</dd>
+              <dt>Probability (the model's actual output)</dt>
+              <dd>Calibrated P(≥1 FIRMS hotspot in this cell within the next 3 days). The model is a binary "fire within 3 days" classifier — it does <b>not</b> know whether a fire would land on day 1, 2, or 3.</dd>
 
-              <dt>raw_prediction</dt>
-              <dd>The continuous version of <code>days_until_fire</code> before flooring to an integer. Floor (not round) is used so a value of 0.96 lands on day 0 ("within 24h"), matching how operators read the bucket label.</dd>
-
-              <dt>Confidence (rounding proxy)</dt>
-              <dd>How close the raw prediction landed to the centre of its day-bucket: 1.0 = dead-centre, 0 = at the edge. <b>Not a calibrated probability</b> — don't read 0.80 as "80% chance the fire happens".</dd>
+              <dt>days_until_fire (display bucket)</dt>
+              <dd>An integer 0–7 used by the day selector to group cells — it is a <b>probability-rank band</b> (0 = highest-probability band), not a forecast of the exact fire date. The only date claim the model supports is "within the 3-day risk window".</dd>
 
               <dt>Historical fires (last 30 days, FIRMS)</dt>
               <dd>Literal count of NASA FIRMS hotspot detections in the cell over the last 30 days. Used as a sanity-check: a CRITICAL prediction in a cell with 0 recent fires deserves scepticism.</dd>

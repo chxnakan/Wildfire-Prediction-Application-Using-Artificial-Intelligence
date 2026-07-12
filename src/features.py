@@ -650,7 +650,16 @@ def add_multi_sat_confirmed(df: pd.DataFrame) -> pd.DataFrame:
 def make_label_days_until_fire(
     df: pd.DataFrame, horizon: int = MAX_PREDICTION_DAYS
 ) -> pd.DataFrame:
-    """Vectorized label: days until next strict-future fire in this cell, ≤ horizon."""
+    """Vectorized label: days until next strict-future fire in this cell, ≤ horizon.
+
+    Also emits `days_ahead_observed` — how many future calendar days the
+    dataset actually contains beyond each row's date. Near the dataset tail
+    the shift(-k).fillna(0) below silently converts "future not observed"
+    into "no future fire", which is a FALSE NEGATIVE label. Rows whose
+    days_ahead_observed < the label horizon in use are CENSORED: train.py
+    must exclude them from supervised training and evaluation (they remain
+    valid for live inference, where the future is genuinely unknown).
+    """
     df = _ensure_sorted(df).copy()
     labels = np.full(len(df), -1, dtype=np.int8)
     fire_today = (df["fire_count"].fillna(0) > 0).astype(np.int8)
@@ -668,6 +677,12 @@ def make_label_days_until_fire(
 
     df["days_until_fire"] = labels.astype(int)
     df["fire_today"] = fire_today.astype(int)
+    # NOT a model feature (encodes position relative to dataset end, which
+    # is meaningless at inference) — censoring bookkeeping only.
+    dates = pd.to_datetime(df["date"])
+    df["days_ahead_observed"] = (
+        (dates.max() - dates).dt.days.clip(upper=127).astype(np.int8)
+    )
     return df
 
 

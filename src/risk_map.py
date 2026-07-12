@@ -39,11 +39,19 @@ load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-MODEL_PATH = os.path.join(BASE_DIR, "outputs", "models", "lgbm_fire_date_model.pkl")
-DATA_PATH  = os.path.join(BASE_DIR, "outputs", "features", "full_features.parquet")
-META_PATH  = os.path.join(BASE_DIR, "outputs", "metadata", "dataset_info.json")
+# Honor OUTPUT_DIR like train.py / api.py — previously this module hardcoded
+# BASE_DIR/outputs, so under a custom OUTPUT_DIR (Railway volume at
+# /data/outputs) it silently read a stale model from the repo directory
+# while train.py wrote the fresh one elsewhere.
+_OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "./outputs")
+if not os.path.isabs(_OUTPUT_DIR):
+    _OUTPUT_DIR = os.path.join(BASE_DIR, _OUTPUT_DIR)
 
-RISKMAP_DIR  = os.path.join(BASE_DIR, "outputs", "riskmap")
+MODEL_PATH = os.path.join(_OUTPUT_DIR, "models", "lgbm_fire_date_model.pkl")
+DATA_PATH  = os.path.join(_OUTPUT_DIR, "features", "full_features.parquet")
+META_PATH  = os.path.join(_OUTPUT_DIR, "metadata", "dataset_info.json")
+
+RISKMAP_DIR  = os.path.join(_OUTPUT_DIR, "riskmap")
 GEOJSON_PATH = os.path.join(RISKMAP_DIR, "fire_dates_all.geojson")
 LATEST_PATH  = os.path.join(RISKMAP_DIR, "latest.json")
 
@@ -312,29 +320,31 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
         )
     X = base[feature_cols].fillna(0)
 
-    raw_pred = model.predict(X)
-    # Floor (not round) to assign each cell to a day bucket. round() pushed
-    # the model's narrow prediction band of [~1, ~5] days into days 1-5,
-    # leaving day 0 ("today") with 0 cells because the lowest raw_pred ~0.96
-    # rounds up to 1. Floor lets a 0.96 prediction land on day 0, which
-    # matches the operator's intuition that "≤1 day to fire" = today.
-    # Net effect: each bucket shifts forward by ~0.5 day on average and the
-    # day selector now exercises all of day 0..4 instead of just day 2..3.
+    # ── PRIMARY OUTPUT: calibrated P(≥1 hotspot within IMMINENT_DAYS) ──────
+    # The model is a binary "fire within 3 days" classifier. It does NOT
+    # know whether a fire lands on day 1, 2 or 3 — so this module must never
+    # manufacture an exact fire date from it. `probability` is the real,
+    # calibrated model output; everything else below is display scaffolding.
+    if hasattr(model, "predict_proba"):
+        prob = np.asarray(model.predict_proba(X), dtype=float)
+    else:  # very old artifact — recover rank-only proxy from pseudo-days
+        prob = 1.0 - (np.asarray(model.predict(X), dtype=float) - 1.0) / 6.0
+    base["probability"] = np.clip(prob, 0.0, 1.0)
+
+    raw_pred = model.predict(X)   # monotone pseudo-days (compat / display bins)
+    # Floor into integer bins. These bins are PROBABILITY-RANK buckets that
+    # the dashboard's day selector groups by — bin 0 = highest probability
+    # band, bin 7 = lowest. They are not date forecasts.
     days_floored = np.clip(np.floor(raw_pred), 0, MAX_PREDICTION_DAYS).astype(int)
 
     base["raw_prediction"] = raw_pred
     base["days_until_fire"] = days_floored
-    base["predicted_fire_date"] = [
-        (base_date + timedelta(days=int(d))).strftime("%Y-%m-%d")
-        for d in days_floored
-    ]
-
-    # Rounding-proximity proxy. Documented as NOT a calibrated probability.
-    # Anchored at the bucket centre (days_floored + 0.5) so a raw_pred sitting
-    # exactly in the middle of a day reads as confidence = 1.0.
-    base["prediction_confidence"] = (
-        1.0 - 2.0 * np.abs(raw_pred - (days_floored + 0.5))
-    ).clip(0.0, 1.0)
+    # Honest date semantics: the ONLY date claim this model supports is
+    # "within the next imminent_days days". Same window end for every cell.
+    imminent_days = int(meta.get("imminent_days", 3))
+    risk_window_end = (base_date + timedelta(days=imminent_days)).strftime("%Y-%m-%d")
+    base["predicted_fire_date"] = risk_window_end  # kept for frontend/CSV compat
+    base["prediction_confidence"] = base["probability"]  # legacy field alias
 
     # Attach real historical fire counts per cell at TWO time scales:
     #   • 30-day count → "is this cell active right now?"
@@ -451,20 +461,19 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
         )
         base["province"] = provinces
 
-    # Per-day cap: cells already grouped by days_until_fire (clipped int).
-    # Within each day we sort by recent activity — historical_fire_count_30d
-    # is the strongest "is this place burning right now" signal — and keep
-    # the top MAX_CELLS_PER_DAY. Cells without 30d history (e.g. brand-new
-    # active cells) get historical_fire_count_30d=0 and tie-break by
-    # raw_prediction (closer to integer = more confident).
+    # Display cap: within each probability bucket keep the top
+    # MAX_CELLS_PER_DAY ranked PRIMARILY by calibrated model probability
+    # (tie-break: recent activity). The previous ranking led with
+    # historical_fire_count_30d × 1000, which made the "model's" map mostly
+    # a recent-activity map. The number of suppressed cells is reported so
+    # the operator knows this is a display cap, not the model's full output.
+    n_suppressed_by_cap = 0
     if MAX_CELLS_PER_DAY > 0 and len(base) > 0:
         before = len(base)
-        # Confidence proxy: how close raw_pred landed to the rounded integer.
-        # Used as tiebreaker when historical_fire_count_30d is equal.
-        rounding_proximity = 1.0 - np.abs(
-            base["raw_prediction"].to_numpy() - base["days_until_fire"].to_numpy()
+        base = base.assign(
+            _rank_score=base["probability"].fillna(0) * 1000
+            + base["historical_fire_count_30d"].fillna(0).clip(upper=999) / 1000.0
         )
-        base = base.assign(_rank_score=base["historical_fire_count_30d"].fillna(0) * 1000 + rounding_proximity)
         base = (
             base.sort_values(["days_until_fire", "_rank_score"], ascending=[True, False])
                 .groupby("days_until_fire", group_keys=False)
@@ -472,91 +481,83 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
                 .drop(columns="_rank_score")
                 .reset_index(drop=True)
         )
-        n_dropped = before - len(base)
+        n_suppressed_by_cap = before - len(base)
         per_day_counts = base.groupby("days_until_fire").size().to_dict()
         print(
-            f"Per-day cap   : capped each predicted day to {MAX_CELLS_PER_DAY} most-active "
-            f"cells; dropped {n_dropped:,}; {len(base):,} / {before:,} kept "
-            f"(per-day: {per_day_counts})"
+            f"Display cap   : kept top {MAX_CELLS_PER_DAY} by model probability per bucket; "
+            f"suppressed {n_suppressed_by_cap:,}; {len(base):,} / {before:,} kept "
+            f"(per-bucket: {per_day_counts})"
         )
+    base.attrs["n_suppressed_by_cap"] = n_suppressed_by_cap
 
     print(f"Total after history filters: {len(base):,} / {n_total:,} cells "
           f"({len(base)*100/max(n_total,1):.1f}%)")
 
-    # ── Percentile-pyramid tier assignment ──
-    # The calibrated binary classifier emits a strongly bimodal probability
-    # distribution (one cluster near 0.05-0.10, another near 0.55-0.70,
-    # nothing in between). Day-based or fixed-probability thresholds
-    # therefore produce flat or inverted distributions: many "HIGH today"
-    # cells, no "MEDIUM" cells in between. A real fire-risk dashboard wants
-    # a pyramid — most cells LOW, fewer MEDIUM, rare HIGH — so the operator
-    # focuses on the few truly-urgent cells.
-    #
-    # We achieve that by ranking the surviving cells by RECOVERED
-    # PROBABILITY (the inverse of train.py's piecewise pseudo-days mapping)
-    # and assigning tiers by percentile within the snapshot:
-    #   HIGH    = top 10%
-    #   MEDIUM  = next 30%
-    #   LOW     = bottom 60%
-    # (CRITICAL is intentionally not used here — the operator can find
-    # CRITICAL-equivalent cells inside the HIGH tier by sorting by prob.)
-    #
-    # The downside: "HIGH" is relative to this snapshot, not an absolute
-    # confidence threshold. The threshold values written into
-    # `urgency_thresholds` reflect the actual probabilities cut at the 60th
-    # and 90th percentiles, so the frontend / metadata stays interpretable.
+    # ── Tier assignment: ABSOLUTE calibrated-probability thresholds ──
+    # Cutoffs are selected on the training pipeline's calib split (never on
+    # test) and persisted in dataset_info.json["probability_tier_thresholds"]:
+    #   HIGH   ≥ deployment threshold (F1-optimal on calib)
+    #   MEDIUM ≥ threshold catching ≥85% of calib fires
+    #   LOW    = everything else
+    # Because the thresholds are absolute, a genuinely low-risk day shows NO
+    # HIGH cells — unlike the previous percentile pyramid, which forced the
+    # top 10% of any snapshot to be "HIGH" even when nothing was likely to
+    # burn ("high relative to today" masquerading as high absolute risk).
+    probs = base["probability"].to_numpy()
 
-    def _raw_pred_to_prob(rp: float) -> float:
-        """Inverse of train.py's piecewise _prob_to_days_for_compat."""
-        days_anchors = [0.0, 0.5, 1.5, 2.5, 4.0, 5.5, 7.0]
-        prob_anchors = [1.0, 0.70, 0.50, 0.35, 0.20, 0.10, 0.00]
-        rp = float(rp)
-        if rp <= days_anchors[0]:
-            return prob_anchors[0]
-        if rp >= days_anchors[-1]:
-            return prob_anchors[-1]
-        for i in range(1, len(days_anchors)):
-            if rp <= days_anchors[i]:
-                t = (rp - days_anchors[i - 1]) / (days_anchors[i] - days_anchors[i - 1])
-                return prob_anchors[i - 1] + t * (prob_anchors[i] - prob_anchors[i - 1])
-        return 0.0
-
-    probs = np.array([_raw_pred_to_prob(rp) for rp in base["raw_prediction"]])
-    base["probability"] = probs
-
-    if len(base) >= 10:
-        # Percentile cutoffs from this snapshot's actual probability distribution
-        low_med_cut  = float(np.percentile(probs, 60))   # ≥ 60th pct → MEDIUM+
-        med_hi_cut   = float(np.percentile(probs, 90))   # ≥ 90th pct → HIGH
+    tier_meta = meta.get("probability_tier_thresholds") or {}
+    if {"HIGH", "MEDIUM"} <= set(tier_meta):
+        thr_high = float(tier_meta["HIGH"])
+        thr_med = float(tier_meta["MEDIUM"])
 
         def _tier(p: float) -> str:
-            if p >= med_hi_cut:  return "HIGH"
-            if p >= low_med_cut: return "MEDIUM"
+            if p >= thr_high:
+                return "HIGH"
+            if p >= thr_med:
+                return "MEDIUM"
             return "LOW"
 
         base["urgency_level"] = [_tier(p) for p in probs]
-        # Surface the thresholds for the frontend. Note: kept in PROBABILITY
-        # space (not days) — this matches the new tier semantics. CRITICAL
-        # is set to 1.01 so nothing ever satisfies "prob ≥ CRITICAL" by
-        # accident if a downstream component still checks for it.
         thresholds = {
-            "CRITICAL": 1.01,
-            "HIGH":     med_hi_cut,
-            "MEDIUM":   low_med_cut,
-            "LOW":      0.0,
+            "CRITICAL": 1.01,  # unreachable sentinel — tier not used
+            "HIGH": thr_high,
+            "MEDIUM": thr_med,
+            "LOW": 0.0,
         }
-        thresholds_source = "percentile-pyramid (top 10% HIGH / next 30% MEDIUM / rest LOW)"
+        thresholds_source = (
+            "absolute calibrated probability, selected on calib split "
+            f"(HIGH: F1-opt, precision={tier_meta.get('calib_precision_at_high')}, "
+            f"recall={tier_meta.get('calib_recall_at_high')}; "
+            f"MEDIUM: recall≥{tier_meta.get('calib_recall_target_medium')})"
+        )
+    elif len(base) >= 10:
+        # Legacy artifact without persisted cutoffs — RELATIVE ranking only.
+        # Explicitly labelled: "HIGH" here means "top of today's snapshot",
+        # not high absolute risk. Retrain to get absolute thresholds.
+        low_med_cut = float(np.percentile(probs, 60))
+        med_hi_cut = float(np.percentile(probs, 90))
+        base["urgency_level"] = [
+            "HIGH" if p >= med_hi_cut else "MEDIUM" if p >= low_med_cut else "LOW"
+            for p in probs
+        ]
+        thresholds = {"CRITICAL": 1.01, "HIGH": med_hi_cut, "MEDIUM": low_med_cut, "LOW": 0.0}
+        thresholds_source = (
+            "PRIORITY RANKING (relative percentiles — legacy model artifact "
+            "has no calibrated tier cutoffs; retrain to enable absolute tiers)"
+        )
     else:
-        # Tiny snapshot — fall back to fixed-domain days thresholds.
         thresholds = _resolve_thresholds(meta)
         base["urgency_level"] = [
             urgency_from_thresholds(int(d), thresholds)
             for d in base["days_until_fire"]
         ]
-        thresholds_source = "fixed-domain (too few cells for percentile pyramid)"
+        thresholds_source = "fixed-domain fallback (tiny snapshot)"
 
+    tier_counts = base["urgency_level"].value_counts().to_dict() if len(base) else {}
     print(f"Urgency thresholds [{thresholds_source}]: "
-          f"HIGH≥{thresholds['HIGH']:.3f} · MEDIUM≥{thresholds['MEDIUM']:.3f}")
+          f"HIGH≥{thresholds['HIGH']:.3f} · MEDIUM≥{thresholds['MEDIUM']:.3f} "
+          f"· tiers: {tier_counts}")
+    base.attrs["thresholds_source"] = thresholds_source
 
     return base, base_date, thresholds
 
@@ -746,7 +747,14 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
     geojson["metadata"] = {
         "base_date": base_date_str,
         "horizon_days": MAX_PREDICTION_DAYS,
+        "output_semantics": (
+            "probability = calibrated P(≥1 FIRMS hotspot within the risk "
+            "window). days_until_fire is a probability-rank display bucket, "
+            "NOT a forecast of the exact fire date."
+        ),
         "urgency_thresholds": thresholds,
+        "thresholds_source": str(predicted.attrs.get("thresholds_source", "")) if hasattr(predicted, "attrs") else "",
+        "suppressed_by_display_cap": int(predicted.attrs.get("n_suppressed_by_cap", 0)) if hasattr(predicted, "attrs") else 0,
         "metrics": metrics,
         "history_window_days": HISTORY_WINDOW_DAYS,
         "long_history_window_days": LONG_HISTORY_WINDOW_DAYS,
@@ -796,14 +804,17 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
             "properties": {
                 "base_date": base_date_str,
                 "source": "predicted",
+                # Probability-rank display bucket (0 = highest band). NOT an
+                # exact-date forecast — the binary model can't resolve days.
                 "days_until_fire": int(r["days_until_fire"]),
+                # End of the risk window (base_date + imminent_days) — the
+                # only date claim the model supports. Same for all cells.
                 "predicted_fire_date": str(r["predicted_fire_date"]),
                 "urgency_level": str(r["urgency_level"]),
                 "confidence": float(r["prediction_confidence"]),
                 "raw_prediction": float(r["raw_prediction"]),
-                # Real probability recovered from raw_prediction via the
-                # piecewise inverse — frontend prefers this over re-doing
-                # the inverse client-side.
+                # Calibrated P(≥1 hotspot within the risk window) — the
+                # model's actual output; everything else derives from it.
                 "probability": float(r.get("probability", 0.0)),
                 "historical_fire_count_30d": int(r["historical_fire_count_30d"]),
                 "historical_fire_count_long": int(r[long_col]),
@@ -896,7 +907,7 @@ def run():
         "search_method": _model_meta.get("search_method"),
         "search_iterations": _model_meta.get("n_iter"),
         "cv_n_splits": _model_meta.get("n_splits"),
-        "cv_gap_days": _model_meta.get("ts_split_gap_days"),
+        "cv_gap_days": _model_meta.get("cv_method") or _model_meta.get("ts_split_gap_days"),
         "ensemble_size": _model_meta.get("n_ensemble"),
         "early_stopping_rounds": _model_meta.get("early_stopping_rounds"),
         "best_params": _model_meta.get("best_params"),

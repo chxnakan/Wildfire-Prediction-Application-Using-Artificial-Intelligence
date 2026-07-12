@@ -267,32 +267,61 @@ def grid_and_aggregate(
 
 
 def densify_active_cells(daily: pd.DataFrame) -> pd.DataFrame:
-    """Expand to (active-cell × every-day-in-range) so rolling features see real zero-days.
+    """Expand to (cell × day) rows so rolling features see real zero-days —
+    CAUSALLY: a cell enters the universe only from its FIRST detection onward.
 
-    Active cell = cell with at least one detection in the dataset. Inactive cells
-    are excluded entirely (they have no signal to learn from).
+    The previous version included every historically-active cell across the
+    FULL date range, which leaks hindsight: whether a cell had rows in
+    January depended on it burning at any later point in the dataset. A
+    training row on Jan 5 for a cell whose first-ever fire was in March
+    encodes "this cell will eventually burn" — information unavailable on
+    Jan 5. Under the causal rule, the universe at time t = cells with at
+    least one detection at or before t, which an operator standing at time
+    t could actually enumerate.
+
+    Consequences (intentional):
+      - No pre-first-detection negative rows → fewer trivially-easy
+        negatives → reported metrics drop but become honest.
+      - The model still cannot flag never-burned cells (documented
+        limitation — the prediction universe is recent-history cells, not
+        all of Thailand).
     """
     if daily.empty:
         return daily
+
+    daily = daily.copy()
+    daily["date"] = pd.to_datetime(daily["date"]).dt.date
+
+    # First detection per cell — rows strictly before this are excluded.
+    first_seen = (
+        daily[daily["fire_count"] > 0]
+        .groupby(["lat_grid", "lon_grid"], as_index=False)["date"]
+        .min()
+        .rename(columns={"date": "_first_detection"})
+    )
 
     cells = daily[["lat_grid", "lon_grid"]].drop_duplicates().reset_index(drop=True)
     date_range = pd.date_range(daily["date"].min(), daily["date"].max(), freq="D").date
     dense_idx = cells.assign(_k=1).merge(
         pd.DataFrame({"date": date_range, "_k": 1}), on="_k"
     ).drop(columns="_k")
-
     dense_idx["date"] = pd.to_datetime(dense_idx["date"]).dt.date
-    daily = daily.copy()
-    daily["date"] = pd.to_datetime(daily["date"]).dt.date
+
+    n_full = len(dense_idx)
+    dense_idx = dense_idx.merge(first_seen, on=["lat_grid", "lon_grid"], how="left")
+    # Cells with no positive detection at all (possible when caller filtered
+    # fire rows upstream) have no causal entry point — drop them entirely.
+    dense_idx = dense_idx[dense_idx["_first_detection"].notna()]
+    dense_idx = dense_idx[dense_idx["date"] >= dense_idx["_first_detection"]]
+    dense_idx = dense_idx.drop(columns="_first_detection")
 
     out = dense_idx.merge(daily, on=["lat_grid", "lon_grid", "date"], how="left")
     out[AGG_COLUMNS] = out[AGG_COLUMNS].fillna(0.0)
 
     log.info(
-        "Densified %d active cells × %d days = %d rows",
-        len(cells),
-        len(date_range),
-        len(out),
+        "Densified %d cells × %d days causally: %d rows "
+        "(%d pre-first-detection rows excluded as hindsight)",
+        len(cells), len(date_range), len(out), n_full - len(out),
     )
     return out.sort_values(["lat_grid", "lon_grid", "date"]).reset_index(drop=True)
 
