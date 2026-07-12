@@ -41,6 +41,9 @@ from features import (
 )
 from storage import exists, read_json, read_pickle, read_table, resolve_existing
 
+import db as db_module
+import scheduler as scheduler_module
+
 # =====================================
 # CONFIG
 # =====================================
@@ -225,33 +228,60 @@ def _register_model_classes_in_main() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not os.path.exists(MODEL_PATH):
-        raise RuntimeError(f"Model not found at {MODEL_PATH}. Run train.py first.")
+    # ── model + feature state (degraded-mode tolerant) ──────────────────────
+    # On a fresh deployment (empty Railway volume) there is no trained model
+    # yet — the automation scheduler below will accumulate FIRMS data and
+    # train one. Refusing to boot here would crash-loop the whole service,
+    # so we start degraded instead: /health reports ready=false and
+    # model-dependent endpoints fail individually until training completes.
+    app.state.model = None
+    app.state.df = None
+    app.state.historical_counts = None
+    app.state.meta = {}
+    app.state.features = []
+    app.state.thresholds = dict(DEFAULT_URGENCY_THRESHOLDS)
+
     feature_path = resolve_existing(FEATURE_PATH)
-    if not feature_path:
-        raise RuntimeError(f"Feature file not found at {FEATURE_PATH}. Run train.py first.")
+    if os.path.exists(MODEL_PATH) and feature_path:
+        _register_model_classes_in_main()
+        app.state.model = read_pickle(MODEL_PATH)
 
-    _register_model_classes_in_main()
-    app.state.model = read_pickle(MODEL_PATH)
+        df_latest, historical_counts = _load_minimal_state(feature_path)
+        app.state.df = df_latest
+        # Pre-aggregated 30-day count per (lat_grid, lon_grid). Computed once at
+        # startup since base_date doesn't change between requests on a given
+        # snapshot — saves a groupby per request and avoids holding 290k history
+        # rows in RAM long-term.
+        app.state.historical_counts = historical_counts
 
-    df_latest, historical_counts = _load_minimal_state(feature_path)
-    app.state.df = df_latest
-    # Pre-aggregated 30-day count per (lat_grid, lon_grid). Computed once at
-    # startup since base_date doesn't change between requests on a given
-    # snapshot — saves a groupby per request and avoids holding 290k history
-    # rows in RAM long-term.
-    app.state.historical_counts = historical_counts
+        meta = _load_metadata()
+        app.state.meta = meta
+        app.state.features = _resolve_features(meta, df_latest)
+        app.state.thresholds = _resolve_thresholds(meta)
 
-    meta = _load_metadata()
-    app.state.meta = meta
-    app.state.features = _resolve_features(meta, df_latest)
-    app.state.thresholds = _resolve_thresholds(meta)
+        print("✅ Fire Date Prediction Model loaded")
+        print(f"   Features ({len(app.state.features)}): {len(FEATURES_WEATHER)} weather slots, "
+              f"weather active: {any(c in app.state.features for c in FEATURES_WEATHER)}")
+        print(f"   Calibrated thresholds: {app.state.thresholds}")
+    else:
+        print(f"⚠️  No trained model at {MODEL_PATH} — starting in DEGRADED mode.")
+        print("   The scheduler will fetch data and train automatically "
+              "(or run train.py manually).")
 
-    print("✅ Fire Date Prediction Model loaded")
-    print(f"   Features ({len(app.state.features)}): {len(FEATURES_WEATHER)} weather slots, "
-          f"weather active: {any(c in app.state.features for c in FEATURES_WEATHER)}")
-    print(f"   Calibrated thresholds: {app.state.thresholds}")
+    # ── database + automation scheduler ─────────────────────────────────────
+    try:
+        db_module.init_db()
+    except Exception as exc:  # DB down ≠ API down; log and continue
+        _log.error("Database init failed: %s", exc)
+
+    if os.getenv("SCHEDULER_ENABLED", "true").lower() in ("1", "true", "yes"):
+        scheduler_module.start()
+    else:
+        print("ℹ️  SCHEDULER_ENABLED=false — automation jobs not started")
+
     yield
+
+    scheduler_module.shutdown()
 
 
 # =====================================
@@ -398,6 +428,60 @@ def health(request: Request):
         "skill_check_passed": skill_check_passed,
         "feature_count": len(getattr(state, "features", []) or []),
     }
+
+
+# ─── automation ───────────────────────────────────────────────────────────────
+
+# Optional shared secret for the manual-trigger endpoints. When ADMIN_TOKEN is
+# set (Railway env), callers must send it as the X-Admin-Token header. When
+# unset (local dev), the endpoints are open.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+
+def _check_admin(request: Request) -> None:
+    if ADMIN_TOKEN and request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Admin-Token")
+
+
+@app.get("/api/automation/status")
+def automation_status():
+    """Everything monitoring needs in one call: DB row counts, last fetch,
+    last training run, and the scheduler's next fire times."""
+    return _json_sanitize({
+        "scheduler": scheduler_module.status(),
+        **db_module.automation_status(),
+    })
+
+
+@app.post("/api/admin/sync")
+def admin_sync(request: Request):
+    """Manually trigger one fetch-and-predict cycle (runs in a worker thread)."""
+    _check_admin(request)
+    import threading
+
+    from sync_worker import run_sync
+    threading.Thread(target=run_sync, name="manual-sync", daemon=True).start()
+    return {"status": "started", "detail": "sync running in background; "
+            "watch /api/automation/status"}
+
+
+@app.post("/api/admin/retrain")
+def admin_retrain(request: Request):
+    """Manually trigger a full retrain (long: 20+ min). Refuses when one is
+    already in progress."""
+    _check_admin(request)
+    if os.path.exists(scheduler_module.TRAIN_LOCK) or db_module.any_run_in_progress():
+        raise HTTPException(status_code=409, detail="Training already in progress")
+    import threading
+
+    threading.Thread(
+        target=scheduler_module.retrain_now,
+        kwargs={"trigger": "manual"},
+        name="manual-retrain",
+        daemon=True,
+    ).start()
+    return {"status": "started", "detail": "training in background; "
+            "watch /api/automation/status"}
 
 
 def _json_sanitize(obj):

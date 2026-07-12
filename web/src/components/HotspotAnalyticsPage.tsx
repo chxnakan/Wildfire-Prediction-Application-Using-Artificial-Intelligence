@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Bar, BarChart, CartesianGrid, Cell, Legend, Pie, PieChart,
+  Bar, BarChart, CartesianGrid, Cell, Pie, PieChart,
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
 import type { GistdaFeature } from "../types";
@@ -218,22 +218,6 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
           </div>
         ))}
       </div>
-    );
-  };
-
-  const PieLabelLine = ({ cx, cy, midAngle, outerRadius, name, value, percent }: {
-    cx: number; cy: number; midAngle: number; outerRadius: number;
-    name: string; value: number; percent: number;
-  }) => {
-    if (percent < 0.04) return null;
-    const RADIAN = Math.PI / 180;
-    const x = cx + (outerRadius + 14) * Math.cos(-midAngle * RADIAN);
-    const y = cy + (outerRadius + 14) * Math.sin(-midAngle * RADIAN);
-    return (
-      <text x={x} y={y} fill="var(--text-2)" textAnchor={x > cx ? "start" : "end"}
-        dominantBaseline="central" fontSize={10}>
-        {name}: {value}
-      </text>
     );
   };
 

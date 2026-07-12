@@ -78,7 +78,10 @@ There is no Python test suite, linter, or build step.
 | `model.py` | **Legacy from the multi-model era.** train.py no longer uses its `select_best` / multi-candidate helpers; the binary classifier path is self-contained in train.py. Kept around because some tools still import `evaluate()` / `EnsembleRegressor`. |
 | `train.py` | End-to-end binary classifier pipeline (see "Training pipeline" below). |
 | `risk_map.py` | Loads model + features, predicts for latest base date, filters (history / urban / country / per-day cap), assigns urgency tiers, writes `outputs/riskmap/fire_dates_all.geojson` (append-mode). |
-| `api.py` | FastAPI: `/predictions/today`, `/predictions/timeline`, `/predictions/day/{n}`, `/predict/location`, `/metrics`, `/geojson`. Mounts `web/dist/` at `/` so SPA + API share port 8000. |
+| `api.py` | FastAPI: `/predictions/today`, `/predictions/timeline`, `/predictions/day/{n}`, `/predict/location`, `/metrics`, `/geojson`. Mounts `web/dist/` at `/` so SPA + API share port 8000. Starts the automation scheduler in its lifespan (disable with `SCHEDULER_ENABLED=false`). Boots in degraded mode (no crash) when no trained model exists yet. |
+| `db.py` | PostgreSQL persistence (hotspots / predictions / model runs / fetch log). **Every function is a silent no-op when `DATABASE_URL` is unset** — local dev needs no Postgres. psycopg3 dialect, `ON CONFLICT DO NOTHING` dedupe. |
+| `sync_worker.py` | One sync cycle: fetch FIRMS → detect new rows (parquet delta + DB rowcount) → if new, subprocess `train.py --predict-only` → always write `fetch_log`. Never raises. |
+| `scheduler.py` | APScheduler wiring: `sync_job` every `SYNC_INTERVAL_MINUTES` (10), `retrain_check_job` every 6 h retrains when the model is older than `RETRAIN_EVERY_DAYS` (3). Restart-safe (compares persisted timestamps, not interval clocks). `outputs/.train.lock` guards train vs. predict overlap. |
 
 ### Pipeline
 
@@ -195,6 +198,19 @@ All entry points resolve paths via `BASE_DIR = parent-of-src`. `train.py` reads 
 | `MAX_CELLS_PER_DAY` | `100` | risk_map per-day cap; 0 disables |
 | `MIN_FIRE_DAYS_PER_YEAR` | `3.0` | risk_map filter: annualized fire-day rate floor |
 | `MAX_TRAIN_HISTORY_DAYS` | `0` | If >0, train.py keeps only this many latest days of densified data |
+| `DATABASE_URL` | (unset) | PostgreSQL archive. Unset ⇒ db.py is a no-op; parquet/GeoJSON only |
+| `SCHEDULER_ENABLED` | `true` | Start APScheduler jobs in api.py's lifespan |
+| `SYNC_INTERVAL_MINUTES` | `10` | Fetch-and-predict cycle interval |
+| `RETRAIN_EVERY_DAYS` | `3` | Retrain when the last successful run is older than this |
+| `TRAIN_ARGS` | `--quick` | Args passed to the scheduled train.py subprocess |
+| `ADMIN_TOKEN` | (unset) | Secret for `/api/admin/sync` + `/api/admin/retrain` (`X-Admin-Token` header). Unset ⇒ open (dev) |
+
+### Automation / deployment (Railway + Vercel)
+
+- Split deploy: Railway runs FastAPI + APScheduler + PostgreSQL; Vercel serves `web/dist/` with `VITE_API_BASE` pointing at the Railway URL. Config: `railway.toml` (has the full setup checklist in comments) + `vercel.json`.
+- Railway needs a **Volume** (mount e.g. `/data`, set `OUTPUT_DIR=/data/outputs`, `FIRMS_PATH=/data/firms/firms_all.parquet`, `RAW_DIR=/data/raw`) — the filesystem is otherwise wiped on each deploy, losing the model + FIRMS cache.
+- GeoJSON stays the serving format; PostgreSQL is the durable archive (hotspots, prediction snapshots, model-run history, fetch audit log). A DB outage never blocks the map refresh.
+- `/api/automation/status` = one-call monitoring (scheduler next-run times, last fetch, last model run, row counts).
 
 ### Gotchas
 
@@ -203,7 +219,7 @@ All entry points resolve paths via `BASE_DIR = parent-of-src`. `train.py` reads 
 - **Test metrics look terrible (MAE 5 d, acc±1 6%)** = you're reading legacy regression keys from `test_metrics` on a binary task. Read `roc_auc`, `f1`, `precision_at_best_thr` instead; check `test_metrics.task` first.
 - **All predictions land in MEDIUM/LOW, no CRITICAL/HIGH** = the binary classifier's probabilities are mostly 0.3–0.5 (uncertain), which under the pseudo-days mapping land in days 4–5. To get more CRITICAL alerts, either improve features (weather completion, drought index) or tune `_prob_to_days_for_compat()`.
 - **`fetch_firms.py` HTTP 400 across all datasets** = bad / rate-limited `MAP_KEY`. Check status at `https://firms.modaps.eosdis.nasa.gov/mapserver/mapkey_status/?MAP_KEY=…`. Resets daily.
-- **`uvicorn api:app` startup `RuntimeError: Model not found`** = no trained artifact. Run `python train.py` first.
+- **API boots but `/health` says `ready: false`** = no trained artifact yet (degraded mode — the old hard `RuntimeError` on startup was removed so fresh Railway deploys don't crash-loop). Run `python train.py`, or let the scheduler train once enough data accumulates.
 - **Stale model after feature changes**: delete `outputs/models/*.pkl` before retraining. api.py / risk_map.py resolve features from `dataset_info.json` but a leftover `.pkl` from a different feature contract will silently mispredict.
 - **`scikit-optimize` / `matplotlib` missing**: train.py falls back to `RandomizedSearchCV` / skips PNG report. Install for full functionality: `pip install scikit-optimize matplotlib scipy`.
 - **`PerformanceWarning: DataFrame is highly fragmented`** during feature build is harmless — pandas warns about column-by-column `frame.insert` calls.

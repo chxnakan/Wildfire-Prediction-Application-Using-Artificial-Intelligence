@@ -907,6 +907,18 @@ def run():
     # comparison view.
     append_geojson(observed, predicted, base_date, thresholds, metrics, daily_df=df)
 
+    # Mirror this snapshot into PostgreSQL when a DATABASE_URL is configured
+    # (Railway). The GeoJSON stays the serving format; the DB is the durable
+    # archive that survives redeploys and feeds long-term analytics. A DB
+    # failure must never break the map refresh, hence the broad except.
+    try:
+        import db
+        if db.enabled():
+            n = db.insert_predictions(predicted, base_date)
+            print(f"🗄️  Persisted {n} predictions to database (base_date={base_date})")
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️  DB persist skipped: {exc}")
+
     print("\n✅ FIRE DATE MAP UPDATED")
     print("Observed date :", obs_date)
     print("Base date     :", base_date)
