@@ -9,7 +9,7 @@ import { useState } from "react";
 // Designed so non-ML readers can understand each number at a glance and
 // drill in for detail without leaving the page.
 
-export type MetricStatus = "great" | "good" | "ok" | "warn" | "bad";
+export type MetricStatus = "great" | "good" | "ok" | "info" | "warn" | "bad";
 
 interface RangeMarker {
   position: number;            // 0..1 along the scale bar
@@ -34,6 +34,8 @@ interface Props {
   goodRange: string;
   // Smaller secondary text shown below the value (e.g. "across 17 months")
   subtitle?: string;
+  // Optional evidence-backed context displayed within the same card.
+  secondaryStat?: string;
   highlight?: boolean;         // visual emphasis for hero card
 }
 
@@ -41,6 +43,7 @@ const STATUS_COLORS: Record<MetricStatus, string> = {
   great: "#22c55e",   // green
   good:  "#84cc16",   // light-green
   ok:    "#eab308",   // yellow
+  info:  "#60a5fa",   // neutral informational blue
   warn:  "#f59e0b",   // orange
   bad:   "#ef4444",   // red
 };
@@ -49,13 +52,14 @@ const STATUS_BG: Record<MetricStatus, string> = {
   great: "rgba(34, 197, 94, 0.10)",
   good:  "rgba(132, 204, 22, 0.10)",
   ok:    "rgba(234, 179, 8, 0.10)",
+  info:  "rgba(59, 130, 246, 0.10)",
   warn:  "rgba(245, 158, 11, 0.10)",
   bad:   "rgba(239, 68, 68, 0.10)",
 };
 
 export default function MetricCard({
   label, value, statusLabel, status, range, description, goodRange,
-  subtitle, highlight = false,
+  subtitle, secondaryStat, highlight = false,
 }: Props) {
   const [expanded, setExpanded] = useState(false);
   const color = STATUS_COLORS[status];
@@ -91,6 +95,9 @@ export default function MetricCard({
         )}
       </div>
       {subtitle && <div className="metric-card-subtitle">{subtitle}</div>}
+      {secondaryStat && (
+        <div className="metric-card-secondary-stat">{secondaryStat}</div>
+      )}
 
       {range && (
         <RangeBar

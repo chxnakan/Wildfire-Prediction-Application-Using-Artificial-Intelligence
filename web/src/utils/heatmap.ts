@@ -1,10 +1,16 @@
 import L from "leaflet";
-import { URGENCY_COLORS } from "../constants";
 import type { FireFeature, UrgencyThresholds } from "../types";
+import {
+  heatmapColor,
+  heatmapProbability,
+  heatmapRiskIntensity,
+} from "./heatmapScale";
 
-// IDW heatmap: each pixel's color comes from the NEAREST cell's
-// raw_prediction (averaging produced tier-mismatches around boundaries).
-// Per-pixel alpha falls off quadratically for soft circular blobs.
+// Each pixel's color comes from the NEAREST cell's calibrated probability
+// (averaging produced tier-mismatches around boundaries). Per-pixel alpha
+// combines distance falloff with ABSOLUTE risk, so an off-season snapshot
+// cannot make a tiny probability look intense merely because it is the
+// largest value on that day.
 
 interface Pt {
   lat: number;
@@ -23,31 +29,6 @@ function hexToRgb(hex: string): RGB {
   };
 }
 
-function valueToColor(value: number, thresholds: UrgencyThresholds): RGB {
-  const stops = [
-    { v: 0, c: hexToRgb(URGENCY_COLORS.CRITICAL) },
-    { v: thresholds.CRITICAL, c: hexToRgb(URGENCY_COLORS.CRITICAL) },
-    { v: thresholds.HIGH, c: hexToRgb(URGENCY_COLORS.HIGH) },
-    { v: thresholds.MEDIUM, c: hexToRgb(URGENCY_COLORS.MEDIUM) },
-    { v: thresholds.LOW, c: hexToRgb(URGENCY_COLORS.LOW) },
-  ];
-  if (value <= stops[0].v) return stops[0].c;
-  for (let i = 1; i < stops.length; i++) {
-    if (value <= stops[i].v) {
-      const a = stops[i - 1];
-      const b = stops[i];
-      const span = b.v - a.v;
-      const t = span > 1e-9 ? (value - a.v) / span : 0;
-      return {
-        r: Math.round(a.c.r + t * (b.c.r - a.c.r)),
-        g: Math.round(a.c.g + t * (b.c.g - a.c.g)),
-        b: Math.round(a.c.b + t * (b.c.b - a.c.b)),
-      };
-    }
-  }
-  return stops[stops.length - 1].c;
-}
-
 const STRIDE = 4;
 const MAX_ALPHA = 200;
 
@@ -57,15 +38,11 @@ export function createHeatmapLayer(
   radius: number
 ): L.Layer | null {
   if (!features || features.length === 0) return null;
-  const t = thresholds ?? { CRITICAL: 1, HIGH: 2.5, MEDIUM: 4.5, LOW: 7 };
   const points: Pt[] = features
     .map((f) => ({
       lat: f.geometry.coordinates[1],
       lon: f.geometry.coordinates[0],
-      value:
-        f.properties.raw_prediction != null
-          ? Number(f.properties.raw_prediction)
-          : Number(f.properties.days_until_fire ?? NaN),
+      value: heatmapProbability(f.properties) ?? NaN,
     }))
     .filter((p) => isFinite(p.value));
   if (points.length === 0) return null;
@@ -139,11 +116,14 @@ export function createHeatmapLayer(
             data[idx + 3] = 0;
             continue;
           }
-          const color = valueToColor(nearestValue, t);
+          const color = hexToRgb(heatmapColor(nearestValue, thresholds));
+          const riskIntensity = heatmapRiskIntensity(nearestValue, thresholds);
           data[idx] = color.r;
           data[idx + 1] = color.g;
           data[idx + 2] = color.b;
-          data[idx + 3] = Math.round(Math.min(1, blobAlpha * 1.4) * MAX_ALPHA);
+          data[idx + 3] = Math.round(
+            Math.min(1, blobAlpha * 1.4) * MAX_ALPHA * riskIntensity,
+          );
         }
       }
 

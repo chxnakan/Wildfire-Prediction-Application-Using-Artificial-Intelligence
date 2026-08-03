@@ -53,8 +53,9 @@ def date_grouped_split(
     calib_fraction: float = 0.10,
     test_fraction: float = 0.15,
     purge_days: int = 7,
+    champion_fraction: float = 0.0,
 ) -> SplitResult:
-    """Chronological train/val/calib/test split on WHOLE calendar dates.
+    """Chronological train/val/calib/[champion]/test split on WHOLE calendar dates.
 
     Fractions are of the unique-date count (not row count) so a burst of
     hotspots on one day cannot straddle a boundary. Between consecutive
@@ -66,29 +67,42 @@ def date_grouped_split(
       - a validation row's rolling-history features (which look backward)
         share no day with training labels' forward windows.
 
+    ``champion_fraction > 0`` inserts a dedicated PROMOTION/champion block
+    between calib and test:
+
+        [ train ][purge][ val ][purge][ calib ][purge][ champion ][purge][ test ]
+
+    Candidate-vs-incumbent promotion decisions run on the champion block so the
+    FINAL test stays untouched by model selection (repeated promotions on the
+    test set leak selection decisions into the reported number). Default 0.0
+    keeps the legacy 4-way layout for backward compatibility.
+
     Raises ValueError when the data span is too short to give every split
     at least one date after purging.
     """
-    if val_fraction + calib_fraction + test_fraction >= 1.0:
-        raise ValueError("val + calib + test fractions must sum to < 1.0")
+    if val_fraction + calib_fraction + test_fraction + champion_fraction >= 1.0:
+        raise ValueError("val + calib + champion + test fractions must sum to < 1.0")
 
     s = _to_date_series(dates)
     unique_dates = np.array(sorted(s.unique()))
     n = len(unique_dates)
 
+    n_champion = max(int(round(n * champion_fraction)), 1) if champion_fraction > 0 else 0
+    n_purges = 4 if n_champion else 3
     n_test = max(int(round(n * test_fraction)), 1)
     n_calib = max(int(round(n * calib_fraction)), 1)
     n_val = max(int(round(n * val_fraction)), 1)
-    n_train = n - n_val - n_calib - n_test - 3 * purge_days
+    n_train = n - n_val - n_calib - n_champion - n_test - n_purges * purge_days
     if n_train < 1:
         raise ValueError(
-            f"Not enough distinct dates ({n}) for a 4-way split with "
+            f"Not enough distinct dates ({n}) for a "
+            f"{'5' if n_champion else '4'}-way split with "
             f"{purge_days}-day purges — need at least "
-            f"{n_val + n_calib + n_test + 3 * purge_days + 1}."
+            f"{n_val + n_calib + n_champion + n_test + n_purges * purge_days + 1}."
         )
 
     # Chronological block layout:
-    # [ train ][purge][ val ][purge][ calib ][purge][ test ]
+    # [ train ][purge][ val ][purge][ calib ][purge][ (champion)[purge] ][ test ]
     bounds = {}
     i = n_train
     bounds["train"] = unique_dates[:i]
@@ -97,6 +111,9 @@ def date_grouped_split(
     i += n_val + purge_days
     bounds["calib"] = unique_dates[i : i + n_calib]
     i += n_calib + purge_days
+    if n_champion:
+        bounds["champion"] = unique_dates[i : i + n_champion]
+        i += n_champion + purge_days
     bounds["test"] = unique_dates[i:]
 
     masks: Dict[str, np.ndarray] = {}
@@ -113,7 +130,9 @@ def date_grouped_split(
         masks=masks,
         date_ranges=date_ranges,
         purge_days=purge_days,
-        n_dates_purged=3 * purge_days,
+        # A champion block adds a fourth split boundary; report all actual
+        # purged dates rather than the legacy four-way constant.
+        n_dates_purged=n_purges * purge_days,
         info={
             "n_unique_dates": n,
             "n_dates_per_split": {k: len(v) for k, v in bounds.items()},
@@ -145,7 +164,7 @@ def assert_split_valid(result: SplitResult, dates) -> None:
 
     # Purge width: min date of each later split must be > purge_days after
     # max date of every earlier split.
-    order = [n for n in ("train", "val", "calib", "test") if date_sets.get(n)]
+    order = [n for n in ("train", "val", "calib", "champion", "test") if date_sets.get(n)]
     for i, earlier in enumerate(order):
         for later in order[i + 1:]:
             gap = (min(date_sets[later]) - max(date_sets[earlier])).days

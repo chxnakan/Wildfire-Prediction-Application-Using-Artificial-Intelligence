@@ -15,8 +15,9 @@ import type {
 //   • scientific_stats.json    (via metrics.scientific_stats)
 //   • rolling_eval.json        (via metrics.rolling_by_month + stability_*)
 //
-// Per CLAUDE.md hard rule: no synthetic, simulated, or interpolated values.
-// If a field is missing in the artifact, we render "—" rather than fabricate.
+// Trust rule: every displayed metric must come from a persisted artifact.
+// Source pipelines may legitimately derive aggregates/reanalysis features;
+// if a report field is missing, render "—" rather than inventing a value.
 // ─────────────────────────────────────────────────────────────
 
 interface Props {
@@ -30,15 +31,21 @@ export default function ModelTrainingSummary({ metrics }: Props) {
   const inlineSummary = metrics?.training_summary;
   const [summary, setSummary] = useState<TrainingSummary | null>(inlineSummary ?? null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
-    if (summary) return;
+    if (inlineSummary) {
+      setSummary(inlineSummary);
+      setLoadError(null);
+      return;
+    }
     let cancelled = false;
+    setLoadError(null);
     fetchTrainingSummary()
       .then((s) => { if (!cancelled) setSummary(s); })
       .catch((e: Error) => { if (!cancelled) setLoadError(e.message); });
     return () => { cancelled = true; };
-  }, [summary]);
+  }, [inlineSummary, retryKey]);
 
   const sci = metrics?.scientific_stats ?? null;
   const rolling = metrics?.rolling_by_month ?? [];
@@ -52,9 +59,16 @@ export default function ModelTrainingSummary({ metrics }: Props) {
   if (loadError && !summary) {
     return (
       <section className="report-section">
-        <p style={{ color: "var(--text-3)", fontSize: 12 }}>
-          ไม่สามารถโหลด training summary: {loadError}
-        </p>
+        <div className="report-inline-error" role="alert">
+          <span>ไม่สามารถโหลด training summary: {loadError}</span>
+          <button
+            type="button"
+            className="action-btn"
+            onClick={() => setRetryKey((key) => key + 1)}
+          >
+            ลองอีกครั้ง
+          </button>
+        </div>
       </section>
     );
   }
@@ -70,9 +84,17 @@ export default function ModelTrainingSummary({ metrics }: Props) {
           </p>
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          <span className="status-chip status-chip-ok">✓ Calibrated</span>
-          <span className="status-chip status-chip-ok">✓ Bootstrap 95% CI</span>
-          <span className="status-chip status-chip-ok">✓ Chronological split (no leak)</span>
+          {metrics?.calibration_method && (
+            <span className="status-chip status-chip-ok">
+              ✓ Calibrated · {metrics.calibration_method}
+            </span>
+          )}
+          {sci && (
+            <span className="status-chip status-chip-ok">✓ Bootstrap 95% CI</span>
+          )}
+          {summary?.cv_n_splits != null && (
+            <span className="status-chip status-chip-ok">✓ Time-series CV recorded</span>
+          )}
         </div>
       </header>
 
@@ -97,7 +119,10 @@ export default function ModelTrainingSummary({ metrics }: Props) {
             label="Precision @ deploy"
             point={sci.ci_95.precision_at_deploy.point}
             ci={[sci.ci_95.precision_at_deploy.lower, sci.ci_95.precision_at_deploy.upper]}
-            interpret={`baseline = ${(sci.classification_stats.baseline_class_prior * 100).toFixed(1)}% (positive rate) · uplift ≈ ${(sci.ci_95.precision_at_deploy.point / sci.classification_stats.baseline_class_prior).toFixed(1)}×`}
+            interpret={formatUplift(
+              sci.ci_95.precision_at_deploy.point,
+              sci.classification_stats.baseline_class_prior,
+            )}
             tone="ok"
           />
           <ResultCard
@@ -111,7 +136,7 @@ export default function ModelTrainingSummary({ metrics }: Props) {
             label="Brier score"
             point={sci.ci_95.brier_score.point}
             ci={[sci.ci_95.brier_score.lower, sci.ci_95.brier_score.upper]}
-            interpret="ยิ่งต่ำยิ่งดี · <0.05 = calibrated probabilities"
+            interpret="Mean squared probability error · ยิ่งต่ำยิ่งดี"
             tone={sci.ci_95.brier_score.point < 0.05 ? "great" : "good"}
             invert
           />
@@ -119,7 +144,10 @@ export default function ModelTrainingSummary({ metrics }: Props) {
             label="Avg Precision"
             point={sci.ci_95.average_precision.point}
             ci={[sci.ci_95.average_precision.lower, sci.ci_95.average_precision.upper]}
-            interpret={`baseline = ${(sci.classification_stats.baseline_class_prior * 100).toFixed(1)}% · uplift ≈ ${(sci.ci_95.average_precision.point / sci.classification_stats.baseline_class_prior).toFixed(1)}×`}
+            interpret={formatUplift(
+              sci.ci_95.average_precision.point,
+              sci.classification_stats.baseline_class_prior,
+            )}
             tone="ok"
           />
         </div>
@@ -128,7 +156,7 @@ export default function ModelTrainingSummary({ metrics }: Props) {
       {/* ── Dataset · Model · Training cards (3-up) ── */}
       <div className="summary-cards-row">
         <SummaryCard title="📦 Dataset">
-          <DefRow k="Source" v={summary?.data_source ?? "NASA FIRMS VIIRS NRT + ECMWF ERA5 (Open-Meteo)"} />
+          <DefRow k="Source" v={summary?.data_source ?? "—"} />
           <DefRow k="Date range" v={summary?.date_range && summary.date_range[0] ? `${summary.date_range[0]} → ${summary.date_range[1]}` : "—"} />
           <DefRow k="Total days" v={summary?.total_days?.toLocaleString() ?? "—"} />
           <DefRow k="Active cells" v={summary?.active_cells?.toLocaleString() ?? "—"} suffix={summary?.grid_size_deg ? `× ${summary.grid_size_deg}° grid` : undefined} />
@@ -138,8 +166,8 @@ export default function ModelTrainingSummary({ metrics }: Props) {
         </SummaryCard>
 
         <SummaryCard title="🧠 Model">
-          <DefRow k="Type" v={(summary?.model_type ?? "lightgbm").toUpperCase()} />
-          <DefRow k="Task" v={summary?.prediction_type ?? "binary_fire_in_3d"} />
+          <DefRow k="Type" v={summary?.model_type?.toUpperCase() ?? "—"} />
+          <DefRow k="Task" v={summary?.prediction_type ?? "—"} />
           <DefRow k="Imminent horizon" v={summary?.imminent_days ? `${summary.imminent_days} days` : "—"} />
           {summary?.best_params && (
             <>
@@ -156,13 +184,30 @@ export default function ModelTrainingSummary({ metrics }: Props) {
         </SummaryCard>
 
         <SummaryCard title="🎓 Training">
-          <DefRow k="Split"        v="Chronological 60 / 20 / 20" suffix="(no shuffle)" />
+          <DefRow
+            k="Split"
+            v={sci ? "Chronological train / validation / test" : "—"}
+            suffix={sci ? "(persisted date ranges below)" : undefined}
+          />
           <DefRow k="HP search"    v={summary?.search_method ?? "—"} suffix={summary?.search_iterations ? `${summary.search_iterations} iters` : undefined} />
-          <DefRow k="Inner CV"     v={summary?.cv_n_splits ? `TimeSeriesSplit · ${summary.cv_n_splits} folds` : "—"} suffix={summary?.cv_gap_days != null ? `gap ${summary.cv_gap_days}d` : undefined} />
-          <DefRow k="Ensemble"     v={summary?.ensemble_size?.toString() ?? "—"} suffix="LGBM models (different seeds)" />
+          <DefRow
+            k="Inner CV"
+            v={summary?.cv_n_splits ? `${summary.cv_n_splits} chronological folds` : "—"}
+            suffix={formatCvGap(summary?.cv_gap_days)}
+          />
+          <DefRow
+            k="Ensemble"
+            v={summary?.ensemble_size?.toString() ?? "—"}
+            suffix={summary?.ensemble_size ? "models (different seeds)" : undefined}
+          />
           <DefRow k="Early stop"   v={summary?.early_stopping_rounds ? `${summary.early_stopping_rounds} rounds` : "—"} />
-          <DefRow k="Calibration"  v="Platt sigmoid (fit on val)" />
-          <DefRow k="Sample wt"    v="recency × inverse freq × day-bucket boost" />
+          <DefRow
+            k="Calibration"
+            v={metrics?.calibration_method ?? "—"}
+            suffix={metrics?.threshold_selected_on
+              ? `threshold selected on ${metrics.threshold_selected_on}`
+              : undefined}
+          />
           <DefRow k="Train time"   v={summary?.training_time_seconds ? `${(summary.training_time_seconds / 60).toFixed(1)} min` : "—"} />
         </SummaryCard>
       </div>
@@ -170,7 +215,10 @@ export default function ModelTrainingSummary({ metrics }: Props) {
       {/* ── Bootstrap CI table — large, prominent ── */}
       {sci && (
         <div style={{ marginTop: 18 }}>
-          <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>📐 Bootstrap 95% Confidence Intervals (n = 1000 resamples)</h3>
+          <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
+            📐 Bootstrap 95% Confidence Intervals
+            {" "}(n = {sci.ci_95.roc_auc.n_boot.toLocaleString()} resamples)
+          </h3>
           <table className="stats-table">
             <thead>
               <tr>
@@ -243,10 +291,15 @@ export default function ModelTrainingSummary({ metrics }: Props) {
         </div>
       )}
 
-      <p style={{ marginTop: 16, fontSize: 11, color: "var(--text-3)", fontStyle: "italic", lineHeight: 1.6 }}>
-        Limitation: precision is intentionally low at the operational threshold (0.05) — the model is tuned for high recall
-        on a rare positive class (~3.5% prior), so it accepts false alarms to avoid missing actual fires.
-      </p>
+      {metrics?.deployment_threshold != null && (
+        <p style={{ marginTop: 16, fontSize: 11, color: "var(--text-3)", fontStyle: "italic", lineHeight: 1.6 }}>
+          Persisted HIGH operating point: threshold {metrics.deployment_threshold.toFixed(4)}
+          {metrics.high_test_metrics
+            ? ` · held-out precision ${(metrics.high_test_metrics.precision * 100).toFixed(1)}% · held-out recall ${(metrics.high_test_metrics.recall * 100).toFixed(1)}%`
+            : ""}
+          . Threshold performance can change when seasonal fire prevalence shifts.
+        </p>
+      )}
     </section>
   );
 }
@@ -306,13 +359,27 @@ function fmt(v: unknown): string {
   return String(v);
 }
 
+function formatUplift(point: number, prior: number): string {
+  const baseline = Number.isFinite(prior)
+    ? `${(prior * 100).toFixed(1)}%`
+    : "—";
+  const uplift =
+    Number.isFinite(point) && Number.isFinite(prior) && prior > 0
+      ? `${(point / prior).toFixed(1)}×`
+      : "—";
+  return `baseline = ${baseline} (positive rate) · uplift = ${uplift}`;
+}
+
+function formatCvGap(gap: TrainingSummary["cv_gap_days"]): string | undefined {
+  if (gap == null || gap === "") return undefined;
+  return typeof gap === "number" ? `gap ${gap}d` : String(gap);
+}
+
 function formatDate(iso: string): string {
-  try {
-    const d = new Date(iso);
-    return d.toLocaleDateString("en-CA") + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  } catch {
-    return iso;
-  }
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString("en-CA") + " " +
+    d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function prettyMetricName(key: keyof ScientificStats["ci_95"]): string {

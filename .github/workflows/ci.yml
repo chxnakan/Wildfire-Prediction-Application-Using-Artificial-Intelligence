@@ -1,0 +1,92 @@
+name: CI
+
+# Fast, deterministic checks only — NO model retraining (tests use hermetic
+# fixtures + mocked model/network). See src/pytest.ini for the hang-guard.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Byte-compile all Python
+        run: python -m compileall -q src scripts
+      - name: Pytest (hang-guarded, no network/DB/scheduler)
+        env:
+          SCHEDULER_ENABLED: "false"
+          APP_ENV: "development"
+        # pytest.ini sets a 60s per-test timeout so a hung TestClient lifespan
+        # fails with a thread dump instead of hanging the job.
+        run: cd src && python -m pytest -q --timeout=90
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install deps
+        run: npm ci
+      - name: Type-check
+        run: npm run typecheck
+      - name: Unit tests (Vitest)
+        run: npm test
+      - name: Production build
+        run: npm run build
+
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Whitespace / conflict-marker check (changed range only)
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -n "$base" ]; then
+            git diff --check "$base" HEAD
+          else
+            git diff --check HEAD~1 HEAD || git diff --check
+          fi
+      - name: Semantic contract — no exact-date forecasts on prediction surfaces
+        # The binary model must never present an exact predicted fire date.
+        # Guard the API + inference surfaces (frontend is covered by the
+        # deprecated-field guard in code review); tests/test_api_semantics.py
+        # is the executable version of this contract.
+        run: |
+          set -e
+          # predicted_fire_date / days_until_fire must not be emitted as a value
+          # by the live prediction endpoints (comments/deprecation are fine).
+          if grep -REn '"(predicted_fire_date|days_until_fire)"[[:space:]]*:' src/api.py; then
+            echo "::error::prediction API emits a deprecated date/day field"; exit 1
+          fi
+          # Horizon must be sourced from imminent_days, never MAX_PREDICTION_DAYS,
+          # in the GeoJSON/response metadata writers.
+          if grep -REn '"horizon_days"[[:space:]]*:[[:space:]]*MAX_PREDICTION_DAYS' src; then
+            echo "::error::horizon_days wired to MAX_PREDICTION_DAYS (should be imminent_days)"; exit 1
+          fi
+          echo "semantic contract OK"

@@ -95,7 +95,18 @@ export default function InfoModal(props: Props) {
   if (!props.open) return null;
 
   const m = props.metrics ?? {};
-  const isBinary = m.task === "binary_fire_in_3d";
+  const isBinary = Boolean(
+    m.task === "binary_fire_in_3d" ||
+    typeof m.roc_auc === "number" ||
+    typeof m.deployment_threshold === "number",
+  );
+  const hasLegacyRegressionMetrics = Boolean(
+    typeof m.accuracy_within_1day === "number" ||
+    typeof m.mae_days === "number" ||
+    typeof m.rmse_days === "number" ||
+    typeof m.r2 === "number",
+  );
+  const hasPerformanceMetrics = isBinary || hasLegacyRegressionMetrics;
   const acc = m.accuracy_within_1day;
   const mae = m.mae_days;
   const rmse = m.rmse_days;
@@ -108,12 +119,18 @@ export default function InfoModal(props: Props) {
     if (u && u in tiers) tiers[u]++;
   }
 
-  // Per-day counts
-  const dayCounts: Record<number, number> = {};
-  for (let i = 0; i <= 7; i++) dayCounts[i] = 0;
+  // Risk-tier counts (High / Watch / Background) — the binary model has no
+  // per-day resolution, so we distribute by absolute risk tier, not by day.
+  const tierCounts: { label: string; count: number }[] = [
+    { label: "High", count: 0 },
+    { label: "Watch", count: 0 },
+    { label: "Background", count: 0 },
+  ];
   for (const f of props.predicted) {
-    const d = f.properties.days_until_fire;
-    if (d != null && d >= 0 && d <= 7) dayCounts[d]++;
+    const u = f.properties.urgency_level;
+    if (u === "HIGH") tierCounts[0].count++;
+    else if (u === "MEDIUM") tierCounts[1].count++;
+    else if (u === "LOW") tierCounts[2].count++;
   }
 
   // Province distribution
@@ -130,13 +147,32 @@ export default function InfoModal(props: Props) {
     typeof v === "number" && isFinite(v) ? v.toFixed(d) : "—";
   const fmtPct = (v: number | undefined) =>
     typeof v === "number" ? `${(v * 100).toFixed(1)}%` : "—";
+  const alwaysNegativeBaseline =
+    typeof m.test_positive_rate === "number"
+      ? 1 - m.test_positive_rate
+      : null;
+  const probabilityThresholds = Boolean(
+    props.thresholds &&
+    Number.isFinite(props.thresholds.HIGH) &&
+    Number.isFinite(props.thresholds.MEDIUM) &&
+    props.thresholds.HIGH >= 0 &&
+    props.thresholds.HIGH <= 1 &&
+    props.thresholds.MEDIUM >= 0 &&
+    props.thresholds.MEDIUM <= 1,
+  );
 
   return (
-    <div className="info-modal-backdrop" role="dialog" aria-modal="true" onClick={props.onClose}>
-      <div className="info-modal" onClick={(e) => e.stopPropagation()}>
+    <div className="info-modal-backdrop" onClick={props.onClose}>
+      <div
+        className="info-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="model-details-title"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="info-modal-header">
-          <h2>Model & Snapshot Details</h2>
-          <button className="info-modal-close" onClick={props.onClose} aria-label="Close">
+          <h2 id="model-details-title">Model & Snapshot Details</h2>
+          <button type="button" className="info-modal-close" onClick={props.onClose} aria-label="Close">
             ×
           </button>
         </div>
@@ -144,7 +180,13 @@ export default function InfoModal(props: Props) {
         <div className="info-modal-body">
           <section>
             <h3>Held-out test performance</h3>
-            {isBinary ? (
+            {!hasPerformanceMetrics ? (
+              <p className="info-note" role="status">
+                Model metrics are unavailable in the loaded artifact. Risk
+                cells can still be inspected, but performance claims are
+                intentionally withheld until the metrics payload is restored.
+              </p>
+            ) : isBinary ? (
               <>
                 <p className="info-note" style={{ marginTop: 0, marginBottom: 10 }}>
                   Task: <b>binary classification</b> — "fire within next{" "}
@@ -158,8 +200,9 @@ export default function InfoModal(props: Props) {
                 </div>
                 <p className="info-note" style={{ marginTop: 4 }}>
                   <b>ROC-AUC</b> วัดคุณภาพ ranking (0.5=สุ่ม, 1.0=perfect).{" "}
-                  <b>ECE</b> = Expected Calibration Error — &lt;0.05 หมายถึง probability
-                  ที่โมเดลออกมาตรงกับ ground truth (calibrated).{" "}
+                  <b>ECE</b> = Expected Calibration Error — ยิ่งต่ำยิ่งดี แต่ต้องดู
+                  reliability curve และ seasonal drift ร่วมด้วย ไม่ใช่ตรารับรองว่า
+                  ทุก probability ใช้ได้ทุกฤดู{" "}
                   <b>Test pos rate</b> = ภาคจริงมีไฟกี่% — เป็น baseline ของ P@top-K.
                 </p>
 
@@ -215,19 +258,26 @@ export default function InfoModal(props: Props) {
                     <ReliabilityDiagram bins={m.reliability_bins} />
                     <p className="info-note" style={{ marginTop: 4 }}>
                       แต่ละจุด = bin ของ probability โมเดล (X) vs อัตราเกิดไฟจริงในกลุ่มนั้น (Y).
-                      ทแยงสีแดง = perfect calibration. ใกล้ทแยง = trustworthy probability.
+                      ทแยงสีแดง = perfect calibration. จุดที่ใกล้เส้นหมายถึง
+                      calibration ของ bin นั้นดีกว่า แต่ยังต้องดูจำนวนตัวอย่างและ
+                      seasonal drift ก่อนใช้ probability ราย cell.
                     </p>
                   </>
                 )}
 
                 <p className="info-note" style={{ marginTop: 12 }}>
-                  Evaluated on chronologically held-out 20% test window ({m.evaluated_on ?? "real-distribution"}).
-                  Train/val undersample negatives 4:1; test keeps real class balance.
-                  Calibration via {m.calibration_method ?? "Platt sigmoid"} fit on val.
+                  Evaluated on the held-out test slice of a chronological 4-way
+                  purged split (train / val / calibration / test), at real class
+                  balance. Train-only undersamples negatives 4:1. Calibration and
+                  thresholds are fit on the calibration slice — never on test.
                 </p>
               </>
             ) : (
               <>
+                <p className="info-note" style={{ marginTop: 0 }}>
+                  Legacy date-regression artifact only. The active 3-day risk
+                  model does not produce a per-cell fire date.
+                </p>
                 <div className="info-grid">
                   <div><span>±1 day acc</span><b>{fmtPct(acc)}</b></div>
                   <div><span>MAE</span><b>{fmt(mae, 2)} d</b></div>
@@ -235,8 +285,8 @@ export default function InfoModal(props: Props) {
                   <div><span>R²</span><b>{fmt(r2, 3)}</b></div>
                 </div>
                 <p className="info-note">
-                  From the held-out final 20% of the chronologically-split training
-                  data. The model never saw these rows during tuning or selection.
+                  From the held-out test slice of the chronological 4-way purged
+                  split. The model never saw these rows during tuning or selection.
                 </p>
               </>
             )}
@@ -247,7 +297,10 @@ export default function InfoModal(props: Props) {
             <div className="info-grid">
               <div><span>Predicted cells</span><b>{props.predicted.length}</b></div>
               <div><span>Observed (FIRMS)</span><b>{props.observed.length}</b></div>
-              <div><span>Live (GISTDA)</span><b>{props.liveFires.length || "—"}</b></div>
+              <div>
+                <span>Live (GISTDA)</span>
+                <b>{props.liveFires.length > 0 ? props.liveFires.length : "see feed status"}</b>
+              </div>
               <div><span>Province filter</span><b>{props.selectedProvince === "all" ? "all" : props.selectedProvince}</b></div>
             </div>
           </section>
@@ -262,24 +315,27 @@ export default function InfoModal(props: Props) {
             </div>
             {props.thresholds && (
               <p className="info-note">
-                Cutoffs: ≤{props.thresholds.CRITICAL.toFixed(1)}d CRITICAL,
-                ≤{props.thresholds.HIGH.toFixed(1)}d HIGH,
-                ≤{props.thresholds.MEDIUM.toFixed(1)}d MEDIUM,
-                ≤{props.thresholds.LOW.toFixed(1)}d LOW.
+                {probabilityThresholds
+                  ? <>Absolute cutoffs from metadata: HIGH ≥{" "}
+                      {(props.thresholds.HIGH * 100).toFixed(2)}%; WATCH
+                      (legacy MEDIUM alias) ≥{" "}
+                      {(props.thresholds.MEDIUM * 100).toFixed(2)}%; lower
+                      values are Background.</>
+                  : <>Legacy tier cutoffs: HIGH {props.thresholds.HIGH};
+                      MEDIUM {props.thresholds.MEDIUM}. See artifact semantics
+                      before interpreting their units.</>}
               </p>
             )}
           </section>
 
           <section>
-            <h3>Predicted day distribution</h3>
+            <h3>Risk-tier distribution</h3>
             <div className="info-bars">
-              {Array.from({ length: 8 }, (_, i) => {
-                const count = dayCounts[i];
-                const max = Math.max(...Object.values(dayCounts), 1);
+              {tierCounts.map(({ label, count }) => {
+                const max = Math.max(...tierCounts.map((t) => t.count), 1);
                 const pct = (count / max) * 100;
-                const label = i === 0 ? "Today" : `+${i}d`;
                 return (
-                  <div key={i} className="info-bar-row">
+                  <div key={label} className="info-bar-row">
                     <span className="info-bar-label">{label}</span>
                     <div className="info-bar-track"><div className="info-bar-fill" style={{ width: `${pct}%` }} /></div>
                     <span className="info-bar-count">{count}</span>
@@ -317,10 +373,17 @@ export default function InfoModal(props: Props) {
                   <dd>Area under the precision-recall curve. More demanding than ROC-AUC when positives are rare. <b>Higher = better</b>; equals the test-set positive rate for a random model.</dd>
 
                   <dt>Accuracy (binary)</dt>
-                  <dd>Share of cells where the model's yes/no answer matches reality, using a 0.5 probability threshold. Easy to read but misleading on imbalanced data — a "say no to everything" baseline scores ~87% here.</dd>
+                  <dd>
+                    Share of cells where the model's yes/no answer matches
+                    reality at a stated threshold. It is misleading on this
+                    imbalanced test population: an always-negative baseline
+                    {alwaysNegativeBaseline == null
+                      ? " is already high"
+                      : ` is already ${(alwaysNegativeBaseline * 100).toFixed(1)}%`}.
+                  </dd>
 
                   <dt>Precision</dt>
-                  <dd>Of cells the model flagged as imminent fire, the fraction that really did burn within the window. <b>Higher = fewer false alarms</b>. Reported at the threshold that maximises F1 on the test set.</dd>
+                  <dd>Of cells the model flagged as imminent fire, the fraction that really did burn within the window. <b>Higher = fewer false alarms</b>. The operational threshold is selected on the calibration partition, then evaluated once on test.</dd>
 
                   <dt>Recall</dt>
                   <dd>Of all real imminent fires in the test set, the fraction the model caught. <b>Higher = fewer missed fires</b>. Recall and precision trade off — pick a lower probability threshold to raise recall (more flags, more false alarms).</dd>
@@ -329,19 +392,16 @@ export default function InfoModal(props: Props) {
                   <dd>Harmonic mean of precision and recall. <b>Best F1</b> is the maximum F1 over all probability thresholds — a single-number summary that balances false alarms against missed fires.</dd>
 
                   <dt>Best threshold</dt>
-                  <dd>Probability cutoff that produced "Best F1". Cells with predicted probability ≥ this threshold are operationally treated as "imminent fire". Lower threshold = more alerts = higher recall, lower precision.</dd>
+                  <dd>The persisted HIGH cutoff is selected before test on the calibration partition. A lower cutoff normally increases review load and test-set recall; changing production still requires a reviewed calibration/evaluation run.</dd>
 
                   <dt>Precision @ top-K%</dt>
-                  <dd>If you take the K% of cells with the highest predicted probability and treat them as your watch-list, what fraction actually burns? <b>Direct measure of watch-list quality</b> — independent of threshold tuning.</dd>
-
-                  <dt>Skill check (binary)</dt>
-                  <dd>"Passed" means ROC-AUC ≥ 0.65 — the model meaningfully discriminates fires from non-fires. Below that, predictions are too close to random to act on.</dd>
+                  <dd>If you take the K% of cells with the highest predicted probability and treat them as your watch-list, what fraction actually burns? This measures concentration in a relative watch-list and is separate from the absolute HIGH/WATCH thresholds.</dd>
                 </>
               )}
               {!isBinary && (
                 <>
                   <dt>±1 day accuracy</dt>
-                  <dd>The share of test-set rows where the model's predicted fire date landed within ±1 day of the real fire date. The single most operator-meaningful number: <b>higher = better</b>. 50% means about half the predictions are practically correct.</dd>
+                  <dd>Legacy-only: the share of test-set rows where an older date-regression model landed within ±1 day of the recorded date. The active binary model does not make this claim.</dd>
 
                   <dt>MAE (mean absolute error, days)</dt>
                   <dd>Average distance between predicted and real fire dates, in days. <b>Lower = better</b>. MAE = 1.5 means predictions are off by 1½ days on average. Robust to outliers.</dd>
@@ -350,30 +410,27 @@ export default function InfoModal(props: Props) {
                   <dd>Like MAE but squares the errors before averaging, so big misses count more. <b>Lower = better</b>. If RMSE is much higher than MAE, a few large errors dominate the picture.</dd>
 
                   <dt>R² (coefficient of determination)</dt>
-                  <dd>How much variance in the real fire dates the model explains. <b>0 = no better than predicting the mean, 1 = perfect, negative = worse than predicting the mean</b>. Wildfire date is inherently noisy, so even R² ≈ 0.3 is useful.</dd>
-
-                  <dt>Skill check</dt>
-                  <dd>"Passed" means the model beats the predict-mean baseline by ≥5% on test MAE. "Failed" means the model is barely better than guessing the average — investigate before trusting predictions.</dd>
+                  <dd>Legacy-only coefficient of determination. <b>0 = no better than predicting the mean, 1 = perfect, negative = worse than predicting the mean.</b> It is not used by the active 3-day classifier.</dd>
                 </>
               )}
 
-              <dt>Validation MAE vs Test MAE</dt>
-              <dd>Validation is the slice used during hyperparameter tuning; test is the held-out final 20% the model has never seen. If validation is dramatically worse than test, the validation window was unusually hard (often: off-peak fire season).</dd>
+              <dt>Evaluation protocol</dt>
+              <dd>Whole-date, chronological <b>4-way purged split</b> (train / validation / calibration / test) with a 7-day purge gap between each — not a random or 60/20/20 row split. Thresholds and calibration are chosen only on the calibration slice; the test slice is scored exactly once and never used to pick a threshold.</dd>
 
-              <dt>Urgency tiers (HIGH / MEDIUM / LOW)</dt>
-              <dd>Absolute cutoffs on the calibrated probability, selected on a held-out calibration period during training (HIGH = the deployment threshold; MEDIUM = the threshold catching ≥85% of calibration-period fires). Because they are absolute, a low-risk day can legitimately show zero HIGH cells.</dd>
+              <dt>Risk tiers (HIGH / WATCH / Background)</dt>
+              <dd>Absolute cutoffs on calibrated probability, selected on the calibration partition. <b>HIGH</b> is the precision-oriented operating point; <b>WATCH</b> is the lower monitoring cutoff. Its recall target describes calibration-time selection, not guaranteed held-out or live recall. <b>MEDIUM</b> in stored data is the WATCH compatibility alias. A low-risk day can legitimately show zero HIGH/WATCH cells.</dd>
 
               <dt>Probability (the model's actual output)</dt>
               <dd>Calibrated P(≥1 FIRMS hotspot in this cell within the next 3 days). The model is a binary "fire within 3 days" classifier — it does <b>not</b> know whether a fire would land on day 1, 2, or 3.</dd>
 
-              <dt>days_until_fire (display bucket)</dt>
-              <dd>An integer 0–7 used by the day selector to group cells — it is a <b>probability-rank band</b> (0 = highest-probability band), not a forecast of the exact fire date. The only date claim the model supports is "within the 3-day risk window".</dd>
+              <dt>days_until_fire / predicted_fire_date (deprecated)</dt>
+              <dd><b>Deprecated.</b> These fields may still appear in stored historical GeoJSON but are <b>not forecasts</b> and are no longer used by any chart, alert, export, or validation. The model supports exactly one temporal claim: "a hotspot within the 3-day risk window".</dd>
 
               <dt>Historical fires (last 30 days, FIRMS)</dt>
-              <dd>Literal count of NASA FIRMS hotspot detections in the cell over the last 30 days. Used as a sanity-check: a CRITICAL prediction in a cell with 0 recent fires deserves scepticism.</dd>
+              <dd>Literal count of NASA FIRMS hotspot detections in the cell over the last 30 days. This is supporting context, not proof for or against a forecast; weather and seasonal features can still change current risk.</dd>
 
-              <dt>Hit rate vs FIRMS</dt>
-              <dd>For each historical prediction, did the predicted cell actually burn within ±1 day of the predicted date? Higher = the dashboard is calling real events, not noise.</dd>
+              <dt>Hit rate vs FIRMS (strict model target)</dt>
+              <dd>For each matured historical prediction, did the <b>same model grid cell</b> record a FIRMS hotspot on any day in its risk window (base_date+1 … base_date+3)? This is the model's exact binary target — no spatial radius, no ±1-day slack. Any separate proximity view is context only and is never treated as model precision/recall.</dd>
             </dl>
           </section>
 
@@ -381,19 +438,21 @@ export default function InfoModal(props: Props) {
             <h3>Data sources</h3>
             <ul className="info-list">
               <li><b>NASA FIRMS VIIRS NRT</b> — hotspot detections + FRP / brightness, used for training labels and historical aggregates.</li>
-              <li><b>GISTDA NRT VIIRS + MODIS</b> — independent hotspot feed from Thailand's national space agency, optional live overlay.</li>
+              <li><b>GISTDA NRT VIIRS + MODIS</b> — a separate Thai satellite-hotspot feed used as an optional live overlay. It is useful corroborating context, but not fully independent proof of FIRMS because both share satellite-observation limitations.</li>
               <li><b>Open-Meteo ERA5</b> — daily reanalysis (temp / precip / wind), used as features only when the weather cache is present.</li>
               <li><b>Hansen GFC v1.11</b> — per-cell tree cover baseline (2000) + recent loss %, distinguishes wildfire risk from agricultural-burn signal.</li>
             </ul>
             <p className="info-note">
-              All values shown anywhere in the dashboard come from real sources — no synthetic, interpolated, or simulated data.
+              Observation and metric records come from named real sources. Missing
+              live data is labelled unavailable; model preprocessing may still
+              apply documented missing-value handling.
             </p>
           </section>
 
           <section>
             <h3>Selected filter</h3>
             <p className="info-note">
-              Day filter: <b>{props.selectedDay === "all" ? "all" : `+${props.selectedDay}d`}</b> · Province: <b>{props.selectedProvince === "all" ? "all" : props.selectedProvince}</b>
+              Tier filter: <b>{props.selectedDay === "all" ? "all" : props.selectedDay}</b> · Province: <b>{props.selectedProvince === "all" ? "all" : props.selectedProvince}</b>
             </p>
           </section>
         </div>

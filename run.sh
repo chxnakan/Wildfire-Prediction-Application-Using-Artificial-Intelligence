@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # =====================================================================
-# 🔥 Fire Date Predictor — one-shot runner
+# 🔥 FireWatch Thailand — one-shot runner
 #
-# Real data only. No simulated values, no fake fallbacks.
+# Source-backed operation. Missing feeds stay visibly missing; derived
+# aggregates and reanalysis fields are labelled rather than passed off as raw.
 #
 # Default behaviour:
 #   1. Train on whatever real FIRMS data is already in data/raw + data/firms/
@@ -25,6 +26,7 @@ FETCH_GISTDA=0
 DO_TRAIN=1
 PREDICT_ONLY=0
 OPEN_BROWSER=0
+DEMO_MODE=0
 WEATHER_ARGS=()
 TRAIN_ARGS=()
 API_PORT=8000
@@ -50,6 +52,9 @@ Flags:
                          e.g. --weather-arg --limit-cells --weather-arg 50
   --no-train             Skip training; just start the servers using whatever
                          is already in outputs/.
+  --demo                 Presentation-safe mode: serve the promoted artifacts
+                         without FIRMS refresh, prediction, or training. Keeps
+                         only the live GISTDA scheduler job enabled.
   --predict-only         Run train.py --predict-only: rebuild full_features from
                          latest FIRMS (+ weather cache if present), refresh GeoJSON,
                          leave the existing model .pkl unchanged. Overrides --no-train
@@ -80,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --gistda)       FETCH_GISTDA=1; shift ;;
     --weather-arg)  WEATHER_ARGS+=("$2"); shift 2 ;;
     --no-train)     DO_TRAIN=0; shift ;;
+    --demo)         DEMO_MODE=1; shift ;;
     --predict-only) PREDICT_ONLY=1; shift ;;
     --open)         OPEN_BROWSER=1; shift ;;
     --quick)        TRAIN_ARGS+=("--quick"); shift ;;
@@ -90,6 +96,29 @@ while [[ $# -gt 0 ]]; do
     *)              echo "Unknown flag: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
+
+# Presentation mode is intentionally immutable with respect to model inputs and
+# artifacts. Fail loudly if it is combined with a pipeline flag rather than
+# silently doing a partial refresh that an operator did not expect.
+if [[ $DEMO_MODE -eq 1 ]]; then
+  if [[ $FETCH_FIRMS -eq 1 || $FETCH_WEATHER -eq 1 || $FETCH_GISTDA -eq 1 \
+        || $PREDICT_ONLY -eq 1 || ${#WEATHER_ARGS[@]} -gt 0 \
+        || ${#TRAIN_ARGS[@]} -gt 0 ]]; then
+    cat <<'EOF' >&2
+❌ --demo cannot be combined with data-fetch, prediction, or training flags.
+   Run those jobs before the presentation, then start with: ./run.sh --demo
+EOF
+    exit 2
+  fi
+  DO_TRAIN=0
+  # Shell variables override .env because python-dotenv does not replace an
+  # already-exported value. Keep the scheduler alive solely for GISTDA.
+  export SCHEDULER_ENABLED=true
+  export SCHEDULER_SYNC_ENABLED=false
+  export SCHEDULER_RETRAIN_ENABLED=false
+  export GISTDA_ENABLED=true
+  echo "→ DEMO mode: model artifacts locked; only live GISTDA polling is enabled."
+fi
 
 # ── Activate virtualenv if present ──────────────────────────────────────
 if [[ -d ".venv" ]]; then
@@ -132,8 +161,12 @@ PY
 )
 
 if [[ "$STALENESS" == "missing" ]]; then
-  echo "→ No FIRMS cache found — promoting --fresh so we fetch initial data."
-  FETCH_FIRMS=1
+  if [[ $DEMO_MODE -eq 1 ]]; then
+    echo "  ⚠️  No FIRMS cache found; DEMO mode will not fetch or change model inputs."
+  else
+    echo "→ No FIRMS cache found — promoting --fresh so we fetch initial data."
+    FETCH_FIRMS=1
+  fi
 elif [[ "$STALENESS" == "unknown" ]]; then
   echo "  ⚠️  Could not determine FIRMS cache freshness; continuing without auto-refresh."
 else
@@ -141,9 +174,13 @@ else
   LAG_DAYS="${STALENESS#*|}"
   echo "→ FIRMS cache: latest=${LATEST_DATE} (${LAG_DAYS} day(s) behind today)"
   if [[ "${LAG_DAYS}" -gt "${STALE_DAYS}" && $FETCH_FIRMS -eq 0 ]]; then
-    echo "  ⚠️  Data is >${STALE_DAYS} days stale → promoting --fresh."
-    echo "      Set STALE_DAYS=999 to disable, or run with --fresh explicitly."
-    FETCH_FIRMS=1
+    if [[ $DEMO_MODE -eq 1 ]]; then
+      echo "  ℹ️  DEMO mode keeps the promoted snapshot; no FIRMS refresh is started."
+    else
+      echo "  ⚠️  Data is >${STALE_DAYS} days stale → promoting --fresh."
+      echo "      Set STALE_DAYS=999 to disable, or run with --fresh explicitly."
+      FETCH_FIRMS=1
+    fi
   fi
 fi
 
@@ -215,9 +252,28 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [[ ! -d "web/dist" ]]; then
-  echo "→ Building React dashboard (web/) for the first time …"
-  (cd web && npm install --silent && npm run build)
+WEB_BUILD_NEEDED=0
+if [[ ! -f "web/dist/index.html" ]]; then
+  WEB_BUILD_NEEDED=1
+  echo "→ React dashboard build is missing."
+elif find \
+    web/src \
+    web/index.html \
+    web/package.json \
+    web/package-lock.json \
+    web/tsconfig.json \
+    web/vite.config.ts \
+    -type f -newer web/dist/index.html -print -quit | grep -q .; then
+  WEB_BUILD_NEEDED=1
+  echo "→ React source changed since the last build."
+fi
+
+if [[ $WEB_BUILD_NEEDED -eq 1 ]]; then
+  echo "→ Building the current React dashboard (web/) …"
+  if [[ ! -d "web/node_modules" ]]; then
+    (cd web && npm ci --no-audit --no-fund)
+  fi
+  (cd web && npm run build)
 fi
 
 if [[ $OPEN_BROWSER -eq 1 ]]; then
@@ -235,11 +291,11 @@ cat <<EOF
    API:        ${API_URL}
    API docs:   ${API_URL}docs
 
-   All values shown are derived from real data sources only:
+   Displayed evidence comes from persisted, named data sources:
      • NASA FIRMS VIIRS NRT hotspots
-     • Open-Meteo ERA5 reanalysis (if cached)
-     • Calendar derived from real dates
-   No synthetic, simulated, or interpolated values.
+     • Open-Meteo / ERA5 reanalysis (if cached)
+     • Documented temporal/spatial feature aggregates
+   Missing live feeds are not replaced with fabricated observations.
 
    Press Ctrl+C to stop both servers.
 

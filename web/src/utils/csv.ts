@@ -1,58 +1,109 @@
 import type { FireFeature, PredictionProperties } from "../types";
+import { dateAdd } from "./dates";
+import { probabilityPercent, readProbability } from "./probability";
 
-const COLS: (keyof PredictionProperties)[] = [
+const HORIZON_DAYS = 3;
+
+const HEADERS = [
+  "lat",
+  "lon",
+  "risk_probability_pct",
+  "risk_tier",
   "base_date",
-  "predicted_fire_date",
-  "days_until_fire",
-  "raw_prediction",
-  "urgency_level",
-  "province",
+  "risk_window_start",
+  "risk_window_end",
   "historical_fire_count_30d",
   "fire_days_per_year",
   "tree_cover_pct_2000",
   "tree_loss_pct_recent",
   "nearest_urban_area",
   "nearest_urban_distance_km",
-];
+  "province",
+] as const;
 
-const escape = (v: unknown): string => {
-  if (v == null) return "";
-  const s = String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+const escape = (value: unknown): string => {
+  if (value == null) return "";
+  const text = String(value);
+  return /[",\r\n]/.test(text)
+    ? `"${text.replace(/"/g, '""')}"`
+    : text;
 };
+
+function operatorTier(level: PredictionProperties["urgency_level"]): string {
+  if (level === "HIGH") return "HIGH";
+  if (level === "MEDIUM") return "WATCH";
+  if (level === "LOW") return "BACKGROUND";
+  return level ?? "";
+}
+
+/**
+ * Build the operator export from the model's supported output contract:
+ * calibrated 3-day probability, absolute tier, and one shared risk window.
+ *
+ * Deliberately excludes the legacy `predicted_fire_date` and
+ * `days_until_fire` pseudo-day fields. The binary model cannot predict an
+ * exact ignition date, so exporting those fields would give downstream users
+ * a stronger claim than the model actually makes.
+ */
+export function buildCellsCsv(cells: FireFeature[]): string {
+  const rows = [HEADERS.map(escape).join(",")];
+
+  for (const feature of cells) {
+    const [lon, lat] = feature.geometry.coordinates;
+    const props = feature.properties;
+    const probability = probabilityPercent(readProbability(props));
+    const baseDate = props.base_date ?? "";
+    const row = [
+      lat.toFixed(4),
+      lon.toFixed(4),
+      probability?.toFixed(2) ?? "",
+      operatorTier(props.urgency_level),
+      baseDate,
+      baseDate ? dateAdd(baseDate, 1) : "",
+      baseDate ? dateAdd(baseDate, HORIZON_DAYS) : "",
+      props.historical_fire_count_30d,
+      props.fire_days_per_year,
+      props.tree_cover_pct_2000,
+      props.tree_loss_pct_recent,
+      props.nearest_urban_area,
+      props.nearest_urban_distance_km != null
+        ? Number(props.nearest_urban_distance_km).toFixed(1)
+        : "",
+      props.province,
+    ];
+    rows.push(row.map(escape).join(","));
+  }
+
+  return rows.join("\r\n");
+}
 
 export function exportCellsCsv(
   cells: FireFeature[],
   baseDate: string,
   province: string,
-  day: string
+  tier: string,
 ): boolean {
   if (!cells.length) return false;
 
-  // Final 14-col schema mirrors the original frontend: lat/lon first, then
-  // the documented prediction fields. Kept stable so downstream consumers
-  // don't break when we add new GeoJSON properties.
-  const headers = ["lat", "lon", ...COLS];
-  const rows = [headers.join(",")];
-  for (const f of cells) {
-    const [lon, lat] = f.geometry.coordinates;
-    const p = f.properties;
-    const row = [escape(lat), escape(lon), ...COLS.map((c) => escape(p[c]))];
-    rows.push(row.join(","));
-  }
+  const provinceSlug = province === "all"
+    ? "all"
+    : province.replace(/\s+/g, "_");
+  const tierSlug = tier === "all" ? "all" : tier.toLowerCase();
+  const filename =
+    `wildfire_risk_${baseDate}_${provinceSlug}_${tierSlug}.csv`;
 
-  const provinceSlug = province === "all" ? "all" : province.replace(/\s+/g, "_");
-  const daySlug = day === "all" ? "all" : `day${day}`;
-  const filename = `fire_predictions_${baseDate}_${provinceSlug}_${daySlug}.csv`;
-
-  const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8" });
+  // UTF-8 BOM keeps Thai province names readable when opened in Excel.
+  const blob = new Blob(["\uFEFF", buildCellsCsv(cells)], {
+    type: "text/csv;charset=utf-8",
+  });
   const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setTimeout(() => URL.revokeObjectURL(url), 100);
   return true;
 }

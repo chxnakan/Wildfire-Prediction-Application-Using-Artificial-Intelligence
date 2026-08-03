@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { GistdaFeature } from "../types";
+import { parseGistdaTime } from "./gistdaTime";
 
 // ─────────────────────────────────────────────────────────────
 // Real-time fire alert system
@@ -36,6 +37,8 @@ export interface FireAlert {
 
 function _stableId(f: GistdaFeature): string {
   const a = f.attributes;
+  const upstreamId = String(a.hotspot_id ?? "").trim();
+  if (upstreamId) return upstreamId;
   const lat = Number(a.latitude);
   const lon = Number(a.longitude);
   // Round lat/lon to 4dp to be tolerant of tiny coordinate jitter
@@ -44,13 +47,50 @@ function _stableId(f: GistdaFeature): string {
   return k;
 }
 
-function _formatAcqDateTime(date?: number, time?: string): string {
-  // GISTDA delivers date as YYYYMMDD integer and time as HH:MM string
-  if (!date) return "";
-  const s = String(date);
-  if (s.length !== 8) return "";
-  const iso = `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
-  return time ? `${iso}T${time}` : iso;
+export function formatGistdaAcquisitionTime(
+  date?: number | string,
+  time?: number | string,
+  detectedAtThailand?: string,
+): string {
+  // The current backend emits Unix milliseconds plus an explicit Thailand
+  // timestamp. Older GISTDA payloads used YYYYMMDD + HH:MM.
+  const explicit = String(detectedAtThailand ?? "").trim();
+  const explicitTimestamp = explicit ? new Date(explicit) : null;
+  if (
+    explicitTimestamp &&
+    Number.isFinite(explicitTimestamp.getTime())
+  ) {
+    return explicitTimestamp.toLocaleString("th-TH", {
+      timeZone: "Asia/Bangkok",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  const normalizedTime =
+    typeof time === "string" ? time.replace(":", "") : time;
+  const parsed = parseGistdaTime(date, normalizedTime);
+  if (!parsed) return "";
+
+  const rawDate = String(date ?? "").trim();
+  if (rawDate.length === 8) {
+    const isoDate =
+      `${rawDate.slice(0, 4)}-${rawDate.slice(4, 6)}-${rawDate.slice(6, 8)}`;
+    return parsed.precision === "minute"
+      ? `${isoDate}T${parsed.iso.slice(11, 16)}`
+      : isoDate;
+  }
+  return new Date(parsed.ms).toLocaleString("th-TH", {
+    timeZone: "Asia/Bangkok",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function _featureToAlert(f: GistdaFeature): FireAlert {
@@ -62,7 +102,11 @@ function _featureToAlert(f: GistdaFeature): FireAlert {
     province: (a.pv_tn ?? "").toString() || "—",
     district: (a.ap_tn ?? "").toString() || "—",
     satellite: (a.satellite ?? "").toString() || "VIIRS",
-    acqDateTime: _formatAcqDateTime(a.date as number, a.time as string),
+    acqDateTime: formatGistdaAcquisitionTime(
+      a.date,
+      a.time,
+      a.detected_at_thailand,
+    ),
     confident: (a.confident ?? "").toString(),
     landUse: (a.lu_name ?? "").toString() || "—",
     detectedAt: Date.now(),
@@ -131,10 +175,11 @@ interface UseFireAlertsOptions {
 // ── Backend SSE stream (faster than the per-tab polling fallback) ──
 //
 // Returns a hook that opens an EventSource to /api/fires/stream and yields
-// the latest "new fire" event. The backend polls GISTDA every 60s server-
-// side and pushes to all subscribers — so multiple tabs share one poll and
-// new detections appear within ~60s instead of waiting for the next
-// browser-side poll cycle.
+// the latest "new fire" event. The backend polls GISTDA server-side every
+// GISTDA_POLL_SECONDS (default 300 s) and streams NEW events from the shared
+// PostgreSQL store — all tabs and all Railway replicas see the same events.
+// The 60 s cached refresh (utils/gistda.ts) is the recovery path if the
+// stream drops.
 export function useFireSseStream(): { lastFireAt: number; connected: boolean } {
   const [state, setState] = useState({ lastFireAt: 0, connected: false });
 

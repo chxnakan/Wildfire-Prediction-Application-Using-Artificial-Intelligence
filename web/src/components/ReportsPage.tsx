@@ -9,6 +9,7 @@ import type { FireFeature, RollingMonthPoint, ValidationMetrics } from "../types
 import { chartFilename, downloadChartPng } from "../utils/chartExport";
 import { downloadCsv, downloadMultiSectionCsv } from "../utils/csvExport";
 import { fmtTr, useLang } from "../utils/i18n";
+import { scientificSampleSplits } from "../utils/scientificStats";
 import ModelTrainingSummary from "./ModelTrainingSummary";
 import StatisticsSection from "./StatisticsSection";
 
@@ -89,13 +90,9 @@ interface Props {
 // ─────────────────────────────────────────────────────────────
 // Reports page — model performance + dataset breakdown
 //
-// Three sections:
-//   1. Rolling monthly AUC chart (line + markers)
-//   2. Top 20 feature importances (horizontal bars)
-//   3. Provincial breakdown of current snapshot (CRITICAL/HIGH counts per province)
-//
-// All charts inline SVG — no chart library, no deps. Data already in the
-// loaded GeoJSON metadata, so the page is instant.
+// Performance, threshold, risk-tier, monthly diagnostic, feature-importance,
+// and province sections. Most data comes from persisted GeoJSON metadata; the
+// monthly descriptive diagnostic has an explicit API fallback and error state.
 // ─────────────────────────────────────────────────────────────
 
 const TIER_COLORS: Record<string, string> = {
@@ -114,28 +111,34 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
   // on disk without requiring a re-run of risk_map.
   const inlineMonthly = metrics?.rolling_by_month ?? [];
   const [fetchedMonthly, setFetchedMonthly] = useState<RollingMonthPoint[]>([]);
+  const [rollingLoadState, setRollingLoadState] = useState<
+    "idle" | "loading" | "loaded" | "error"
+  >(inlineMonthly.length > 0 ? "loaded" : "idle");
+  const [rollingRetryKey, setRollingRetryKey] = useState(0);
   useEffect(() => {
-    if (inlineMonthly.length > 0) return;
+    if (inlineMonthly.length > 0) {
+      setRollingLoadState("loaded");
+      return;
+    }
     let cancelled = false;
+    setRollingLoadState("loading");
     fetchRollingEval()
-      .then((r) => { if (!cancelled) setFetchedMonthly(r.months ?? []); })
-      .catch(() => { /* endpoint not available or no file — silent */ });
+      .then((r) => {
+        if (cancelled) return;
+        setFetchedMonthly(r.months ?? []);
+        setRollingLoadState("loaded");
+      })
+      .catch(() => {
+        if (!cancelled) setRollingLoadState("error");
+      });
     return () => { cancelled = true; };
-  }, [inlineMonthly.length]);
+  }, [inlineMonthly.length, rollingRetryKey]);
   const monthly = inlineMonthly.length > 0 ? inlineMonthly : fetchedMonthly;
 
   // ─── Top feature importance ───
-  // Read from window.__FEATURE_IMPORTANCE__ if available; otherwise fall back
-  // to a small slice in metrics (feature_importance_top isn't yet in
-  // ValidationMetrics type — pull from GeoJSON metadata.feature_importance_top).
-  // For now we synthesize from metric stats if not directly provided.
+  // Read only the persisted importance values; absence stays visible.
   const featureImportance: { feature: string; importance: number }[] = useMemo(() => {
-    // The frontend already receives FullValidationMetrics in `metrics`, but
-    // feature_importance_top lives one level up in dataset_info.json's root.
-    // GeoJsonMetadata exposes only `metrics` and a couple of other fields, so
-    // we resolve the property from `metrics as any` to keep types loose.
-    const arr = (metrics as unknown as { feature_importance_top?: typeof featureImportance })
-      ?.feature_importance_top;
+    const arr = metrics?.feature_importance_top;
     if (Array.isArray(arr) && arr.length) return arr.slice(0, 20);
     return [];
   }, [metrics]);
@@ -172,7 +175,11 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
     }
     return Array.from(map.entries())
       .map(([prov, c]) => ({ prov, ...c }))
-      .sort((a, b) => (b.CRITICAL + b.HIGH) - (a.CRITICAL + a.HIGH))
+      .sort((a, b) => {
+        const operationalA = a.CRITICAL + a.HIGH + a.MEDIUM;
+        const operationalB = b.CRITICAL + b.HIGH + b.MEDIUM;
+        return operationalB - operationalA || b.total - a.total;
+      })
       .slice(0, 15);
   }, [predictedAll]);
 
@@ -182,11 +189,8 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
   const thresholdChartRef = useRef<HTMLDivElement>(null);
   const [daysShape, setDaysShape] = useState<ChartShape>("bar");
 
-  // ─── Distribution by predicted day (bar chart) ───
-  // Shows the bimodal pattern of a calibrated binary classifier mapped through
-  // the pseudo-days formula. NOT a bug — it's exactly what a healthy
-  // calibrated probability distribution should look like.
-  const daysDistribution = useMemo(() => {
+  // ─── Distribution by persisted absolute risk tier ───
+  const tierDistribution = useMemo(() => {
     const byDate = new Map<string, FireFeature[]>();
     for (const f of predictedAll) {
       const bd = f.properties.base_date;
@@ -196,27 +200,40 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
     }
     const dates = Array.from(byDate.keys()).sort();
     const latest = dates[dates.length - 1];
-    if (!latest) return { latest: null, rows: [] as { day: number; count: number; label: string }[] };
-    const buckets = new Map<number, number>();
+    if (!latest) return { latest: null, rows: [] as { tier: string; count: number; color: string }[] };
+    // Absolute risk-tier distribution (High / Watch / Background) — the binary
+    // model has no per-day resolution, so this replaces the former pseudo-day
+    // histogram. Counts map from the persisted urgency_level.
+    const counts: Record<string, number> = {
+      CRITICAL: 0,
+      HIGH: 0,
+      MEDIUM: 0,
+      LOW: 0,
+    };
     for (const f of byDate.get(latest)!) {
-      const d = f.properties.days_until_fire;
-      if (typeof d !== "number") continue;
-      buckets.set(d, (buckets.get(d) ?? 0) + 1);
+      const u = f.properties.urgency_level;
+      if (u && u in counts) counts[u]++;
     }
-    const rows: { day: number; count: number; label: string }[] = [];
-    for (let d = 1; d <= 7; d++) {
-      const c = buckets.get(d) ?? 0;
-      const label =
-        d === 1 ? t("sidebar.daypicker.today") :
-        d === 2 ? t("sidebar.daypicker.tomorrow") :
-        d === 3 ? t("sidebar.daypicker.dayafter") :
-        fmtTr(t("sidebar.daypicker.inNdays"), { n: d });
-      rows.push({ day: d, count: c, label });
-    }
+    const rows = [
+      { tier: "Critical", count: counts.CRITICAL, color: TIER_COLORS.CRITICAL },
+      { tier: "High", count: counts.HIGH, color: TIER_COLORS.HIGH },
+      { tier: "Watch", count: counts.MEDIUM, color: TIER_COLORS.MEDIUM },
+      { tier: "Background", count: counts.LOW, color: TIER_COLORS.LOW },
+    ];
     return { latest, rows };
   }, [predictedAll]);
 
   const sciStats = metrics?.scientific_stats;
+  const deploymentThreshold =
+    typeof metrics?.deployment_threshold === "number" &&
+    Number.isFinite(metrics.deployment_threshold)
+      ? metrics.deployment_threshold
+      : null;
+  const separateFileCount =
+    (sciStats ? 6 : 0) +
+    (monthly.length > 0 ? 1 : 0) +
+    (featureImportance.length > 0 ? 1 : 0) +
+    (provinces.length > 0 ? 1 : 0);
 
   // ── Build the section list (used by both combined + separate downloads) ──
   // Defined as a function so it's only evaluated when the user clicks an
@@ -231,18 +248,23 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
         ["dashboard", "FireWatch Thailand"],
         ["generated_at", new Date().toISOString()],
         ["url", typeof window !== "undefined" ? window.location.href : ""],
-        ["note", "All data derived from real sources: NASA FIRMS VIIRS NRT, ECMWF ERA5, Hansen GFC. No synthetic values."],
+        ["note", "Values exported from the persisted dashboard artifacts. Model outputs are predictions; FIRMS/GISTDA fields are observations."],
       ],
     });
 
     if (sciStats) {
+      const sampleRows = scientificSampleSplits(sciStats.samples);
       sections.push({
         name: "Dataset Split",
         rows: [
           ["split", "n_rows", "positives", "positive_rate", "date_start", "date_end"],
-          ["train", sciStats.samples.train.n, sciStats.samples.train.positives, sciStats.samples.train.positive_rate, ...sciStats.samples.train.date_range],
-          ["val",   sciStats.samples.val.n,   sciStats.samples.val.positives,   sciStats.samples.val.positive_rate,   ...sciStats.samples.val.date_range],
-          ["test",  sciStats.samples.test.n,  sciStats.samples.test.positives,  sciStats.samples.test.positive_rate,  ...sciStats.samples.test.date_range],
+          ...sampleRows.map((row) => [
+            row.key,
+            row.data.n,
+            row.data.positives,
+            row.data.positive_rate,
+            ...row.data.date_range,
+          ]),
           ["total_densified", sciStats.samples.total_densified, "", "", "", ""],
         ],
       });
@@ -325,11 +347,16 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
   // ──── Separate: one CSV per section (current behaviour) ────
   const exportAll = () => {
     if (sciStats) {
+      const sampleRows = scientificSampleSplits(sciStats.samples);
       downloadCsv("dataset_split.csv", [
         ["split", "n_rows", "positives", "positive_rate", "date_start", "date_end"],
-        ["train", sciStats.samples.train.n, sciStats.samples.train.positives, sciStats.samples.train.positive_rate, ...sciStats.samples.train.date_range],
-        ["val",   sciStats.samples.val.n,   sciStats.samples.val.positives,   sciStats.samples.val.positive_rate,   ...sciStats.samples.val.date_range],
-        ["test",  sciStats.samples.test.n,  sciStats.samples.test.positives,  sciStats.samples.test.positive_rate,  ...sciStats.samples.test.date_range],
+        ...sampleRows.map((row) => [
+          row.key,
+          row.data.n,
+          row.data.positives,
+          row.data.positive_rate,
+          ...row.data.date_range,
+        ]),
       ]);
       downloadCsv("bootstrap_ci_95.csv", [
         ["metric", "point", "ci_lower", "ci_upper", "std", "n_boot"],
@@ -400,7 +427,9 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
               onClick={exportAll}
               title={t("btn.export.separate")}
             >
-              {t("btn.export.separate", "📂 9 separate files")}
+              {fmtTr(t("btn.export.separate"), {
+                count: separateFileCount,
+              })}
             </button>
           </div>
           <span style={{ fontSize: 10, color: "var(--text-3)" }}>
@@ -432,31 +461,51 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
               <tr>
                 <td>{t("section.summary.row.recall")}</td>
                 <td className="mono right"><b style={{ color: "#22c55e" }}>{(sciStats.classification_stats.sensitivity * 100).toFixed(0)}%</b></td>
-                <td>{(sciStats.classification_stats.sensitivity * 100).toFixed(0)} / 100</td>
+                <td>
+                  {fmtTr(t("section.summary.meaning.recall"), {
+                    count: (sciStats.classification_stats.sensitivity * 100).toFixed(0),
+                  })}
+                </td>
               </tr>
               <tr>
                 <td>{t("section.summary.row.fpr")}</td>
                 <td className="mono right"><b style={{ color: "#eab308" }}>{(sciStats.classification_stats.false_positive_rate * 100).toFixed(0)}%</b></td>
-                <td>{(sciStats.classification_stats.false_positive_rate * 100).toFixed(0)} / 100</td>
+                <td>
+                  {fmtTr(t("section.summary.meaning.fpr"), {
+                    count: (sciStats.classification_stats.false_positive_rate * 100).toFixed(0),
+                  })}
+                </td>
               </tr>
               <tr>
                 <td>{t("section.summary.row.auc")}</td>
                 <td className="mono right"><b style={{ color: "#22c55e" }}>{(sciStats.ci_95.roc_auc.point * 100).toFixed(0)}%</b></td>
-                <td>{(sciStats.ci_95.roc_auc.point * 100).toFixed(0)}% better than random</td>
+                <td>
+                  {fmtTr(t("section.summary.meaning.auc"), {
+                    auc: sciStats.ci_95.roc_auc.point.toFixed(3),
+                  })}
+                </td>
               </tr>
               <tr>
                 <td>{t("section.summary.row.calib")}</td>
-                <td className="mono right"><b style={{ color: "#22c55e" }}>{
-                  sciStats.classification_stats.brier_score < 0.05 ? t("hero.card.calib.status.great")
-                  : sciStats.classification_stats.brier_score < 0.10 ? t("hero.card.calib.status.good")
-                  : t("hero.card.calib.status.ok")
-                }</b></td>
-                <td>± {((sciStats.classification_stats.brier_score) * 100).toFixed(0)}%</td>
+                <td className="mono right">
+                  <b style={{ color: "#60a5fa" }}>
+                    {sciStats.classification_stats.brier_score.toFixed(4)}
+                  </b>
+                </td>
+                <td>
+                  {fmtTr(t("section.summary.meaning.brier"), {
+                    score: sciStats.classification_stats.brier_score.toFixed(4),
+                  })}
+                </td>
               </tr>
               <tr>
                 <td>{t("section.summary.row.miss")}</td>
                 <td className="mono right"><b style={{ color: "#ef4444" }}>{(sciStats.classification_stats.false_negative_rate * 100).toFixed(0)}%</b></td>
-                <td>1 / {Math.round(1 / Math.max(sciStats.classification_stats.false_negative_rate, 0.01))}</td>
+                <td>
+                  {fmtTr(t("section.summary.meaning.miss"), {
+                    count: (sciStats.classification_stats.false_negative_rate * 100).toFixed(0),
+                  })}
+                </td>
               </tr>
             </tbody>
           </table>
@@ -520,12 +569,12 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
                 const cs = sciStats.classification_stats;
                 const auc = sciStats.ci_95.roc_auc.point;
                 return [
-                  ["axis", "value", "target"],
-                  ["Recall (sensitivity)", cs.sensitivity, 0.8],
-                  ["Specificity", cs.specificity, 0.8],
-                  ["AUC", auc, 0.8],
-                  ["Precision (PPV)", cs.ppv, 0.8],
-                  ["Calibration (1 - brier*10)", Math.max(0, 1 - cs.brier_score * 10), 0.8],
+                  ["axis", "value"],
+                  ["Recall (sensitivity)", cs.sensitivity],
+                  ["Specificity", cs.specificity],
+                  ["AUC", auc],
+                  ["Precision (PPV)", cs.ppv],
+                  ["Negative predictive value", cs.npv],
                 ];
               }}
             />
@@ -534,11 +583,11 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
             const cs = sciStats.classification_stats;
             const auc = sciStats.ci_95.roc_auc.point;
             const data = [
-              { axis: t("section.radar.axis.recall"),       value: cs.sensitivity, target: 0.8 },
-              { axis: t("section.radar.axis.specificity"),  value: cs.specificity, target: 0.8 },
-              { axis: t("section.radar.axis.auc"),          value: auc,            target: 0.8 },
-              { axis: t("section.radar.axis.precision"),    value: cs.ppv,         target: 0.8 },
-              { axis: t("section.radar.axis.calib"),        value: Math.max(0, 1 - cs.brier_score * 10), target: 0.8 },
+              { axis: t("section.radar.axis.recall"),      value: cs.sensitivity },
+              { axis: t("section.radar.axis.specificity"), value: cs.specificity },
+              { axis: t("section.radar.axis.auc"),         value: auc },
+              { axis: t("section.radar.axis.precision"),   value: cs.ppv },
+              { axis: t("section.radar.axis.npv"),         value: cs.npv },
             ];
             return (
               <div ref={radarChartRef} style={{ height: 360 }}>
@@ -559,14 +608,6 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
                       fill="var(--accent)"
                       fillOpacity={0.25}
                       strokeWidth={2}
-                    />
-                    <Radar
-                      name={t("section.radar.legend.target")}
-                      dataKey="target"
-                      stroke="var(--text-3)"
-                      fill="transparent"
-                      strokeWidth={1}
-                      strokeDasharray="4 4"
                     />
                     <Legend
                       wrapperStyle={{ fontSize: 11, color: "var(--text-2)" }}
@@ -597,7 +638,13 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
           <div className="report-section-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
             <div style={{ flex: 1 }}>
               <h2>{t("section.threshold")}</h2>
-              <p className="report-section-hint">{t("section.threshold.hint")}</p>
+              <p className="report-section-hint">
+                {deploymentThreshold == null
+                  ? t("section.threshold.hint.no_deploy")
+                  : fmtTr(t("section.threshold.hint"), {
+                      threshold: deploymentThreshold.toFixed(4),
+                    })}
+              </p>
             </div>
             <ChartToolbar
               containerRef={thresholdChartRef}
@@ -639,12 +686,14 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
                       tickFormatter={(v) => `${Math.round(v * 100)}%`}
                       tick={{ fill: "var(--text-3)", fontSize: 11 }}
                     />
-                    <ReferenceLine
-                      x={0.05}
-                      stroke="#eab308"
-                      strokeDasharray="4 4"
-                      label={{ value: t("section.threshold.deploy"), fill: "#eab308", fontSize: 10, position: "insideTopRight" }}
-                    />
+                    {deploymentThreshold != null && (
+                      <ReferenceLine
+                        x={deploymentThreshold}
+                        stroke="#eab308"
+                        strokeDasharray="4 4"
+                        label={{ value: t("section.threshold.deploy"), fill: "#eab308", fontSize: 10, position: "insideTopRight" }}
+                      />
+                    )}
                     <Tooltip
                       contentStyle={{
                         background: "var(--surface)",
@@ -669,54 +718,54 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
             );
           })()}
           <div style={{ marginTop: 10, fontSize: 12, color: "var(--text-2)", lineHeight: 1.55 }}>
-            {t("section.threshold.advice")}
+            {deploymentThreshold == null
+              ? t("section.threshold.advice.no_deploy")
+              : fmtTr(t("section.threshold.advice"), {
+                  threshold: deploymentThreshold.toFixed(4),
+                })}
           </div>
         </section>
       )}
 
-      {/* Distribution by predicted day — bar chart with bimodal explanation */}
-      {daysDistribution.rows.some((r) => r.count > 0) && (
+      {/* Distribution by persisted absolute risk tier */}
+      {tierDistribution.rows.some((r) => r.count > 0) && (
         <section className="report-section">
           <div className="report-section-head" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
             <div style={{ flex: 1 }}>
-              <h2>{t("section.distribution")} — {fmtTr(t("section.distribution.snapshot"), { date: daysDistribution.latest ?? "" })}</h2>
-              <p className="report-section-hint">{t("section.distribution.hint")}</p>
+              <h2>
+                {t("section.distribution")} · {tierDistribution.latest ?? ""}
+              </h2>
+              <p className="report-section-hint">
+                {t("section.distribution.hint")}
+              </p>
             </div>
             <ChartToolbar
               containerRef={daysChartRef}
-              fileStem="fires-by-day"
+              fileStem="cells-by-risk-tier"
               shape={daysShape}
               onShapeChange={setDaysShape}
               getCsvRows={() => [
-                ["day_offset", "label", "count"],
-                ...daysDistribution.rows.map((r) => [r.day, r.label, r.count]),
+                ["risk_tier", "count"],
+                ...tierDistribution.rows.map((r) => [r.tier, r.count]),
               ]}
             />
           </div>
           <div ref={daysChartRef} style={{ height: 280 }}>
             <ResponsiveContainer width="100%" height="100%">
               {daysShape === "bar" ? (
-                <BarChart data={daysDistribution.rows} margin={{ top: 24, right: 16, bottom: 8, left: 0 }}>
+                <BarChart data={tierDistribution.rows} margin={{ top: 24, right: 16, bottom: 8, left: 0 }}>
                   <CartesianGrid stroke="var(--border-soft)" strokeDasharray="3 3" vertical={false} />
-                  <XAxis dataKey="label" tick={{ fill: "var(--text-3)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} />
+                  <XAxis dataKey="tier" tick={{ fill: "var(--text-3)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} />
                   <YAxis tick={{ fill: "var(--text-3)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false}
                     label={{ value: t("section.distribution.yaxis"), angle: -90, position: "insideLeft", offset: 16, style: { fill: "var(--text-3)", fontSize: 11 } }} />
                   <Tooltip
                     cursor={{ fill: "rgba(255, 107, 53, 0.08)" }}
                     contentStyle={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 6, fontSize: 12, color: "var(--text)" }}
                     formatter={(value) => [`${value} ${t("section.distribution.tooltip.count")}`, ""]}
-                    labelFormatter={(label, payload) => {
-                      const row = payload?.[0]?.payload as { day: number } | undefined;
-                      return row ? fmtTr(t("section.distribution.tooltip.label"), { label: String(label), n: row.day, plural: row.day === 1 ? "" : "s" }) : String(label);
-                    }}
                   />
                   <Bar dataKey="count" radius={[6, 6, 0, 0]}>
-                    {daysDistribution.rows.map((r) => (
-                      <Cell key={r.day} fill={
-                        r.day <= 2 ? "#ef4444" :
-                        r.day === 3 ? "#ff6b35" :
-                        r.day <= 5 ? "#eab308" : "#22c55e"
-                      } />
+                    {tierDistribution.rows.map((r) => (
+                      <Cell key={r.tier} fill={r.color} />
                     ))}
                     <LabelList dataKey="count" position="top"
                       style={{ fill: "var(--text)", fontSize: 11, fontWeight: 600 }}
@@ -728,9 +777,9 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
                   </Bar>
                 </BarChart>
               ) : (
-                <LineChart data={daysDistribution.rows} margin={{ top: 24, right: 16, bottom: 8, left: 0 }}>
+                <LineChart data={tierDistribution.rows} margin={{ top: 24, right: 16, bottom: 8, left: 0 }}>
                   <CartesianGrid stroke="var(--border-soft)" strokeDasharray="3 3" />
-                  <XAxis dataKey="label" tick={{ fill: "var(--text-3)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} />
+                  <XAxis dataKey="tier" tick={{ fill: "var(--text-3)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false} />
                   <YAxis tick={{ fill: "var(--text-3)", fontSize: 11 }} axisLine={{ stroke: "var(--border)" }} tickLine={false}
                     label={{ value: t("section.distribution.yaxis"), angle: -90, position: "insideLeft", offset: 16, style: { fill: "var(--text-3)", fontSize: 11 } }} />
                   <Tooltip
@@ -748,7 +797,7 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
             border: "1px solid rgba(59, 130, 246, 0.25)",
             borderRadius: 6, fontSize: 12, color: "var(--text-2)", lineHeight: 1.6,
           }}>
-            {t("section.distribution.bimodal")}
+            {t("section.distribution.tiers")}
           </div>
         </section>
       )}
@@ -783,6 +832,19 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
         </div>
         {monthly.length > 0 ? (
           <RollingAucChart data={monthly} />
+        ) : rollingLoadState === "loading" ? (
+          <EmptyReport msg={t("section.stability.loading")} />
+        ) : rollingLoadState === "error" ? (
+          <div className="report-inline-error" role="alert">
+            <span>{t("section.stability.error")}</span>
+            <button
+              type="button"
+              className="action-btn"
+              onClick={() => setRollingRetryKey((key) => key + 1)}
+            >
+              {t("analytics.error.retry")}
+            </button>
+          </div>
         ) : (
           <EmptyReport msg={t("section.stability.empty")} />
         )}

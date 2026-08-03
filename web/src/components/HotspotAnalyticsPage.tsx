@@ -3,20 +3,17 @@ import {
   Bar, BarChart, CartesianGrid, Cell, Pie, PieChart,
   ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from "recharts";
-import type { GistdaFeature } from "../types";
-import { useLang } from "../utils/i18n";
+import {
+  fetchHotspotAnalytics,
+  type HotspotAnalyticsData,
+} from "../api";
+import type { GistdaFeature, LiveFireMeta } from "../types";
+import { ageDays, parseGistdaTime } from "../utils/gistdaTime";
+import { fmtTr, useLang } from "../utils/i18n";
 
 interface Props {
   liveFires: GistdaFeature[];
-  liveCount: number;
-}
-
-interface AnalyticsData {
-  as_of: string;
-  transboundary: { country: string; count: number }[];
-  historical_burned_mrai: {
-    year: string; year_ce: number; burned_mrai: number;
-  }[];
+  liveFireMeta: LiveFireMeta;
 }
 
 // ── Thai province → region mapping ──────────────────────────────────────────
@@ -25,7 +22,8 @@ const PROVINCE_TO_REGION: Record<string, string> = {
   "เชียงใหม่":"เหนือ","เชียงราย":"เหนือ","แม่ฮ่องสอน":"เหนือ","ลำปาง":"เหนือ",
   "ลำพูน":"เหนือ","พะเยา":"เหนือ","แพร่":"เหนือ","น่าน":"เหนือ","อุตรดิตถ์":"เหนือ",
   "ตาก":"เหนือ","สุโขทัย":"เหนือ","พิษณุโลก":"เหนือ","พิจิตร":"เหนือ",
-  "กำแพงเพชร":"เหนือ","เพชรบูรณ์":"เหนือ",
+  "กำแพงเพชร":"เหนือ","เพชรบูรณ์":"เหนือ","นครสวรรค์":"เหนือ",
+  "อุทัยธานี":"เหนือ",
   // Northeast
   "นครราชสีมา":"ตะวันออกเฉียงเหนือ","บุรีรัมย์":"ตะวันออกเฉียงเหนือ",
   "สุรินทร์":"ตะวันออกเฉียงเหนือ","ศรีสะเกษ":"ตะวันออกเฉียงเหนือ",
@@ -80,41 +78,44 @@ const REGION_COLORS: Record<string, string> = {
 };
 const COUNTRY_COLOR = "#f97316";
 
-// Detect if GISTDA time field looks like Unix ms (> year 2000 threshold)
-function _parseGistdaMs(date?: number, time?: string): number {
-  if (!date) return 0;
-  const s = String(Math.round(date));
-  if (s.length >= 10) return s.length >= 13 ? date : date * 1000;
-  // YYYYMMDD + HHMM fallback
-  if (s.length !== 8) return 0;
-  const hhmm = time && time.length === 4 ? `${time.slice(0,2)}:${time.slice(2,4)}` : "00:00";
-  return Date.parse(`${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}T${hhmm}:00+07:00`) || 0;
-}
-
-function _hoursAgo(ms: number): number {
-  return (Date.now() - ms) / 3_600_000;
-}
-
-export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
-  const { lang } = useLang();
+export default function HotspotAnalyticsPage({
+  liveFires,
+  liveFireMeta,
+}: Props) {
+  const { lang, t } = useLang();
   const th = lang === "th";
-  const [analyticsData, setAnalyticsData] = useState<AnalyticsData | null>(null);
+  const [analyticsData, setAnalyticsData] = useState<HotspotAnalyticsData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [analyticsError, setAnalyticsError] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
   const chartRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    fetch("/api/analytics/hotspots")
-      .then((r) => r.json())
-      .then((d) => { setAnalyticsData(d); setLoading(false); })
-      .catch(() => setLoading(false));
-  }, []);
+    const controller = new AbortController();
+    setLoading(true);
+    setAnalyticsError(false);
+    fetchHotspotAnalytics(controller.signal)
+      .then((d) => {
+        if (!controller.signal.aborted) setAnalyticsData(d);
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        console.error(error);
+        setAnalyticsError(true);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
+    return () => controller.abort();
+  }, [retryKey]);
 
   // ── Derived stats from live GISTDA features ──────────────────────────────
 
   const landUseData = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const f of liveFires) {
-      const lu = (f.attributes.lu_name ?? (th ? "ไม่ระบุ" : "Unknown")) as string;
+      const rawLandUse = String(f.attributes.lu_name ?? "").trim();
+      const lu = rawLandUse || (th ? "ไม่ระบุ" : "Unknown");
       counts[lu] = (counts[lu] ?? 0) + 1;
     }
     return Object.entries(counts)
@@ -130,7 +131,7 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
   const regionData = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const f of liveFires) {
-      const pv = (f.attributes.pv_tn ?? "") as string;
+      const pv = String(f.attributes.pv_tn ?? "").trim();
       const region = PROVINCE_TO_REGION[pv] ?? (th ? "ไม่ระบุ" : "Other");
       counts[region] = (counts[region] ?? 0) + 1;
     }
@@ -153,7 +154,7 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
   const provinceData = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const f of liveFires) {
-      const pv = (f.attributes.pv_tn ?? "") as string;
+      const pv = String(f.attributes.pv_tn ?? "").trim();
       if (!pv) continue;
       counts[pv] = (counts[pv] ?? 0) + 1;
     }
@@ -163,7 +164,7 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
       .map(([name, count]) => ({ name, count }));
   }, [liveFires]);
 
-  const timeData = useMemo(() => {
+  const timeSummary = useMemo(() => {
     const bins = [
       { label: "<1h",  maxH: 1,   count: 0, fill: "#ef4444" },
       { label: "1–3h", maxH: 3,   count: 0, fill: "#f97316" },
@@ -172,16 +173,29 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
       { label: "12–24h",maxH: 24, count: 0, fill: "#a3e635" },
       { label: ">24h", maxH: Infinity, count: 0, fill: "#d1d5db" },
     ];
+    let timestampUnavailable = 0;
     for (const f of liveFires) {
-      const ms = _parseGistdaMs(f.attributes.date as number, f.attributes.time as string);
-      const h = ms ? _hoursAgo(ms) : 999;
+      const parsed = parseGistdaTime(
+        f.attributes.date as number | string | null | undefined,
+        f.attributes.time as number | string | null | undefined,
+      );
+      const age = ageDays(parsed?.ms ?? null);
+      if (!parsed || parsed.precision !== "minute" || age == null) {
+        timestampUnavailable += 1;
+        continue;
+      }
+      const h = age * 24;
       for (let i = 0; i < bins.length; i++) {
         const prev = i === 0 ? 0 : bins[i-1].maxH;
-        if (h <= bins[i].maxH && h > prev) { bins[i].count++; break; }
+        if (h <= bins[i].maxH && (i === 0 ? h >= prev : h > prev)) {
+          bins[i].count++;
+          break;
+        }
       }
     }
-    return bins;
+    return { bins, timestampUnavailable };
   }, [liveFires]);
+  const timeData = timeSummary.bins;
 
   const transboundaryData = useMemo(() => {
     if (!analyticsData?.transboundary) return [];
@@ -190,6 +204,9 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
       fill: d.country === "Thailand" ? "#22c55e" : COUNTRY_COLOR,
     }));
   }, [analyticsData]);
+  const transboundaryMeta = analyticsData?.transboundary_metadata;
+  const transboundaryUnavailable =
+    analyticsError || transboundaryMeta?.available === false;
 
   const historicalData = useMemo(() => {
     return (analyticsData?.historical_burned_mrai ?? []).map((d) => ({
@@ -198,10 +215,44 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
     }));
   }, [analyticsData, th]);
 
-  const totalHistorical = historicalData.reduce((s, d) => s + d.burned, 0);
+  const historicalYears =
+    (analyticsData?.historical_burned_mrai ?? [])
+      .map((d) => d.year_ce)
+      .filter((year) => Number.isFinite(year));
+  const historicalRange = historicalYears.length > 0
+    ? `${Math.min(...historicalYears)}–${Math.max(...historicalYears)}`
+    : "—";
+
+  const hasCachedLiveData = liveFires.length > 0;
+  const hasUsableLiveState =
+    liveFireMeta.status === "ok" || hasCachedLiveData;
+  const feedState =
+    liveFireMeta.status === "loading"
+      ? hasCachedLiveData
+        ? "refreshing"
+        : "loading"
+      : liveFireMeta.status === "error"
+        ? hasCachedLiveData
+          ? "stale"
+          : "unavailable"
+        : liveFireMeta.isStale
+          ? "stale"
+          : liveFireMeta.status === "ok"
+            ? "available"
+            : "idle";
+  const feedMessageKey =
+    feedState === "available" && liveFires.length === 0
+      ? "analytics.feed.empty_confirmed"
+      : `analytics.feed.${feedState}`;
 
   const CustomTooltip = ({ active, payload, label }: {
-    active?: boolean; payload?: { value: number; fill?: string }[]; label?: string;
+    active?: boolean;
+    payload?: {
+      value: number;
+      fill?: string;
+      dataKey?: string | number;
+    }[];
+    label?: string;
   }) => {
     if (!active || !payload?.length) return null;
     return (
@@ -213,7 +264,9 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
         {payload.map((p, i) => (
           <div key={i} style={{ color: p.fill ?? "var(--accent)" }}>
             {typeof p.value === "number"
-              ? p.value % 1 === 0 ? `${p.value} pts` : `${p.value.toFixed(2)}M rai`
+              ? p.dataKey === "burned"
+                ? `${p.value.toFixed(2)} M rai`
+                : fmtTr(t("analytics.tooltip.points"), { count: p.value })
               : p.value}
           </div>
         ))}
@@ -229,9 +282,7 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
             {th ? "📈 สถิติจุดความร้อน" : "📈 Hotspot Analytics"}
           </h1>
           <p className="notify-page-subtitle">
-            {th
-              ? "ข้อมูลจุดความร้อนเรียลไทม์จาก GISTDA VIIRS + FIRMS ย้อนหลัง 24 ชั่วโมง"
-              : "Real-time hotspot data from GISTDA VIIRS + FIRMS last 24 h"}
+            {t("analytics.subtitle")}
           </p>
         </div>
         <div style={{ fontSize: 11, color: "var(--text-3)", textAlign: "right", lineHeight: 1.6 }}>
@@ -242,25 +293,53 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
         </div>
       </header>
 
+      {analyticsError && (
+        <div className="analytics-error" role="alert">
+          <div>
+            <strong>{t("analytics.error.title")}</strong>
+            <span>{t("analytics.error.hint")}</span>
+          </div>
+          <button type="button" onClick={() => setRetryKey((key) => key + 1)}>
+            {t("analytics.error.retry")}
+          </button>
+        </div>
+      )}
+
+      <div
+        className={`analytics-feed-state ${feedState}`}
+        role={feedState === "unavailable" ? "alert" : "status"}
+      >
+        <strong>{t(`analytics.feed.status.${feedState}`)}</strong>
+        <span>
+          {fmtTr(t(feedMessageKey), { count: liveFires.length })}
+        </span>
+      </div>
+
       {/* KPI strip */}
       <div className="alert-counts" style={{ gridTemplateColumns: "repeat(3, 1fr)", marginBottom: 16 }}>
         <div className="alert-count-card" style={{ borderLeftColor: "#06b6d4" }}>
           <div className="alert-count-label" style={{ color: "#06b6d4" }}>
-            {th ? "GISTDA VIIRS (live)" : "GISTDA VIIRS (live)"}
+            {t("analytics.kpi.hotspots")}
           </div>
-          <div className="alert-count-value">{liveCount}</div>
+          <div className="alert-count-value">
+            {hasUsableLiveState ? liveFires.length : "—"}
+          </div>
         </div>
         <div className="alert-count-card" style={{ borderLeftColor: "#f97316" }}>
           <div className="alert-count-label" style={{ color: "#f97316" }}>
-            {th ? "จุดความร้อนที่โหลดแล้ว" : "Loaded in session"}
+            {t("analytics.kpi.feed_status")}
           </div>
-          <div className="alert-count-value">{liveFires.length}</div>
+          <div className="alert-count-value" style={{ fontSize: 18 }}>
+            {t(`analytics.feed.status.${feedState}`)}
+          </div>
         </div>
         <div className="alert-count-card" style={{ borderLeftColor: "#22c55e" }}>
           <div className="alert-count-label" style={{ color: "#22c55e" }}>
-            {th ? "ประเภทการใช้ที่ดิน" : "Land-use categories"}
+            {t("analytics.kpi.land_use")}
           </div>
-          <div className="alert-count-value">{landUseData.length}</div>
+          <div className="alert-count-value">
+            {hasUsableLiveState ? landUseData.length : "—"}
+          </div>
         </div>
       </div>
 
@@ -275,7 +354,11 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
           {liveFires.length === 0 ? (
             <div className="empty-state" style={{ minHeight: 180 }}>
               <div className="empty-icon">🔥</div>
-              <div className="empty-hint">{th ? "ยังไม่มีข้อมูลจุดความร้อน" : "No live fire data yet"}</div>
+              <div className="empty-hint">
+                {hasUsableLiveState
+                  ? t("analytics.empty.confirmed")
+                  : t("analytics.empty.unavailable")}
+              </div>
             </div>
           ) : (
             <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
@@ -319,22 +402,36 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
           <h3 className="report-section-title">
             {th ? "เวลานับตั้งแต่ตรวจพบ · ชั่วโมง" : "Time Since Detection · Hours"}
           </h3>
-          <ResponsiveContainer width="100%" height={180}>
-            <BarChart data={timeData} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-              <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--text-3)" }} />
-              <YAxis tick={{ fontSize: 10, fill: "var(--text-3)" }} />
-              <Tooltip content={<CustomTooltip />} />
-              <Bar dataKey="count" radius={[3, 3, 0, 0]}>
-                {timeData.map((d, i) => <Cell key={i} fill={d.fill} />)}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-          <p style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4, textAlign: "center" }}>
-            {th
-              ? "⚠️ เวลาอาจไม่ตรงหากฟิลด์ date/time จาก GISTDA เป็น null"
-              : "⚠️ Time may be inaccurate if GISTDA date/time fields are null"}
-          </p>
+          {liveFires.length === 0 ? (
+            <div className="empty-state" style={{ minHeight: 180 }}>
+              <div className="empty-hint">
+                {hasUsableLiveState
+                  ? t("analytics.empty.confirmed")
+                  : t("analytics.empty.unavailable")}
+              </div>
+            </div>
+          ) : (
+            <>
+              <ResponsiveContainer width="100%" height={180}>
+                <BarChart data={timeData} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                  <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--text-3)" }} />
+                  <YAxis tick={{ fontSize: 10, fill: "var(--text-3)" }} />
+                  <Tooltip content={<CustomTooltip />} />
+                  <Bar dataKey="count" radius={[3, 3, 0, 0]}>
+                    {timeData.map((d, i) => <Cell key={i} fill={d.fill} />)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+              {timeSummary.timestampUnavailable > 0 && (
+                <p style={{ fontSize: 10, color: "#eab308", marginTop: 4, textAlign: "center" }}>
+                  {fmtTr(t("analytics.time.excluded"), {
+                    count: timeSummary.timestampUnavailable,
+                  })}
+                </p>
+              )}
+            </>
+          )}
         </div>
       </div>
 
@@ -348,7 +445,11 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
           </h3>
           {regionData.length === 0 ? (
             <div className="empty-state" style={{ minHeight: 200 }}>
-              <div className="empty-hint">{th ? "ไม่มีข้อมูลจังหวัด" : "No province data in live feed"}</div>
+              <div className="empty-hint">
+                {hasUsableLiveState
+                  ? t("analytics.empty.confirmed")
+                  : t("analytics.empty.unavailable")}
+              </div>
             </div>
           ) : (
             <ResponsiveContainer width="100%" height={200}>
@@ -373,7 +474,11 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
           </h3>
           {provinceData.length === 0 ? (
             <div className="empty-state" style={{ minHeight: 200 }}>
-              <div className="empty-hint">{th ? "ไม่มีข้อมูลจังหวัด" : "No province data in live feed"}</div>
+              <div className="empty-hint">
+                {hasUsableLiveState
+                  ? t("analytics.empty.confirmed")
+                  : t("analytics.empty.unavailable")}
+              </div>
             </div>
           ) : (
             <ResponsiveContainer width="100%" height={Math.max(200, provinceData.length * 28)}>
@@ -409,7 +514,11 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
             </div>
           ) : transboundaryData.length === 0 ? (
             <div className="empty-state" style={{ minHeight: 200 }}>
-              <div className="empty-hint">{th ? "ไม่มีข้อมูล FIRMS" : "FIRMS data unavailable"}</div>
+              <div className="empty-hint">
+                {transboundaryUnavailable
+                  ? t("analytics.transboundary.unavailable")
+                  : t("analytics.transboundary.empty")}
+              </div>
             </div>
           ) : (
             <ResponsiveContainer width="100%" height={200}>
@@ -427,26 +536,45 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
             </ResponsiveContainer>
           )}
           <p style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>
-            {th
-              ? "📡 NASA FIRMS VIIRS · เขตพื้นที่โดยประมาณ · อาจมีพื้นที่ซ้อนทับชายแดน"
-              : "📡 NASA FIRMS VIIRS · approximate bounding boxes · border overlap possible"}
+            {transboundaryMeta?.available
+              ? fmtTr(t("analytics.transboundary.method"), {
+                  hours: transboundaryMeta.window_hours ?? 24,
+                  assigned: transboundaryMeta.assigned_rows ?? "—",
+                  source: transboundaryMeta.source_rows_in_window ?? "—",
+                  unassigned: transboundaryMeta.unassigned_rows ?? "—",
+                })
+              : t("analytics.transboundary.method.unavailable")}
           </p>
         </div>
 
         {/* Historical burned area */}
         <div className="report-section">
           <h3 className="report-section-title">
-            {th ? "พื้นที่เผาไหม้ช้าชาก (ล้านไร่)" : "Cumulative Burned Area (Million Rai)"}
+            {t("analytics.history.title")}
           </h3>
-          <div style={{ fontSize: 24, fontWeight: 800, color: "#f97316", marginBottom: 4 }}>
-            {totalHistorical.toFixed(2)}
-            <span style={{ fontSize: 12, fontWeight: 400, color: "var(--text-3)", marginLeft: 6 }}>
-              {th ? "ล้านไร่ (รวมทั้งหมด)" : "M rai total"}
-            </span>
-          </div>
+          {historicalData.length > 0 && (
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#f97316", marginBottom: 8 }}>
+              {fmtTr(t("analytics.history.range"), {
+                range: historicalRange,
+                years: historicalData.length,
+              })}
+            </div>
+          )}
           {loading ? (
             <div className="empty-state" style={{ minHeight: 180 }}>
               <div className="empty-hint">{th ? "กำลังโหลด…" : "Loading…"}</div>
+            </div>
+          ) : analyticsError && historicalData.length === 0 ? (
+            <div className="empty-state" style={{ minHeight: 180 }}>
+              <div className="empty-hint">
+                {t("analytics.history.unavailable")}
+              </div>
+            </div>
+          ) : historicalData.length === 0 ? (
+            <div className="empty-state" style={{ minHeight: 180 }}>
+              <div className="empty-hint">
+                {t("analytics.history.empty")}
+              </div>
             </div>
           ) : (
             <ResponsiveContainer width="100%" height={180}>
@@ -461,9 +589,7 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
             </ResponsiveContainer>
           )}
           <p style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>
-            {th
-              ? "📊 ข้อมูลจากรายงานประจำปีของ GISTDA (ค่าโดยประมาณ)"
-              : "📊 From GISTDA annual wildfire reports (approximate values)"}
+            {t("analytics.history.source")}
           </p>
         </div>
       </div>
@@ -479,7 +605,7 @@ export default function HotspotAnalyticsPage({ liveFires, liveCount }: Props) {
             style={{ color: "#f97316", textDecoration: "none" }}>
             🛰 NASA FIRMS · firms.modaps.eosdis.nasa.gov
           </a>
-          <span>{th ? "ข้อมูลเรียลไทม์ · อัปเดตทุก 5 นาที" : "Real data · updates every 5 min"}</span>
+          <span>{t("analytics.footer.polling")}</span>
         </div>
       </footer>
     </div>

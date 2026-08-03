@@ -4,6 +4,7 @@ import {
   getNotificationPermission, requestNotificationPermission,
   type NotifyPermission,
 } from "../utils/fireAlerts";
+import { fmtTr, useLang } from "../utils/i18n";
 
 interface Props {
   alerts: FireAlert[];
@@ -25,6 +26,7 @@ interface Props {
 const AUTO_DISMISS_MS = 20_000;
 
 export default function AlertToasts({ alerts, onDismiss, onDismissAll, onFlyTo }: Props) {
+  const { t } = useLang();
   const [now, setNow] = useState(() => Date.now());
   const [perm, setPerm] = useState<NotifyPermission>(getNotificationPermission());
   const [hoveredId, setHoveredId] = useState<string | null>(null);
@@ -49,22 +51,28 @@ export default function AlertToasts({ alerts, onDismiss, onDismissAll, onFlyTo }
     setPerm(next);
   };
 
-  if (alerts.length === 0 && perm === "granted") return null;
+  // Do not ask for OS-notification permission as an unrelated first-load
+  // overlay. Offer it only alongside a real in-app fire alert, where the
+  // reason for granting permission is clear and the prompt cannot obscure a
+  // zero-event dashboard or presentation.
+  if (alerts.length === 0) return null;
 
   return (
-    <div className="alert-toasts" role="region" aria-label="Real-time fire alerts">
+    <div className="alert-toasts" role="region" aria-label={t("alerts.region.aria")}>
       {/* OS Notification permission CTA — shown until granted/denied/unsupported */}
       {perm === "default" && (
         <div className="alert-toast alert-toast-info">
           <div className="alert-toast-body">
-            <div className="alert-toast-title">🔔 เปิด Browser Notifications?</div>
+            <div className="alert-toast-title">
+              {t("alerts.permission.title")}
+            </div>
             <div className="alert-toast-sub">
-              ระบบจะแจ้งเตือนทันทีแม้ปิด tab อยู่ (ใช้ Browser Notification API)
+              {t("alerts.permission.body")}
             </div>
           </div>
           <div className="alert-toast-actions">
             <button type="button" className="action-btn primary" onClick={onEnableNotify}>
-              เปิด
+              {t("alerts.permission.enable")}
             </button>
           </div>
         </div>
@@ -76,7 +84,7 @@ export default function AlertToasts({ alerts, onDismiss, onDismissAll, onFlyTo }
           className="alert-toast-clear-all"
           onClick={onDismissAll}
         >
-          Clear all ({alerts.length})
+          {fmtTr(t("alerts.clear_all"), { count: alerts.length })}
         </button>
       )}
 
@@ -96,17 +104,24 @@ export default function AlertToasts({ alerts, onDismiss, onDismissAll, onFlyTo }
               type="button"
               className="alert-toast-close"
               onClick={() => onDismiss(a.id)}
-              aria-label="Dismiss alert"
+              aria-label={t("alerts.dismiss")}
             >×</button>
             <div
               className="alert-toast-body"
               onClick={() => onFlyTo?.(a.lat, a.lon)}
+              onKeyDown={(event) => {
+                if (!onFlyTo) return;
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onFlyTo(a.lat, a.lon);
+                }
+              }}
               style={{ cursor: onFlyTo ? "pointer" : "default" }}
               role={onFlyTo ? "button" : undefined}
               tabIndex={onFlyTo ? 0 : undefined}
             >
               <div className="alert-toast-title">
-                🔥 ตรวจพบไฟใหม่!
+                {t("alerts.new_fire")}
               </div>
               <div className="alert-toast-location">
                 <b>{a.province}</b>
@@ -116,12 +131,13 @@ export default function AlertToasts({ alerts, onDismiss, onDismissAll, onFlyTo }
                 {a.lat.toFixed(3)}°, {a.lon.toFixed(3)}°
               </div>
               <div className="alert-toast-meta">
-                {a.satellite} · {a.confident && `confidence ${a.confident}`}
+                {a.satellite}
+                {a.confident && ` · ${fmtTr(t("alerts.confidence"), { value: a.confident })}`}
                 {a.landUse && a.landUse !== "—" ? ` · ${a.landUse}` : ""}
               </div>
               {a.acqDateTime && (
                 <div className="alert-toast-time">
-                  ตรวจพบ {a.acqDateTime}
+                  {fmtTr(t("alerts.detected_at"), { time: a.acqDateTime })}
                 </div>
               )}
             </div>

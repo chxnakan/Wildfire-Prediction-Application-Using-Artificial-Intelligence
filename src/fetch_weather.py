@@ -256,6 +256,20 @@ def discover_active_cells() -> tuple[pd.DataFrame, date, date]:
 
 CellTodo = Tuple[float, float, date, date]   # (lat, lon, fetch_start, fetch_end)
 
+# ERA5's native grid is 0.25°; Open-Meteo snaps finer coordinates to the
+# nearest native point server-side, so requesting per-0.1°-cell pays the API
+# quota ~6× for values that are identical within each 0.25° parent point.
+# We fetch once per unique parent and copy its rows to every member 0.1° cell
+# — nearest-neighbour assignment at the source's REAL resolution, exactly what
+# the API itself would return per cell. No interpolation, no fabricated values.
+ERA5_NATIVE_RES_DEG = float(os.getenv("OPEN_METEO_NATIVE_RES_DEG", "0.25"))
+
+
+def _era5_parent(lat: float, lon: float) -> Tuple[float, float]:
+    """Snap a grid-cell coordinate to its ERA5 native (0.25°) parent point."""
+    r = ERA5_NATIVE_RES_DEG
+    return (round(round(lat / r) * r, 6), round(round(lon / r) * r, 6))
+
 
 def _build_cache_index(
     cache: pd.DataFrame,
@@ -595,6 +609,28 @@ def update_cache(
         log.info("Cache already up to date — nothing to fetch.")
         return 0
 
+    # ── Collapse 0.1° cells to their ERA5 native parent points ───────────────
+    # Each parent is fetched once with the union window of its members; the
+    # result is copied back to every member cell in process_success below.
+    members_by_parent: Dict[Tuple[float, float], List[Tuple[float, float]]] = defaultdict(list)
+    parent_window: Dict[Tuple[float, float], Tuple[date, date]] = {}
+    for lat, lon, s, e in todo:
+        pkey = _era5_parent(lat, lon)
+        members_by_parent[pkey].append((lat, lon))
+        if pkey in parent_window:
+            ps, pe = parent_window[pkey]
+            parent_window[pkey] = (min(ps, s), max(pe, e))
+        else:
+            parent_window[pkey] = (s, e)
+    n_cells_todo = len(todo)
+    todo = [(la, lo, s, e) for (la, lo), (s, e) in parent_window.items()]
+    log.info(
+        "Collapsed %d cell-windows into %d ERA5 native points (%.2f° grid) — "
+        "%.1fx fewer coordinates on the API bill",
+        n_cells_todo, len(todo), ERA5_NATIVE_RES_DEG,
+        n_cells_todo / max(1, len(todo)),
+    )
+
     # ── Group into batches by shared date window ─────────────────────────────
     groups = _group_cells_by_window(todo)
     work_units: List[WorkUnit] = []
@@ -669,11 +705,19 @@ def update_cache(
         for df in dfs:
             if df.empty:
                 continue
-            keys = list(zip(df["lat_grid"].round(6), df["lon_grid"].round(6), df["date"]))
-            mask = [k not in existing for k in keys]
-            df = df[mask]
-            if not df.empty:
-                new_frames.append(df)
+            # df carries the PARENT point's coordinates — fan it back out to
+            # every member 0.1° cell that needed data.
+            pkey = (round(float(df["lat_grid"].iloc[0]), 6),
+                    round(float(df["lon_grid"].iloc[0]), 6))
+            for mlat, mlon in members_by_parent.get(pkey) or [pkey]:
+                m = df.copy()
+                m["lat_grid"] = mlat
+                m["lon_grid"] = mlon
+                keys = list(zip(m["lat_grid"].round(6), m["lon_grid"].round(6), m["date"]))
+                mask = [k not in existing for k in keys]
+                m = m[mask]
+                if not m.empty:
+                    new_frames.append(m)
         units_since_flush += 1
         if _flush_cfg > 0 and units_since_flush >= _flush_cfg:
             checkpoint("interval")

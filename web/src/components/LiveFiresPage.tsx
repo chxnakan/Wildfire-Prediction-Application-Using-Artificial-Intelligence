@@ -1,10 +1,16 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { FireFeature, GistdaFeature, LiveFireMeta } from "../types";
+import {
+  ageDays,
+  parseGistdaTime,
+  type TimestampPrecision,
+} from "../utils/gistdaTime";
 import { fmtTr, useLang } from "../utils/i18n";
 
 interface Props {
   liveFires: GistdaFeature[];               // GISTDA NRT — live <30 min latency
   observed: FireFeature[];                  // NASA FIRMS observed (last days)
+  observedAvailable: boolean;
   liveFireMeta: LiveFireMeta;
   onRefresh?: () => void;
   onNavigateToMap: (lat: number, lon: number) => void;
@@ -14,7 +20,7 @@ interface Props {
 // Live Fires Feed page — news-dashboard-style chronological list
 // of REAL satellite fire detections.
 //
-// Two real-data sources, both verifiable independently:
+// Two real-data sources with official links for separate verification:
 //   1. GISTDA NRT VIIRS  — Thai government, < 30 min latency
 //      verify: https://fire.gistda.or.th/
 //   2. NASA FIRMS NRT    — NASA Earth Data, satellite thermal anomalies
@@ -40,51 +46,47 @@ interface Incident {
   district: string;
   satellite: string;
   confidence: string;
+  detectionCount: number | null;
   landUse: string;
   verifyUrl: string;
-  daysOld: number;             // how many days back this was detected
+  daysOld: number | null;       // null means source time is not usable
+  timePrecision: TimestampPrecision | null;
 }
 
-function _formatGistdaTime(date?: number, time?: string): { iso: string; ms: number } {
-  if (!date) return { iso: "", ms: 0 };
-  const s = String(Math.round(date));
-  // ArcGIS GeoJSON (f=geojson) returns esriFieldTypeDate as Unix ms — 13 digits.
-  // Some older exports use Unix seconds (10 digits). Handle both.
-  if (s.length >= 10) {
-    const ms = s.length >= 13 ? date : date * 1000;
-    return isNaN(ms) ? { iso: "", ms: 0 } : { iso: new Date(ms).toISOString(), ms };
-  }
-  // Fallback: 8-digit YYYYMMDD integer with optional HHMM time string.
-  if (s.length !== 8) return { iso: "", ms: 0 };
-  const isoDate = `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;
-  // GISTDA time field is HHMM without colon — convert to HH:MM
-  const hhmm = time && time.length === 4
-    ? `${time.slice(0, 2)}:${time.slice(2, 4)}`
-    : (time ?? "00:00");
-  const iso = `${isoDate}T${hhmm}:00+07:00`;
-  const ms = Date.parse(iso);
-  return { iso, ms: isNaN(ms) ? 0 : ms };
+function validCoordinate(lat: number, lon: number): boolean {
+  return Number.isFinite(lat) &&
+    Number.isFinite(lon) &&
+    lat >= -90 &&
+    lat <= 90 &&
+    lon >= -180 &&
+    lon <= 180;
 }
 
-function _gistdaToIncident(f: GistdaFeature): Incident {
+function _gistdaToIncident(f: GistdaFeature): Incident | null {
   const a = f.attributes;
-  const { iso, ms } = _formatGistdaTime(a.date as number, a.time as string);
-  const lat = Number(a.latitude) || 0;
-  const lon = Number(a.longitude) || 0;
+  const parsed = parseGistdaTime(
+    a.date as number | string | null | undefined,
+    a.time as number | string | null | undefined,
+  );
+  const lat = Number(a.latitude);
+  const lon = Number(a.longitude);
+  if (!validCoordinate(lat, lon)) return null;
   return {
     id: `gistda-${lat.toFixed(4)}-${lon.toFixed(4)}-${a.date ?? ""}-${a.time ?? ""}`,
     source: "GISTDA",
-    detectedAt: ms,
-    detectedAtStr: iso || "—",
+    detectedAt: parsed?.ms ?? 0,
+    detectedAtStr: parsed?.iso ?? "—",
     lat,
     lon,
     province: (a.pv_tn ?? "").toString() || "—",
     district: (a.ap_tn ?? "").toString() || "",
     satellite: (a.satellite ?? "VIIRS").toString(),
     confidence: (a.confident ?? "").toString(),
+    detectionCount: null,
     landUse: (a.lu_name ?? "").toString() || "",
     verifyUrl: "https://fire.gistda.or.th/",
-    daysOld: ms ? (Date.now() - ms) / 86_400_000 : 0,
+    daysOld: ageDays(parsed?.ms ?? null),
+    timePrecision: parsed?.precision ?? null,
   };
 }
 
@@ -96,11 +98,20 @@ function _isInThailandBbox(lat: number, lon: number): boolean {
   return lat >= 5.5 && lat <= 20.6 && lon >= 97.3 && lon <= 105.7;
 }
 
-function _firmsObservedToIncident(f: FireFeature): Incident {
+function _firmsObservedToIncident(f: FireFeature): Incident | null {
   const p = f.properties;
   const [lon, lat] = f.geometry.coordinates;
+  if (!validCoordinate(lat, lon)) return null;
   const dateStr = p.date ?? "";
-  const ms = dateStr ? Date.parse(dateStr + "T12:00:00+07:00") : 0;
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
+  const parsedMs = dateStr
+    ? Date.parse(dateOnly ? `${dateStr}T00:00:00+07:00` : dateStr)
+    : Number.NaN;
+  const ms = Number.isFinite(parsedMs) ? parsedMs : 0;
+  const detectionCount =
+    typeof p.fire_count === "number" && Number.isFinite(p.fire_count)
+      ? p.fire_count
+      : null;
   return {
     id: `firms-${lat.toFixed(4)}-${lon.toFixed(4)}-${dateStr}`,
     source: "FIRMS",
@@ -111,16 +122,26 @@ function _firmsObservedToIncident(f: FireFeature): Incident {
     province: p.province ?? "—",
     district: "",
     satellite: "VIIRS-SNPP/NOAA20",
-    confidence: String(p.fire_count ?? ""),
+    confidence: "",
+    detectionCount,
     landUse: "",
     verifyUrl: `https://firms.modaps.eosdis.nasa.gov/map/#l:viirs;@${lon.toFixed(3)},${lat.toFixed(3)},9z`,
-    daysOld: ms ? (Date.now() - ms) / 86_400_000 : 99,
+    daysOld: ageDays(ms || null),
+    timePrecision: ms ? (dateOnly ? "date" : "minute") : null,
   };
 }
 
-function _timeAgo(ms: number, t: (k: string, fb?: string) => string): string {
-  if (!ms) return "—";
-  const diff = (Date.now() - ms) / 1000;
+function _timeAgo(
+  incident: Incident,
+  t: (k: string, fb?: string) => string,
+): string {
+  if (!incident.detectedAt || incident.daysOld == null) {
+    return t("live.time.unavailable");
+  }
+  if (incident.timePrecision === "date") {
+    return t("live.time.date_only");
+  }
+  const diff = Math.max(0, (Date.now() - incident.detectedAt) / 1000);
   if (diff < 60)    return fmtTr(t("live.ago.seconds"), { n: Math.round(diff) });
   if (diff < 3600)  return fmtTr(t("live.ago.minutes"), { n: Math.round(diff / 60) });
   if (diff < 86400) return fmtTr(t("live.ago.hours"),   { n: Math.round(diff / 3600) });
@@ -138,7 +159,12 @@ const SOURCE_INFO: Record<IncidentSource, { full: string; org: string }> = {
 };
 
 export default function LiveFiresPage({
-  liveFires, observed, liveFireMeta, onRefresh, onNavigateToMap,
+  liveFires,
+  observed,
+  observedAvailable,
+  liveFireMeta,
+  onRefresh,
+  onNavigateToMap,
 }: Props) {
   const { t } = useLang();
   const [sourceFilter, setSourceFilter] = useState<IncidentSource | "ALL">("ALL");
@@ -156,8 +182,14 @@ export default function LiveFiresPage({
 
   const incidents = useMemo<Incident[]>(() => {
     const out: Incident[] = [];
-    for (const f of liveFires) out.push(_gistdaToIncident(f));
-    for (const f of observed) out.push(_firmsObservedToIncident(f));
+    for (const f of liveFires) {
+      const incident = _gistdaToIncident(f);
+      if (incident) out.push(incident);
+    }
+    for (const f of observed) {
+      const incident = _firmsObservedToIncident(f);
+      if (incident) out.push(incident);
+    }
     out.sort((a, b) => b.detectedAt - a.detectedAt);
     return out;
   }, [liveFires, observed]);
@@ -172,7 +204,11 @@ export default function LiveFiresPage({
     return incidents.filter((i) => {
       if (sourceFilter !== "ALL" && i.source !== sourceFilter) return false;
       if (provinceFilter !== "ALL" && i.province !== provinceFilter) return false;
-      if (i.daysOld > timeWindow) return false;
+      if (i.daysOld == null || i.daysOld > timeWindow) return false;
+      // A date-only FIRMS row cannot honestly be placed inside an exact
+      // sub-day window. Keep it in 3/7/30-day views, where day precision is
+      // sufficient, instead of presenting it as a precise "past 24 h" hit.
+      if (timeWindow <= 1 && i.timePrecision !== "minute") return false;
       // Thailand only — accept if province is annotated OR coordinates fall
       // inside the Thai bbox (fallback for FIRMS observed rows, which the
       // backend doesn't yet annotate with province).
@@ -193,9 +229,9 @@ export default function LiveFiresPage({
     });
   }, [incidents, sourceFilter, provinceFilter, timeWindow, search, thailandOnly]);
 
-  // Cross-verification: for each incident, find other-source incidents within
-  // 12 km AND 24h. If any → flag "✓ cross-verified by other satellite".
-  const crossVerified = useMemo(() => {
+  // Source-overlap cue: this is supporting context, not independent proof.
+  // GISTDA and FIRMS may distribute observations from the same VIIRS sensor.
+  const sourceOverlap = useMemo(() => {
     const map = new Map<string, IncidentSource[]>();
     const others = incidents;
     for (const i of incidents) {
@@ -205,6 +241,7 @@ export default function LiveFiresPage({
         const dLat = (i.lat - o.lat) * 111;
         const dLon = (i.lon - o.lon) * 111 * Math.cos((i.lat * Math.PI) / 180);
         const km = Math.sqrt(dLat * dLat + dLon * dLon);
+        if (!i.detectedAt || !o.detectedAt) continue;
         const dt = Math.abs(i.detectedAt - o.detectedAt);
         if (km <= 12 && dt <= 24 * 3600 * 1000) matches.push(o.source);
       }
@@ -219,27 +256,49 @@ export default function LiveFiresPage({
       if (i.source === "GISTDA") c.GISTDA++;
       if (i.source === "FIRMS") c.FIRMS++;
       c.total++;
-      if (i.daysOld * 24 <= 1) c.last1h++;
-      if (i.daysOld <= 1) c.last24h++;
+      if (
+        i.timePrecision === "minute" &&
+        i.daysOld != null &&
+        i.daysOld * 24 <= 1
+      ) {
+        c.last1h++;
+      }
+      if (
+        i.timePrecision === "minute" &&
+        i.daysOld != null &&
+        i.daysOld <= 1
+      ) {
+        c.last24h++;
+      }
     }
     return c;
   }, [incidents]);
 
   const liveStatus = liveFireMeta.status;
-  const liveStatusLabel =
-    liveStatus === "ok" ? `live · ${liveFireMeta.count} active`
-    : liveStatus === "loading" ? "loading…"
-    : liveStatus === "error" ? "API error"
-    : "idle";
+  const hasCachedGistda = liveFires.length > 0;
+  const waitingForFirstLiveResult =
+    (liveStatus === "idle" || liveStatus === "loading") &&
+    !hasCachedGistda;
+  const allSourcesUnavailable =
+    liveStatus === "error" &&
+    !hasCachedGistda &&
+    !observedAvailable;
+  const effectiveLiveStatus =
+    liveStatus === "error" && hasCachedGistda
+      ? "cached"
+      : liveFireMeta.isStale && hasCachedGistda
+        ? "cached"
+        : liveStatus;
+  const liveStatusLabel = fmtTr(
+    t(`live.status.${effectiveLiveStatus}`),
+    { count: liveFires.length },
+  );
 
   // Reset pagination whenever filters change so user starts from the top
   // again — otherwise switching province while at page 200 looks empty.
-  const filterKey = `${sourceFilter}|${provinceFilter}|${timeWindow}|${search}|${thailandOnly}`;
-  const lastFilterKeyRef = useRef<string>(filterKey);
-  if (lastFilterKeyRef.current !== filterKey) {
-    lastFilterKeyRef.current = filterKey;
-    if (pageSize !== 50) setPageSize(50);
-  }
+  useEffect(() => {
+    setPageSize(50);
+  }, [sourceFilter, provinceFilter, timeWindow, search, thailandOnly]);
 
   return (
     <div className="notify-page">
@@ -251,6 +310,8 @@ export default function LiveFiresPage({
             <button
               type="button"
               onClick={() => setShowHelp(!showHelp)}
+              aria-expanded={showHelp}
+              aria-controls="live-feed-help"
               style={{ marginLeft: 8, background: "transparent", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: 12, fontWeight: 600 }}
             >
               {showHelp ? t("live.help.hide") : t("live.help.show")}
@@ -259,12 +320,26 @@ export default function LiveFiresPage({
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "center", flexDirection: "column" }}>
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-            <span className={`status-badge ${liveStatus === "ok" ? "great" : liveStatus === "error" ? "bad" : "ok"}`}>
+            <span
+              className={`status-badge ${
+                effectiveLiveStatus === "ok"
+                  ? "great"
+                  : effectiveLiveStatus === "error"
+                    ? "bad"
+                    : "ok"
+              }`}
+              role="status"
+            >
               ⚡ GISTDA {liveStatusLabel}
             </span>
             {onRefresh && (
-              <button type="button" className="action-btn" onClick={onRefresh} title="Refresh feed">
-                ↻ Refresh
+              <button
+                type="button"
+                className="action-btn"
+                onClick={onRefresh}
+                title={t("live.error.retry")}
+              >
+                ↻ {t("live.error.retry")}
               </button>
             )}
           </div>
@@ -277,7 +352,7 @@ export default function LiveFiresPage({
       </header>
 
       {showHelp && (
-        <div className="help-card" style={{
+        <div id="live-feed-help" className="help-card" style={{
           background: "var(--surface)",
           border: "1px solid var(--border)",
           borderLeft: "4px solid var(--accent)",
@@ -335,33 +410,65 @@ export default function LiveFiresPage({
         </div>
       )}
 
+      {liveStatus === "error" && !hasCachedGistda && (
+        <div className="analytics-error" role="alert">
+          <div>
+            <strong>{t("live.error.title")}</strong>
+            <span>
+              {liveFireMeta.error || t("live.error.hint")}
+            </span>
+          </div>
+          {onRefresh && (
+            <button type="button" onClick={onRefresh}>
+              {t("live.error.retry")}
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Top counts strip */}
       <div className="alert-counts" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
         <div className="alert-count-card" style={{ borderLeftColor: "#ef4444" }}>
           <div className="alert-count-label" style={{ color: "#ef4444" }}>{t("live.count.h1")}</div>
-          <div className="alert-count-value">{sourceCounts.last1h}</div>
+          <div className="alert-count-value">
+            {waitingForFirstLiveResult && !observedAvailable
+              ? "—"
+              : sourceCounts.last1h}
+          </div>
         </div>
         <div className="alert-count-card" style={{ borderLeftColor: "#f97316" }}>
           <div className="alert-count-label" style={{ color: "#f97316" }}>{t("live.count.h24")}</div>
-          <div className="alert-count-value">{sourceCounts.last24h}</div>
+          <div className="alert-count-value">
+            {waitingForFirstLiveResult && !observedAvailable
+              ? "—"
+              : sourceCounts.last24h}
+          </div>
         </div>
         <button
           type="button"
           className={`alert-count-card ${sourceFilter === "GISTDA" ? "active" : ""}`}
           onClick={() => setSourceFilter(sourceFilter === "GISTDA" ? "ALL" : "GISTDA")}
+          aria-pressed={sourceFilter === "GISTDA"}
           style={{ borderLeftColor: SOURCE_COLOR.GISTDA }}
         >
           <div className="alert-count-label" style={{ color: SOURCE_COLOR.GISTDA }}>GISTDA</div>
-          <div className="alert-count-value">{sourceCounts.GISTDA}</div>
+          <div className="alert-count-value">
+            {liveStatus === "ok" || hasCachedGistda
+              ? sourceCounts.GISTDA
+              : "—"}
+          </div>
         </button>
         <button
           type="button"
           className={`alert-count-card ${sourceFilter === "FIRMS" ? "active" : ""}`}
           onClick={() => setSourceFilter(sourceFilter === "FIRMS" ? "ALL" : "FIRMS")}
+          aria-pressed={sourceFilter === "FIRMS"}
           style={{ borderLeftColor: SOURCE_COLOR.FIRMS }}
         >
           <div className="alert-count-label" style={{ color: SOURCE_COLOR.FIRMS }}>FIRMS</div>
-          <div className="alert-count-value">{sourceCounts.FIRMS}</div>
+          <div className="alert-count-value">
+            {observedAvailable ? sourceCounts.FIRMS : "—"}
+          </div>
         </button>
       </div>
 
@@ -386,16 +493,28 @@ export default function LiveFiresPage({
           />
           {t("live.filter.thailand")}
         </label>
-        <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value as IncidentSource | "ALL")}>
+        <select
+          value={sourceFilter}
+          onChange={(e) => setSourceFilter(e.target.value as IncidentSource | "ALL")}
+          aria-label={t("live.filter.source.label")}
+        >
           <option value="ALL">{t("live.filter.all_source")}</option>
           <option value="GISTDA">GISTDA only</option>
           <option value="FIRMS">FIRMS only</option>
         </select>
-        <select value={provinceFilter} onChange={(e) => setProvinceFilter(e.target.value)}>
+        <select
+          value={provinceFilter}
+          onChange={(e) => setProvinceFilter(e.target.value)}
+          aria-label={t("live.filter.province.label")}
+        >
           <option value="ALL">{t("live.filter.all_province")}</option>
           {provinces.map((p) => <option key={p} value={p}>{p}</option>)}
         </select>
-        <select value={timeWindow} onChange={(e) => setTimeWindow(Number(e.target.value))}>
+        <select
+          value={timeWindow}
+          onChange={(e) => setTimeWindow(Number(e.target.value))}
+          aria-label={t("live.filter.time.label")}
+        >
           <option value={0.25}>{t("live.filter.window.6h")}</option>
           <option value={1}>{t("live.filter.window.24h")}</option>
           <option value={3}>{t("live.filter.window.3d")}</option>
@@ -407,9 +526,13 @@ export default function LiveFiresPage({
           placeholder={t("live.search.placeholder")}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
+          aria-label={t("live.filter.search.label")}
         />
         <div className="alert-filter-summary">
-          {filtered.length} / {incidents.length} incidents
+          {fmtTr(t("live.paginator.summary"), {
+            n: filtered.length,
+            total: incidents.length,
+          })}
         </div>
       </div>
 
@@ -417,14 +540,39 @@ export default function LiveFiresPage({
       {filtered.length === 0 ? (
         <div className="empty-state">
           <div className="empty-icon">🌲</div>
-          <div className="empty-title">{t("live.empty.title")}</div>
-          <div className="empty-hint">{t("live.empty.hint")}</div>
+          <div className="empty-title">
+            {waitingForFirstLiveResult && incidents.length === 0
+              ? t("analytics.feed.status.loading")
+              : allSourcesUnavailable
+              ? t("live.empty.unavailable.title")
+              : incidents.length === 0 &&
+                  liveStatus === "ok" &&
+                  observedAvailable
+                ? t("live.empty.confirmed.title")
+                : t("live.empty.title")}
+          </div>
+          <div className="empty-hint">
+            {waitingForFirstLiveResult && incidents.length === 0
+              ? t("analytics.feed.loading")
+              : allSourcesUnavailable
+              ? t("live.empty.unavailable.hint")
+              : incidents.length === 0 &&
+                  liveStatus === "ok" &&
+                  observedAvailable
+                ? t("live.empty.confirmed.hint")
+                : t("live.empty.hint")}
+          </div>
         </div>
       ) : (
         <div className="incident-feed">
           {filtered.slice(0, pageSize).map((i) => {
-            const verified = crossVerified.get(i.id);
-            const isFresh = (Date.now() - i.detectedAt) < 5 * 60 * 1000;  // < 5 min old
+            const overlap = sourceOverlap.get(i.id);
+            const now = Date.now();
+            const isFresh =
+              i.detectedAt > 0 &&
+              i.detectedAt <= now &&
+              i.timePrecision === "minute" &&
+              now - i.detectedAt < 5 * 60 * 1000;
             return (
               <article
                 key={i.id}
@@ -432,7 +580,7 @@ export default function LiveFiresPage({
                 style={{ borderLeftColor: SOURCE_COLOR[i.source] }}
               >
                 <div className="incident-time">
-                  <div className="incident-time-rel">{_timeAgo(i.detectedAt, t)}</div>
+                  <div className="incident-time-rel">{_timeAgo(i, t)}</div>
                   <div className="incident-time-abs">{i.detectedAtStr}</div>
                 </div>
                 <div className="incident-body">
@@ -440,13 +588,29 @@ export default function LiveFiresPage({
                     <span className="incident-source-badge" style={{ background: SOURCE_COLOR[i.source] + "22", color: SOURCE_COLOR[i.source], borderColor: SOURCE_COLOR[i.source] + "55" }}>
                       🛰 {i.source}
                     </span>
-                    {verified && verified.length > 0 && (
-                      <span className="incident-verified" title={`Cross-verified by ${verified.join(", ")}`}>
-                        ✓ Cross-verified
+                    {overlap && overlap.length > 0 && (
+                      <span
+                        className="incident-verified"
+                        title={fmtTr(t("live.overlap.tooltip"), {
+                          sources: overlap.join(", "),
+                        })}
+                      >
+                        ✓ {t("live.overlap.label")}
                       </span>
                     )}
                     {i.confidence && (
-                      <span className="incident-conf">conf: {i.confidence}</span>
+                      <span className="incident-conf">
+                        {fmtTr(t("live.confidence.code"), {
+                          code: i.confidence,
+                        })}
+                      </span>
+                    )}
+                    {i.detectionCount != null && (
+                      <span className="incident-conf">
+                        {fmtTr(t("live.detection_count"), {
+                          count: i.detectionCount,
+                        })}
+                      </span>
                     )}
                   </div>
                   <h3 className="incident-location">
@@ -545,7 +709,7 @@ export default function LiveFiresPage({
       {/* Footer attribution */}
       <footer className="report-footer">
         <p style={{ fontSize: 11, color: "var(--text-3)" }}>
-          📡 Data sources (independent, verifiable):
+          📡 {t("live.subtitle")}
         </p>
         <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginTop: 8, justifyContent: "center" }}>
           <a href="https://fire.gistda.or.th/" target="_blank" rel="noopener noreferrer"
@@ -557,6 +721,9 @@ export default function LiveFiresPage({
             🛰 NASA FIRMS · firms.modaps.eosdis.nasa.gov
           </a>
         </div>
+        <p style={{ fontSize: 10, color: "var(--text-3)", marginTop: 8 }}>
+          {t("live.help.bullet2")}
+        </p>
       </footer>
     </div>
   );

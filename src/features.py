@@ -29,6 +29,7 @@ was trained on, since weather columns are added dynamically.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -56,6 +57,8 @@ WEATHER_COLUMNS: Tuple[str, ...] = (
 )
 WEATHER_LAGS: Tuple[int, ...] = (1, 3, 7)
 WEATHER_ROLLS: Tuple[int, ...] = (3, 7)
+WEATHER_DROUGHT_WINDOWS: Tuple[int, ...] = (30, 60, 90)
+DRY_DAY_PRECIP_MM = 1.0
 
 # RADD roll windows — wider than fire rolls because RADD has a 6–12 day revisit
 RADD_COLUMNS: Tuple[str, ...] = ("radd_alert_count", "radd_confidence_max")
@@ -246,6 +249,7 @@ def add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
         "night_fire_count",
         "afternoon_fire_count",
         "n_satellites_today",
+        "n_active_satellites",
         "tree_cover_pct_2000",
         "tree_loss_pct_recent",
     ):
@@ -345,12 +349,60 @@ def add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     weather_cols_present = [c for c in WEATHER_COLUMNS if c in df.columns]
     if weather_cols_present:
         for col in weather_cols_present:
+            # MISSINGNESS (audited item 6): fillna(0) makes an unavailable
+            # measurement look like a REAL physical value (0 °C, 0 mm rain).
+            # With WEATHER_MISSING_INDICATORS=true, a {col}_missing indicator
+            # is emitted BEFORE the fill so the model can separate "no data"
+            # from "measured zero". CAUSAL: availability of today's cached
+            # value is known at prediction time. Opt-in so the default feature
+            # contract (164) is unchanged until the next reviewed retrain.
+            if WEATHER_MISSING_INDICATORS:
+                df[f"{col}_missing"] = df[col].isna().astype("float32")  # CAUSAL
             df[f"{col}_today"] = df[col].fillna(0)
             for lag in WEATHER_LAGS:
                 df[f"{col}_lag_{lag}"] = grp[col].shift(lag).fillna(0)         # CAUSAL
             for w in WEATHER_ROLLS:
                 df[f"{col}_mean_{w}d"] = _past_roll(df, col, w, "mean")        # CAUSAL
 
+        df = add_weather_drought_features(df)
+
+    return df
+
+
+def add_weather_drought_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add causal drought features from real precipitation and FAO-56 ET0.
+
+    The input must be sorted by cell/date (as ``add_temporal_features`` does).
+    This separate helper also lets the leak-free ablation harness enrich an
+    existing feature snapshot without rebuilding unrelated FIRMS features.
+    """
+    if "precip_sum" not in df.columns:
+        return df
+    df = df.copy()
+    grp = df.groupby(GROUP_KEYS, sort=False)
+    precip_past = grp["precip_sum"].shift(1)  # CAUSAL: <= yesterday
+    dry = (precip_past.notna() & (precip_past < DRY_DAY_PRECIP_MM)).to_numpy()
+    lats = df["lat_grid"].to_numpy()
+    lons = df["lon_grid"].to_numpy()
+    streak = np.zeros(len(df), dtype=np.float32)
+    run = 0
+    prev_key = None
+    for i in range(len(df)):
+        key = (lats[i], lons[i])
+        if key != prev_key:
+            run = 0
+            prev_key = key
+        run = run + 1 if dry[i] else 0
+        streak[i] = run
+    df["consecutive_dry_days"] = streak  # CAUSAL
+
+    for w in WEATHER_DROUGHT_WINDOWS:
+        df[f"precip_sum_{w}d"] = _past_roll(df, "precip_sum", w, "sum")  # CAUSAL
+        if "et0" in df.columns:
+            et0_sum = _past_roll(df, "et0", w, "sum")  # CAUSAL
+            df[f"precip_deficit_{w}d"] = np.maximum(
+                et0_sum - df[f"precip_sum_{w}d"].to_numpy(), 0.0
+            )  # CAUSAL: observed ET0 - observed precipitation
     return df
 
 
@@ -767,6 +819,7 @@ def _build_core_feature_list() -> List[str]:
         "night_fire_count",
         "afternoon_fire_count",
         "n_satellites_today",
+        "n_active_satellites",
     ]
     cols += [
         "fire_acceleration",
@@ -831,14 +884,25 @@ def _build_radd_feature_list() -> List[str]:
     return cols
 
 
+# Opt-in weather missingness indicators (see add_weather block). Env-gated so
+# the default contract stays 164 features until a reviewed retrain adopts them.
+WEATHER_MISSING_INDICATORS = os.getenv(
+    "WEATHER_MISSING_INDICATORS", "false").lower() in ("1", "true", "yes")
+
+
 def _build_weather_feature_list() -> List[str]:
     cols: List[str] = []
     for c in WEATHER_COLUMNS:
+        if WEATHER_MISSING_INDICATORS:
+            cols.append(f"{c}_missing")
         cols.append(f"{c}_today")
         for lag in WEATHER_LAGS:
             cols.append(f"{c}_lag_{lag}")
         for w in WEATHER_ROLLS:
             cols.append(f"{c}_mean_{w}d")
+    cols.append("consecutive_dry_days")
+    for w in WEATHER_DROUGHT_WINDOWS:
+        cols += [f"precip_sum_{w}d", f"precip_deficit_{w}d"]
     return cols
 
 

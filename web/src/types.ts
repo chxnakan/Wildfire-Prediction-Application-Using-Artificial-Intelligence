@@ -11,10 +11,13 @@ export interface UrgencyThresholds {
 }
 
 export interface ValidationMetrics {
-  // Task discriminator — "binary_fire_in_3d" or undefined (legacy regression).
+  // Active task discriminator. Undefined is accepted only for compatibility
+  // with historical exports; consumers must inspect which metric fields are
+  // actually present instead of assuming that missing means regression.
   task?: string;
   imminent_days?: number;
-  // Legacy regression metrics — meaningful when task is undefined.
+  // Deprecated date-regression metrics. They describe historical artifacts,
+  // not the active 3-day binary-risk model.
   mae_days?: number;
   rmse_days?: number;
   r2?: number;
@@ -41,12 +44,17 @@ export interface ValidationMetrics {
   uplift_at_top_10pct?: number;
   uplift_at_top_20pct?: number;
   // Calibration metrics (added by Phase 0.5 post-calibration).
-  // ECE = expected calibration error on test (lower = better).
-  // < 0.05 = trustworthy probability; > 0.15 = treat as rank-only.
+  // ECE = aggregate expected calibration error on test (lower = better).
+  // It must be interpreted with reliability-bin sample sizes and prevalence
+  // drift; no single ECE cutoff guarantees that every cell probability is
+  // reliable in every season.
   ece?: number;
   ece_val_before_calibration?: number;
   ece_val_after_calibration?: number;
   calibration_method?: string;
+  // "calib" when the deployment threshold was locked on the calibration
+  // split (which also implies Platt calibration was fitted there).
+  threshold_selected_on?: string;
   // Locked deployment threshold + its metrics. Headline dashboard numbers
   // should come from these (they're the ones an operator actually sees).
   deployment_threshold?: number;
@@ -54,13 +62,25 @@ export interface ValidationMetrics {
   deployment_recall?: number;
   deployment_f1?: number;
   deployment_accuracy?: number;
+  // WATCH (recall-oriented monitoring) operating point + full HIGH/WATCH
+  // reports + base-rate drift diagnostic. Present only on models trained with
+  // the two-threshold selector; older snapshots omit them (render gracefully).
+  watch_threshold?: number;
+  high_test_metrics?: ThresholdReport;
+  watch_test_metrics?: ThresholdReport;
+  prevalence_drift?: PrevalenceDrift;
+  recall_captured_top_5pct?: number;
+  recall_captured_top_10pct?: number;
+  recall_captured_top_20pct?: number;
   // Reliability bins for the calibration curve plot.
   reliability_bins?: ReliabilityBin[];
   // Where the metrics were evaluated. "full_distribution_test_window" = real
   // class balance (positive ~3-5%); legacy runs evaluated on undersampled.
   evaluated_on?: string;
-  // Stability across rolling monthly evaluations (from rolling_eval.json).
-  // Tells the operator whether the model's AUC drifts over time.
+  // Legacy monthly diagnostic fields from rolling_eval.json. That script
+  // applies one deployed model across its full timeline, including training
+  // months, so these values are in-sample descriptive evidence—not genuine
+  // walk-forward/out-of-sample stability.
   stability_months?: number;
   stability_valid_months?: number;
   stability_auc_mean?: number;
@@ -92,7 +112,7 @@ export interface TrainingSummary {
   search_method?: string;
   search_iterations?: number;
   cv_n_splits?: number;
-  cv_gap_days?: number;
+  cv_gap_days?: number | string;
   ensemble_size?: number;
   early_stopping_rounds?: number;
   best_params?: Record<string, number | string | boolean | null>;
@@ -111,7 +131,10 @@ export interface ScientificStats {
   samples: {
     total_densified: number;
     train: SampleSplit;
-    val: SampleSplit;
+    /** Legacy reports used `val`; current reports publish `validation`. */
+    val?: SampleSplit;
+    validation?: SampleSplit;
+    calibration?: SampleSplit;
     test: SampleSplit;
   };
   ci_95: {
@@ -149,8 +172,8 @@ export interface ScientificStats {
 export interface SampleSplit {
   n: number;
   positives: number;
-  positive_rate: number;
-  date_range: [string, string];
+  positive_rate: number | null;
+  date_range: [string | null, string | null];
 }
 
 export interface CurvePoint {
@@ -180,10 +203,60 @@ export interface SnapshotHitRate {
   future?: number;
 }
 
+export interface ThresholdReport {
+  threshold: number;
+  precision: number;
+  recall: number;
+  f1: number;
+  alert_rate: number;
+  confusion_matrix?: { tp: number; fp: number; fn: number; tn: number };
+  n?: number;
+  positives?: number;
+}
+
+export interface PrevalenceDrift {
+  calib_prevalence: number;
+  recent_prevalence: number;
+  ratio: number;
+  ratio_threshold: number;
+  drift_flag: boolean;
+  direction?: string;
+}
+
+export interface RankingPolicy {
+  type?: string;
+  policy_version?: string;
+  watch_top_pct?: number;
+  extended_watch_top_pct?: number;
+  absolute_high_threshold?: number;
+  note?: string;
+  historical_coverage_note?: string;
+  historical_coverage?: {
+    top_5pct?: number;
+    top_10pct?: number;
+    top_20pct?: number;
+  };
+}
+
 export interface GeoJsonMetadata {
+  // base_date is the daily prediction origin; latest_data_time is the real
+  // UTC instant of the freshest FIRMS hotspot (finer than the day); both
+  // written by risk_map.py. generated_at = when the snapshot was built.
+  latest_data_time?: string;
+  generated_at?: string;
   urgency_thresholds?: UrgencyThresholds;
+  // Human-readable provenance of urgency_thresholds, written by risk_map.py:
+  //   "absolute calibrated probability, …"  → cutoffs are probabilities (0..1)
+  //   "PRIORITY RANKING (relative percentiles …)" → relative rank, not risk
+  //   otherwise → legacy days-based cutoffs
+  thresholds_source?: string;
   metrics?: ValidationMetrics;
+  ranking_policy?: RankingPolicy;
   validation_summary?: {
+    evaluation?: string;
+    match_rule?: string;
+    horizon_days?: number;
+    operational_tiers?: string[];
     per_snapshot?: Record<string, SnapshotHitRate>;
   };
 }
@@ -191,8 +264,11 @@ export interface GeoJsonMetadata {
 export interface PredictionProperties {
   source: "predicted" | "observed";
   base_date?: string;
+  /** @deprecated Compatibility-only pseudo-date; not a per-cell forecast. */
   predicted_fire_date?: string;
+  /** @deprecated Compatibility-only pseudo-day value; not model output time. */
   days_until_fire?: number;
+  /** Legacy encoded pseudo-day value used only to recover old probabilities. */
   raw_prediction?: number;
   // Real probability (0..1) recovered from the binary classifier — only
   // written by newer risk_map.py runs. Older snapshots omit it and the
@@ -210,11 +286,11 @@ export interface PredictionProperties {
   // observed
   date?: string;
   fire_count?: number;
-  // Retrospective validation (set by risk_map.py on past snapshots once the
-  // ±1-day window closes):
-  //   "hit"    — predicted cell did burn within the window
-  //   "miss"   — no fire observed in the window
-  //   "future" — prediction window hasn't closed yet
+  // Retrospective validation (set by risk_map.py once base_date+1 … +3 has
+  // fully elapsed):
+  //   "hit"    — the same grid cell had a FIRMS hotspot in that risk window
+  //   "miss"   — the same grid cell had none in that risk window
+  //   "future" — the complete risk window is not yet observable
   validation_status?: "hit" | "miss" | "future";
 }
 
@@ -255,24 +331,30 @@ export interface NotifyLogRecord {
   timestamp: string;
   channel: NotifyChannel;
   recipients_count: number;
-  recipients_preview: string[];
+  /** Legacy development logs only; production intentionally omits PII. */
+  recipients_preview?: string[];
   zone_ids_count: number;
-  zone_ids_preview: string[];
+  zone_ids_preview?: string[];
   priority: NotifyPriority;
   template: string | null;
-  message_preview: string;
+  /** Current privacy-preserving API stores length, not message content. */
+  message_length?: number;
+  message_preview?: string;
   status: "queued" | "sent" | "failed";
 }
 
 export type AlertPageRoute = "dashboard" | "notify" | "live" | "reports" | "compare" | "analytics";
 
-export type DaySelection = "all" | "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7";
+// Risk-tier filter for the operator screen. Replaced the former day-0..7
+// pseudo-date buckets — the binary model has no per-day resolution.
+export type DaySelection = "all" | "High" | "Watch" | "Background";
 
 export interface DisplayOptions {
   showObserved: boolean;
   showLiveFires: boolean;
   showPredicted: boolean;
   showCellPins: boolean;
+  hideVeryLowRisk: boolean;
   heatRadius: number;
 }
 
@@ -283,11 +365,16 @@ export interface LiveFireMeta {
   count: number;
   lastFetch: Date | null;
   error: string | null;
+  /** Backend flag: the server-side poller hasn't succeeded within its
+   *  staleness window — cached detections still render but may be old. */
+  isStale?: boolean;
+  /** Last time the SERVER successfully pulled from GISTDA (ISO string). */
+  lastSuccessAt?: string | null;
 }
 
-// GISTDA ArcGIS feature attributes — typed loosely because the upstream
-// schema can vary between the NPP and MODIS endpoints (some fields like
-// `satellite` only show up on one).
+// GISTDA hotspot attributes as served by OUR backend (/live-hotspots) in the
+// legacy ArcGIS-like shape — typed loosely because the upstream schema
+// varies between the NPP and MODIS layers.
 export interface GistdaFeature {
   attributes: {
     latitude?: number | string;
@@ -296,8 +383,13 @@ export interface GistdaFeature {
     lu_name?: string;
     pv_tn?: string;
     ap_tn?: string;
+    tb_tn?: string;
     date?: number;
     time?: string;
     satellite?: string;
+    hotspot_id?: string;
+    detected_by?: string[];
+    detected_at_thailand?: string;
+    source?: string;
   };
 }

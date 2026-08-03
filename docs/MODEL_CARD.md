@@ -1,217 +1,178 @@
-# Model Card: Thailand Wildfire Imminence Predictor v0.5
+# Model Card — FireWatch Thailand 3-Day Hotspot Risk
 
-> Following the [Google Model Cards](https://modelcards.withgoogle.com/about) framework.
+This card describes the **currently promoted artifact trained on
+2026-07-16**. The authoritative machine-readable record is
+[`outputs/metadata/dataset_info.json`](../outputs/metadata/dataset_info.json).
+If this document and that artifact ever differ, the artifact wins.
 
-> **⚠️ METRICS WITHDRAWN — protocol revision 2026-07-12.** All performance
-> numbers on this card were measured under an evaluation protocol later
-> found invalid (row-based split with date leakage, negatives undersampled
-> before splitting so test prevalence was artificial, deployment threshold
-> selected on the test set, calibration fit in-sample, censored tail labels,
-> hindsight cell universe). The pipeline has been repaired — see
-> `docs/METHODOLOGY.md` § "Protocol revision" — and this card will be
-> refreshed from the first retrain under the new protocol. Until then, do
-> not quote the numbers below.
+## Model details
 
-## 🎯 Model Details
+- Task: binary classification
+- Output: calibrated `P(≥1 FIRMS hotspot in a 0.1° cell during t+1 … t+3)`
+- Model: five-seed LightGBM ensemble with Platt-sigmoid calibration
+- Features: 164 causal satellite, history, spatial, calendar, land-cover, and
+  weather features
+- Grid: 0.1° (roughly 11 km north–south)
+- Geographic scope: historically active cells in the Thailand study area
+- Training source: NASA FIRMS VIIRS NRT plus optional measured auxiliary data
+- Promoted-artifact timestamp: `2026-07-16T14:48:35Z`
 
-- **Name:** Thailand Wildfire Imminence Predictor
-- **Version:** v0.5 (Phase 0.5 — calibrated, validated, multi-month stable)
-- **Type:** Binary classifier (LightGBM ensemble + Platt calibration)
-- **Output:** `P(fire occurs in 0.1° cell within next 3 days)` ∈ [0, 1]
-- **Task:** `binary_fire_in_3d`
-- **Geographic scope:** Thailand BBOX `96°E–107°E, 4°N–22°N`
-- **Temporal resolution:** Daily (one prediction per cell per day)
-- **Spatial resolution:** 0.1° grid (≈ 11 km × 11 km at the equator)
-- **Developed by:** Solo project (chankan2q@gmail.com), 2025–2026
-- **License:** MIT
-- **Source code:** [github.com/0Maruz/Science-Project-version-3](https://github.com/0Maruz/Science-Project-version-3)
+The model does **not** predict an exact ignition date, fire perimeter, cause,
+severity, or evacuation need.
 
-## 📋 Intended Use
+## Intended use
 
-### Primary use cases
-1. **Operator watch-list** — daily ranking of cells by imminent-fire risk
-2. **Resource allocation** — identifying top-K cells for ground-team patrols
-3. **Research benchmark** — open-source baseline for Thai wildfire ML
-4. **Educational** — student/portfolio demonstration of operational ML
+Appropriate:
 
-### Out-of-scope uses
-- ❌ **Life-safety decisions** — model is research-grade, not certified
-- ❌ **Automated dispatch** — operator review of every alert is required
-- ❌ **Real-time evacuation** — not validated for emergency response
-- ❌ **Legal liability claims** — precision is too low (~10–35%) for accusations
-- ❌ **Use outside Thailand** — trained only on Thailand BBOX
+1. Rank historically active cells for operator review.
+2. Build a daily WATCH list when patrol capacity is limited.
+3. Compare archived risk windows with later FIRMS observations.
+4. Research and education about operational rare-event ML.
 
-### Operational threshold
-- **Deployment threshold:** selected as best-F1 **on the calibration split**
-  (never on test) and locked before the single test evaluation; persisted in
-  `dataset_info.json → probability_tier_thresholds`
-- Watch-list mode preferred over alert mode given the precision/recall trade-off
+Not appropriate:
 
-## 📊 Performance
+1. Sole-source life-safety, evacuation, or automated dispatch decisions.
+2. Legal attribution or enforcement against a person or community.
+3. Use outside the trained geographic/population scope.
+4. Treating a probability or ranking tier as proof that a fire will occur.
+5. Treating a Background cell as proof that no fire can occur.
 
-### Test set (held-out chronological 20% = ~890K rows)
+## Data and evaluation protocol
+
+Current data:
+
+| Item | Value |
+|---|---:|
+| Source date range | 2025-06-11 … 2026-07-16 |
+| Total days | 401 |
+| Historically active cells | 11,833 |
+| Training rows after train-only sampling | 485,190 |
+| Feature count | 164 |
+| Held-out test cell-days | 709,002 |
+| Held-out positive cell-days | 22,992 |
+| Held-out positive rate | 3.24% |
+
+The four partitions contain whole calendar dates and are separated by 7-day
+purges:
+
+| Partition | Date range | Purpose |
+|---|---|---|
+| Train | 2025-06-11 … 2026-01-13 | Fit models; negative sampling only here |
+| Validation | 2026-01-21 … 2026-03-21 | Early stopping/model selection |
+| Calibration | 2026-03-29 … 2026-05-07 | Fit calibrator and lock thresholds |
+| Test | 2026-05-15 … 2026-07-13 | One final natural-prevalence evaluation |
+
+No calendar date belongs to two partitions. The 3-day label tail is censored
+when its future observation window is incomplete. Hyperparameter search uses
+purged whole-date folds, not row-based `TimeSeriesSplit`.
+
+## Current held-out evidence
+
+Threshold-independent ranking:
 
 | Metric | Value | Interpretation |
-|---|---|---|
-| ROC-AUC | **0.8451** | Good ranking (Grade A-) |
-| Average Precision | 0.3124 | 2.4× over random baseline (3.43%) |
-| ECE (calibration) | **0.0216** | Excellent — probability matches reality |
-| F1 (best threshold) | 0.1942 | Operationally usable |
-| Precision @ deploy | 0.1112 | 11% of alerts are true fires |
-| Recall @ deploy | 0.7654 | Catches 77% of true fires |
-| Watch-list (top-20%) | 0.1156 | 3.4× over random selection |
-| Test positive rate | 0.0343 | 3.43% of cells burn within 3 days |
+|---|---:|---|
+| ROC-AUC | **0.9051** | Strong ordering of positive above negative cell-days |
+| Average precision | **0.2175** | Precision-recall performance under a 3.24% base rate |
+| Brier score | 0.0390 | Mean squared probability error |
+| ECE | 0.0503 | Aggregate calibration error; see drift caveat below |
 
-### Stability across 17 monthly rolling evaluations
+Comparison baselines on the same test population:
 
-| Statistic | AUC |
-|---|---|
-| Mean | **0.9152** |
-| Std deviation | 0.0640 |
-| Min | 0.8044 (Mar 2026) |
-| Max | 0.9845 (Aug 2025) |
+| Baseline | ROC-AUC | Average precision |
+|---|---:|---:|
+| Fired in previous 3 days | 0.5898 | 0.0920 |
+| Fired in previous 7 days | 0.6403 | 0.1165 |
+| Training cell climatology | 0.6078 | 0.0431 |
 
-The model is **stable across seasons** — burn season and off-season both
-score above 0.80 AUC. See `outputs/metadata/rolling_eval.json` for per-month
-details.
+Absolute operational tiers:
 
-## 🔬 Training Data
+| Tier | Threshold | Precision | Recall | Alert rate |
+|---|---:|---:|---:|---:|
+| HIGH | 0.5236 | 38.50% | 11.68% | 0.98% |
+| WATCH | 0.4376 | 22.72% | 31.55% | 4.50% |
 
-### Sources (all open, all verifiable)
+Relative historical coverage:
 
-| Source | Coverage | License | Verification |
-|---|---|---|---|
-| NASA FIRMS VIIRS NRT | 100% | Open / US Government | [firms.modaps.eosdis.nasa.gov](https://firms.modaps.eosdis.nasa.gov/) |
-| ECMWF ERA5 (via Open-Meteo) | ~38% | CC-BY 4.0 | [open-meteo.com](https://open-meteo.com/) |
-| Hansen GFC v1.11 | 100% | Open (UMD) | [glad.umd.edu](https://glad.umd.edu/) |
-| Thailand 77-province GeoJSON | 100% | Open (HDX) | [data.humdata.org](https://data.humdata.org/dataset/cod-ab-tha) |
+| Ranked share | Held-out fires captured |
+|---|---:|
+| Top 5% | 33.91% |
+| Top 10% | 52.47% |
+| Top 20% | **82.93%** |
 
-**Hard rule: real data only — no synthetic, no random, no interpolated values.**
-If a real source is unavailable for a column, the column is simply absent.
+Relative coverage is a resource-allocation result, **not** an absolute alert
+and not a guarantee for a particular day.
 
-### Statistics
-- **Temporal coverage:** 2025-01-31 → 2026-05-14 (14 months)
-- **Active cells:** 9,479 (excluding inactive cells with zero fires ever)
-- **Densified rows:** 4,455,130 (active cells × days)
-- **Positive rate** (fire within 3 days): 5.31% globally
-- **Labeled training rows** (after undersampling negatives 4:1): 1,183,285
+## Seasonal drift
 
-### Pre-processing
-1. **Cleaning** — drop FRP outliers (top 0.1%), confidence < threshold
-2. **Grid snap** — 0.1° lat/lon
-3. **Causal densification** — fill no-fire days with zeros, each cell entering the universe from its **first detection onward** (no hindsight)
-4. **Urban filter** — drop hotspots inside curated Thai city polygons
-5. **Tree cover merge** — Hansen GFC per-cell aggregates
-6. **Weather merge** — ERA5 where available (38% coverage)
-7. **Float32 cast + tail censoring** — rows whose 3-day label window is unobserved are excluded from supervision
-8. **Undersampling** — negatives 4:1, **train partition only** (val/calib/test at natural prevalence)
+The calibration partition had 39.33% positive prevalence while the held-out
+test period had 3.24%, a 12.13× mismatch. This is a major seasonal base-rate
+shift. A single cutoff locked during the high-prevalence calibration period
+therefore transfers poorly to the off-season test period.
 
-## 🧠 Model
+Consequences:
 
-### Architecture
-- **Base:** LightGBM `LGBMClassifier(objective="binary")`
-- **Ensemble:** 3 models with different random seeds, averaged probabilities
-- **Calibrator:** Platt sigmoid (LogisticRegression on the calibration split's raw probabilities — disjoint from all fitting data)
-- **Inference output:** Calibrated probability; dashboard tiers use absolute calib-selected probability cutoffs
+- The model remains a strong ranker (AUC 0.9051).
+- Absolute HIGH/WATCH recall is much lower than calibration-period recall.
+- Probabilities and fixed-tier decisions need the visible drift context.
+- The dashboard shows WATCH recall and Top-20% coverage together because they
+  answer different operational questions.
+- The frontend must not select a nicer precomputed threshold or invent recall.
 
-### Hyperparameters (best from BayesSearchCV on purged date-grouped CV, 7-day purge)
-```
-n_estimators: 400
-max_depth: 8
-learning_rate: 0.05
-num_leaves: 31
-min_child_samples: 20
-subsample: 0.9
-colsample_bytree: 0.7
-reg_alpha: 0.0
-reg_lambda: 1.0
-scale_pos_weight: ~3.8  (corrects residual class imbalance after undersampling)
-```
+## Features and leakage controls
 
-### Features (164 total)
-- Lag features (1-30 days): fire_count, FRP
-- Rolling windows (3-60 days): sum, max, mean, active-days
-- Spatial neighbors (3×3 and 5×5 grids): fire + FRP aggregates
-- Calendar: cyclic encoding of month, day-of-year, week, day-of-week
-- Burn-season: is_burn_season, is_dry_season, days_into_burn_season
-- Fire periodicity: days_since_last_fire, season_fire_count, recurrence
-- Static: distance_to_nearest_city, tree_cover_pct_2000, tree_loss_pct_recent
-- Weather (when available): temp_max/min, precip_sum, wind_max, et0 + lags/rolls
+Major feature groups:
 
-### Causality (anti-leakage audit)
-- Every rolling window uses `.shift(1)` BEFORE `.rolling()` (past-only)
-- Every lag is `.shift(lag)` with `lag ≥ 1`
-- Trend features use `lag_1 - lag_k` (no current day)
-- Streak counters use shifted fire flags
-- Every feature tagged `# CAUSAL` in `src/features.py`
+- past FIRMS counts, FRP, recurrence, and active-day windows;
+- 3×3 and wider spatial-neighbour aggregates;
+- day-of-year/week/month cyclic seasonality;
+- tree cover and recent loss;
+- temperature, precipitation, wind, evapotranspiration, and past-only weather
+  windows when available;
+- location and distance-to-urban context.
 
-The label `days_until_fire` is computed strictly from FUTURE rows.
-See `docs/METHODOLOGY.md` for the full leakage audit.
+Time-varying rolling features shift before rolling. Lags are at least one day.
+Cumulative features exclude the current/future outcome. A cell enters the
+population from its first observed FIRMS detection onward; first-ever fires in
+previously unseen cells are outside the current prediction universe.
 
-## ⚠️ Limitations
+## Known limitations
 
-### Data limitations
-1. **Weather coverage is sparse (~38%)** — full 100% would lift AUC by an estimated 3–5%
-2. **No drought index (KBDI / SPI)** — known strong predictor in operational systems
-3. **No vegetation moisture (NDVI / NDWI)** — would improve fuel state modeling
-4. **No lightning data** — natural ignition source missing
-5. **No elevation / slope / aspect** — terrain factors absent
-6. **Short history** — 14 months may not capture inter-annual variability
+1. **Seasonal transfer:** the current global thresholds are affected by the
+   documented prevalence drift.
+2. **Population scope:** never-burned cells cannot be flagged until they enter
+   the historically active universe.
+3. **Spatial resolution:** an 0.1° cell is an area priority, not a point-fire
+   location.
+4. **Satellite observation:** cloud, smoke, overpass timing, source latency,
+   and non-wildfire heat can affect labels.
+5. **Geographic generalisation:** no province-held-out validation has yet
+   established performance in unseen regions.
+6. **Seasonal feature strength:** calendar signals are important, so unusual
+   seasons or policy changes may shift performance.
+7. **Weather availability:** local ERA5 may lag; an Open-Meteo response is a
+   labelled fallback, not hidden substitution.
+8. **Live audit sample size:** a single archived snapshot can contain very few
+   outcomes. Exact counts should be shown and percentages withheld for small
+   denominators.
 
-### Modeling limitations
-7. **Threshold-dependent metrics** — precision/recall trade-off is steep due to ~3% positive rate
-8. **Calendar dominance** — top features are seasonal (`doy_sin/cos`, `week_sin`), so model partly predicts "burn season vs not" rather than cell-specific imminence
-9. **Spatial CV not performed** — train/test split is purely temporal; performance on geographically held-out provinces unknown
-10. **Single-grid resolution** — 0.1° (~11 km) cells may miss sub-grid fire dynamics
+## Operational safeguards
 
-### Deployment limitations
-11. **Manual retrain cadence** — no automatic drift detection (recommended weekly)
-12. **No on-call infrastructure** — no PagerDuty / runbook / rollback automation
-13. **No A/B testing** — new versions ship directly to production
-14. **No user authentication** — dashboard is open access
+- fixed thresholds are read from artifact metadata, never presentation
+  constants;
+- candidates must pass model-promotion gates before replacing the incumbent;
+- data/feed freshness is exposed through health metadata;
+- live feed failure is labelled unavailable rather than displayed as zero;
+- prediction exports include probability and the 3-day window, not deprecated
+  pseudo-date fields;
+- operator review is required.
 
-## 🧪 Ethical Considerations
+## Maintenance
 
-- **No personal data** — model uses only satellite + reanalysis data
-- **No demographic bias by construction** — features have no demographic content
-- **Geographic bias possible** — performance may differ by province; spatial fairness audit not yet performed
-- **Operational bias risk** — if used to allocate finite resources, the model's bias toward known-burn cells may underserve emerging areas
-- **Public dashboard** — predictions could theoretically panic or mislead the public; framing emphasizes "research-grade, watch-list" use
+- Daily: refresh FIRMS data and generate a prediction snapshot.
+- Every few days: retraining check; retain incumbent if a candidate fails.
+- Per release: frontend typecheck/tests/build and backend compile/tests.
+- After material drift: recalibrate/retrain with broader seasonal calibration
+  coverage before changing production thresholds.
 
-## 🔄 Validation Strategy
-
-1. **Chronological hold-out** — final 20% of timeline never seen during tuning
-2. **Time-series CV with 7-day gap** — prevents leakage between adjacent folds
-3. **Rolling monthly eval** — 17 monthly snapshots tracked for drift
-4. **Calibration verification** — Platt sigmoid fit on val, ECE checked on test
-5. **Retrospective validation** — past predictions tagged hit/miss/future as ground truth arrives (visible in dashboard's "Past Predictions" panel)
-
-## 📅 Maintenance
-
-- **Daily:** `./run.sh --fresh --predict-only` — refresh predictions
-- **Weekly:** `./run.sh --quick` — retrain on latest 14 months
-- **Monthly:** `python scripts/rolling_eval.py` — check for AUC drift
-- **Quarterly:** review feature importance + add new sources as available
-
-## 📚 Citation
-
-If you use this model or method, please cite:
-
-```bibtex
-@misc{thailand_wildfire_predictor_2026,
-  author = {0Maruz},
-  title  = {Thailand Wildfire Imminence Predictor v0.5},
-  year   = {2026},
-  url    = {https://github.com/0Maruz/Science-Project-version-3}
-}
-```
-
-## 📞 Contact
-
-- **Maintainer:** chankan2q@gmail.com
-- **Issues:** [GitHub Issues](https://github.com/0Maruz/Science-Project-version-3/issues)
-- **License:** MIT
-
----
-
-*Card last updated: 2026-05-16. Following [Mitchell et al. 2019](https://arxiv.org/abs/1810.03993) Model Cards format.*
+Card updated: 2026-07-24.

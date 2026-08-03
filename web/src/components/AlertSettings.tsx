@@ -1,5 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
-import type { FireFeature, ValidationMetrics } from "../types";
+import { useEffect, useMemo } from "react";
+import type {
+  FireFeature,
+  ThresholdReport,
+  ValidationMetrics,
+} from "../types";
+import { useLang } from "../utils/i18n";
 
 interface Props {
   open: boolean;
@@ -8,174 +13,210 @@ interface Props {
   metrics: ValidationMetrics | null;
 }
 
-// Lets the operator slide a probability-threshold and see live counts of:
-//   • how many cells would be alerted at this threshold
-//   • estimated precision/recall (interpolated from reliability bins)
-//   • visual urgency-tier breakdown
-//
-// Educational — helps non-ML operators understand the precision/recall
-// trade-off in concrete terms ("alert 200 cells vs 50 cells").
-export default function AlertSettings({ open, onClose, predicted, metrics }: Props) {
-  // Default to deployment threshold from metadata, fall back 0.5
-  const defaultThr = metrics?.deployment_threshold ?? 0.5;
-  const [thr, setThr] = useState<number>(defaultThr);
+interface OperatingPoint {
+  name: "HIGH" | "WATCH";
+  purpose: string;
+  threshold: number | null;
+  report: ThresholdReport | null;
+  visibleCells: number;
+}
 
-  useEffect(() => {
-    setThr(defaultThr);
-  }, [defaultThr]);
+const pct = (value: number | null | undefined): string =>
+  typeof value === "number" && Number.isFinite(value)
+    ? `${(value * 100).toFixed(2)}%`
+    : "—";
+
+/**
+ * Read-only explanation of the two persisted operating points.
+ *
+ * This used to be an arbitrary threshold simulator. It inverted the legacy
+ * pseudo-day field with the wrong formula and inferred precision/recall from
+ * reliability-bin centres, producing numbers that were not measured metrics.
+ * Operational thresholds now remain exactly as trained and persisted.
+ */
+export default function AlertSettings({
+  open,
+  onClose,
+  predicted,
+  metrics,
+}: Props) {
+  const { lang } = useLang();
+  const copy = lang === "th"
+    ? {
+        title: "เกณฑ์ใช้งานจากโมเดล",
+        intro:
+          "หน้านี้เป็นข้อมูลแบบอ่านอย่างเดียว เกณฑ์ HIGH และ WATCH มาจาก artifact ที่ผ่านการ train ไม่ได้เปลี่ยนแผนที่หรือคำนวณ metric ใหม่ใน browser",
+        purposeHigh: "แจ้งเตือนเร่งด่วน เน้น precision",
+        purposeWatch: "รายการเฝ้าระวัง เน้น recall",
+        threshold: "เกณฑ์ probability",
+        cells: "cell ในมุมมองปัจจุบัน",
+        precision: "Held-out precision",
+        recall: "Held-out recall",
+        rate: "Held-out alert rate",
+        evidence: "ฐานประเมิน",
+        unavailable: "artifact นี้ไม่มี operating point ดังกล่าว",
+        background: "Background ในมุมมองปัจจุบัน",
+        drift:
+          "มี seasonal prevalence drift: ค่า held-out ด้านล่างจึงต่างจาก calibration period มาก โปรดอ่านคู่กับ drift note บนหน้าหลัก",
+        fixed:
+          "การเปลี่ยนเกณฑ์จริงต้องผ่าน calibration, held-out evaluation และ model-promotion gate — browser ไม่ควรสร้างค่าที่ดูดีขึ้นเอง",
+        close: "ปิด",
+      }
+    : {
+        title: "Persisted model operating points",
+        intro:
+          "This is a read-only explanation. HIGH and WATCH come from the trained artifact; this browser does not change the map or invent new metrics.",
+        purposeHigh: "Urgent, precision-oriented alert",
+        purposeWatch: "Recall-oriented monitoring list",
+        threshold: "Probability cutoff",
+        cells: "Cells in current view",
+        precision: "Held-out precision",
+        recall: "Held-out recall",
+        rate: "Held-out alert rate",
+        evidence: "Evaluation basis",
+        unavailable: "This operating point is not present in the artifact",
+        background: "Background in current view",
+        drift:
+          "Seasonal prevalence drift is flagged, so these held-out results differ materially from the calibration period. Read them with the drift note on the map.",
+        fixed:
+          "A real threshold change requires calibration, held-out evaluation, and the model-promotion gate. The browser must not create a better-looking operating point.",
+        close: "Close",
+      };
 
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
-  // Pre-compute per-cell probability from raw_prediction (pseudo-days)
-  // raw_prediction was produced by the piecewise mapping; invert by inferring
-  // probability from the pseudo-days value.
-  const cellProbabilities = useMemo(() => {
-    return predicted
-      .map((f) => {
-        const raw = f.properties.raw_prediction;
-        if (typeof raw !== "number" || !isFinite(raw)) return null;
-        // Old mapping: prob = 1 - (raw - 1) / 6
-        // Match the latest piecewise mapping anchor points
-        return Math.max(0, Math.min(1, 1 - (raw - 1) / 6));
-      })
-      .filter((p): p is number => p !== null);
-  }, [predicted]);
-
-  // Live counts at chosen threshold
-  const aboveThr = cellProbabilities.filter((p) => p >= thr).length;
-  const belowThr = cellProbabilities.length - aboveThr;
-  const pctAlerts = cellProbabilities.length
-    ? (aboveThr / cellProbabilities.length) * 100
-    : 0;
-
-  // Interpolate precision/recall from reliability bins (if available).
-  // This is an approximation — true precision/recall require test labels.
-  const reliability = metrics?.reliability_bins ?? [];
-  let estPrecision: number | null = null;
-  let estRecall: number | null = null;
-  if (reliability.length > 0) {
-    // Find the bin containing our threshold; the bin's actual_rate ≈ precision
-    const bin = reliability.find((b) => thr >= b.bin_lower && thr < b.bin_upper);
-    if (bin) estPrecision = bin.actual_rate;
-    // Recall ≈ sum of (bin.actual_rate * bin.count) for bins above threshold,
-    // divided by total positives.
-    let truePos = 0;
-    let allPos = 0;
-    for (const b of reliability) {
-      const binCenter = (b.bin_lower + b.bin_upper) / 2;
-      const positives = b.actual_rate * b.count;
-      allPos += positives;
-      if (binCenter >= thr) truePos += positives;
+  const counts = useMemo(() => {
+    let high = 0;
+    let watch = 0;
+    let background = 0;
+    for (const feature of predicted) {
+      const level = feature.properties.urgency_level;
+      if (level === "HIGH" || level === "CRITICAL") high += 1;
+      else if (level === "MEDIUM") watch += 1;
+      else if (level === "LOW") background += 1;
     }
-    estRecall = allPos > 0 ? truePos / allPos : 0;
-  }
+    return { high, watch, background };
+  }, [predicted]);
 
   if (!open) return null;
 
+  const highReport = metrics?.high_test_metrics ?? (
+    metrics?.deployment_threshold == null
+      ? null
+      : {
+          threshold: metrics.deployment_threshold,
+          precision: metrics.deployment_precision ?? NaN,
+          recall: metrics.deployment_recall ?? NaN,
+          f1: metrics.deployment_f1 ?? NaN,
+          alert_rate: NaN,
+        }
+  );
+  const operatingPoints: OperatingPoint[] = [
+    {
+      name: "HIGH",
+      purpose: copy.purposeHigh,
+      threshold:
+        metrics?.high_test_metrics?.threshold ??
+        metrics?.deployment_threshold ??
+        null,
+      report: highReport,
+      visibleCells: counts.high,
+    },
+    {
+      name: "WATCH",
+      purpose: copy.purposeWatch,
+      threshold:
+        metrics?.watch_test_metrics?.threshold ??
+        metrics?.watch_threshold ??
+        null,
+      report: metrics?.watch_test_metrics ?? null,
+      visibleCells: counts.watch,
+    },
+  ];
+
   return (
-    <div className="info-modal-backdrop" role="dialog" aria-modal="true" onClick={onClose}>
-      <div className="info-modal" onClick={(e) => e.stopPropagation()}>
+    <div className="info-modal-backdrop" onClick={onClose}>
+      <div
+        className="info-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="operating-points-title"
+        onClick={(event) => event.stopPropagation()}
+      >
         <div className="info-modal-header">
-          <h2>⚙️ Alert Threshold Settings</h2>
-          <button className="info-modal-close" onClick={onClose} aria-label="Close">×</button>
+          <h2 id="operating-points-title">⚙️ {copy.title}</h2>
+          <button
+            type="button"
+            className="info-modal-close"
+            onClick={onClose}
+            aria-label={copy.close}
+          >
+            ×
+          </button>
         </div>
 
         <div className="info-modal-body">
-          <p style={{ color: "var(--text-2)", marginBottom: 8 }}>
-            เลื่อน threshold เพื่อดูว่าจะเตือนกี่ cells, precision/recall จะเป็นยังไง
+          <p style={{ color: "var(--text-2)", lineHeight: 1.6 }}>
+            {copy.intro}
           </p>
 
-          <div className="threshold-slider-row">
-            <input
-              type="range"
-              className="threshold-slider"
-              min={0.05}
-              max={0.95}
-              step={0.05}
-              value={thr}
-              onChange={(e) => setThr(Number(e.target.value))}
-            />
-            <div className="threshold-value">{thr.toFixed(2)}</div>
-          </div>
-
-          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
-            {[0.10, 0.25, 0.35, 0.50, 0.70].map((preset) => (
-              <button
-                key={preset}
-                type="button"
-                onClick={() => setThr(preset)}
-                className="action-btn"
-                style={{ flex: 1, padding: "4px 6px", fontSize: 11 }}
-              >
-                {preset.toFixed(2)}
-              </button>
+          <div className="threshold-operating-grid">
+            {operatingPoints.map((point) => (
+              <section className="threshold-operating-card" key={point.name}>
+                <h3>{point.name}</h3>
+                <p>{point.purpose}</p>
+                {point.threshold == null ? (
+                  <div className="info-note">{copy.unavailable}</div>
+                ) : (
+                  <dl>
+                    <div>
+                      <dt>{copy.threshold}</dt>
+                      <dd>{point.threshold.toFixed(4)}</dd>
+                    </div>
+                    <div>
+                      <dt>{copy.cells}</dt>
+                      <dd>{point.visibleCells.toLocaleString()}</dd>
+                    </div>
+                    <div>
+                      <dt>{copy.precision}</dt>
+                      <dd>{pct(point.report?.precision)}</dd>
+                    </div>
+                    <div>
+                      <dt>{copy.recall}</dt>
+                      <dd>{pct(point.report?.recall)}</dd>
+                    </div>
+                    <div>
+                      <dt>{copy.rate}</dt>
+                      <dd>{pct(point.report?.alert_rate)}</dd>
+                    </div>
+                    <div>
+                      <dt>{copy.evidence}</dt>
+                      <dd>
+                        {point.report?.n != null
+                          ? `${point.report.n.toLocaleString()} cell-days`
+                          : "—"}
+                      </dd>
+                    </div>
+                  </dl>
+                )}
+              </section>
             ))}
           </div>
 
-          <section style={{ marginTop: 18 }}>
-            <h3>ผลที่ threshold = {thr.toFixed(2)}</h3>
-            <div className="info-grid">
-              <div>
-                <span>Alert cells</span>
-                <b style={{ color: "#ef4444" }}>{aboveThr}</b>
-              </div>
-              <div>
-                <span>No-alert cells</span>
-                <b>{belowThr}</b>
-              </div>
-              <div>
-                <span>% alerted</span>
-                <b>{pctAlerts.toFixed(1)}%</b>
-              </div>
-              <div>
-                <span>Est. precision</span>
-                <b style={{ color: "#84cc16" }}>
-                  {estPrecision != null ? `${(estPrecision * 100).toFixed(1)}%` : "—"}
-                </b>
-              </div>
-              <div>
-                <span>Est. recall</span>
-                <b style={{ color: "#22c55e" }}>
-                  {estRecall != null ? `${(estRecall * 100).toFixed(1)}%` : "—"}
-                </b>
-              </div>
-              <div>
-                <span>Deployment thr</span>
-                <b>{defaultThr.toFixed(2)}</b>
-              </div>
-            </div>
-            <p className="info-note" style={{ marginTop: 8 }}>
-              <b>Estimated</b> = interpolated จาก reliability bins ของ test set —
-              ค่าจริงอาจต่างถ้า distribution ใน production ต่างจาก test
-            </p>
-          </section>
-
-          <section style={{ marginTop: 18 }}>
-            <h3>คำแนะนำ</h3>
-            <ul style={{ paddingLeft: 18, color: "var(--text-2)", lineHeight: 1.6, fontSize: 12 }}>
-              <li><b>threshold ต่ำ (0.05–0.20):</b> เตือนเยอะ — เกือบไม่พลาดไฟ แต่ false alarm สูง</li>
-              <li><b>threshold กลาง (0.30–0.50):</b> สมดุล — แนะนำสำหรับ daily monitoring</li>
-              <li><b>threshold สูง (0.60+):</b> เตือนน้อย — เฉพาะที่ confident มาก พลาดไฟบ้าง</li>
-              <li><b>Deployment threshold ({defaultThr.toFixed(2)}):</b> ค่าที่ F1-optimal บน held-out test</li>
-            </ul>
-          </section>
-
-          <section style={{ marginTop: 18 }}>
-            <h3>วิธีใช้</h3>
-            <p style={{ color: "var(--text-2)", fontSize: 12, lineHeight: 1.5 }}>
-              ค่า threshold ที่ตั้งใน modal นี้ <b>ยังไม่ apply กับ dashboard จริง</b> —
-              เป็น preview ให้ดูตัวเลขเฉยๆ. ถ้าจะเปลี่ยน threshold deployment ให้แก้
-              <code style={{ background: "var(--surface-2)", padding: "1px 4px", borderRadius: 3 }}>train.py</code>
-              {" "}แล้วเทรนใหม่ หรือใช้ JSON metadata `deployment_threshold` field
-            </p>
-          </section>
+          <p className="info-note">
+            {copy.background}: <b>{counts.background.toLocaleString()}</b>
+          </p>
+          {metrics?.prevalence_drift?.drift_flag && (
+            <p className="info-note drift">{copy.drift}</p>
+          )}
+          <p className="info-note">{copy.fixed}</p>
         </div>
       </div>
     </div>

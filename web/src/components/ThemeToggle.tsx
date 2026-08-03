@@ -14,8 +14,13 @@ const STORAGE_KEY = "firewatch.theme";
 
 function detectInitial(): Theme {
   if (typeof window === "undefined") return "dark";
-  const stored = window.localStorage.getItem(STORAGE_KEY);
-  if (stored === "dark" || stored === "light") return stored;
+  try {
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    if (stored === "dark" || stored === "light") return stored;
+  } catch {
+    // Sandboxed/private contexts may deny even reads. OS preference remains a
+    // safe, session-only fallback.
+  }
   // OS preference fallback
   if (window.matchMedia?.("(prefers-color-scheme: light)").matches) return "light";
   return "dark";

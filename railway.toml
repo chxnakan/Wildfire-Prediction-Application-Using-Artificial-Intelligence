@@ -1,29 +1,72 @@
 # Railway deployment config
 #
+# NOTE: railway.json (Dockerfile builder) is the canonical build config for
+# the web service; this file mirrors it so whichever config Railway reads,
+# the result is identical. railway.cron.json defines the separate daily
+# fetch+train cron service. Do NOT point this file at nixpacks — the
+# Dockerfile build (SPA build stage + /srv volume seeding via
+# scripts/start.sh) is required.
+#
 # Setup checklist (one-time, in the Railway dashboard):
-#   1. New Project → Deploy from GitHub repo
-#   2. Add a PostgreSQL service → DATABASE_URL is injected automatically
-#   3. Add a Volume mounted at /data (persists model + FIRMS cache across deploys)
-#   4. Set service variables:
+#   1. New Project → Deploy from GitHub repo (web service)
+#   2. Add a PostgreSQL service → DATABASE_URL is injected automatically.
+#      REQUIRED in production: it persists live GISTDA hotspots across
+#      deploys and provides the advisory lock that stops multiple replicas
+#      from polling GISTDA simultaneously.
+#   3. Add a Volume mounted at /srv (persists model + FIRMS cache — the
+#      Dockerfile defaults OUTPUT_DIR=/srv/outputs, DATA_DIR=/srv/data)
+#   4. Web service variables:
 #        FIRMS_API_KEY   = <your NASA FIRMS map key>          (required)
-#        OUTPUT_DIR      = /data/outputs
-#        FIRMS_PATH      = /data/firms/firms_all.parquet
-#        RAW_DIR         = /data/raw
 #        ADMIN_TOKEN     = <random secret for /api/admin/* endpoints>
 #      Optional tuning:
 #        SYNC_INTERVAL_MINUTES = 10
 #        RETRAIN_EVERY_DAYS    = 3
 #        TRAIN_ARGS            = --quick
 #        PREDICT_MAX_HISTORY_DAYS = 180
+#      GISTDA live-hotspot layer (observed detections — not predictions):
+#        GISTDA_ENABLED        = true
+#        GISTDA_POLL_SECONDS   = 300     # server-side poll cadence
+#        CLIENT_REFRESH_SECONDS = 60     # browser refresh of OUR cache
+#        GISTDA_RETENTION_DAYS = 7
+#        GISTDA_REQUEST_TIMEOUT_SECONDS = 15
+#        GISTDA_MAX_RETRIES    = 4
+#        GISTDA_STALE_AFTER_SECONDS = 900
+#   5. RECOMMENDED TOPOLOGY: ONE web service running everything (API +
+#      APScheduler sync/predict/retrain/GISTDA jobs). Reasons:
+#        - Railway VOLUMES ATTACH TO EXACTLY ONE SERVICE. A separate cron
+#          service does NOT see the web service's /srv volume — the
+#          Dockerfile comment suggesting a "shared volume" is wrong on
+#          Railway. A cron service would train against its own empty disk
+#          and the web service would never see the result.
+#        - Committing railway.cron.json does NOT create a second service by
+#          itself. A second service must be created in the dashboard (New →
+#          GitHub repo → same repo, config file path = railway.cron.json)
+#          and would then need its own volume + a DB/object-storage handoff
+#          for artifacts. Only do this if API-process isolation from
+#          training becomes a real problem; until then keep cron OFF.
+#      Retraining runs as a subprocess of the web service (nice-to-have:
+#      Railway restarts the service if memory peaks — the promoted bundle
+#      on the volume survives, and the API reboots into it).
 #
-# The API boots in degraded mode when the volume is empty (no model yet);
-# the scheduler then accumulates FIRMS data and trains automatically.
+# Multi-replica note: sync/predict/GISTDA jobs are PostgreSQL-advisory-lock
+# guarded, and the SSE stream reads from PostgreSQL, so multiple replicas
+# are safe WITH a database. Without PostgreSQL, run exactly ONE replica
+# (locks and SSE fall back to process-local state).
+#
+# Fresh/empty volume behaviour (tested): the API boots DEGRADED — /health
+# returns 200 with ready:false + model_loaded:false (so the Railway health
+# check passes and the service stays up), map/predict endpoints stay empty,
+# and the scheduler accumulates FIRMS data until training succeeds and the
+# quality gates promote a first bundle. The image also bakes bootstrap
+# copies of data/+outputs/ (scripts/start.sh seeds an empty volume from
+# them), so committing a trained outputs/models/lgbm_fire_date_model.pkl
+# gives fresh deploys a trusted starting model immediately.
 
 [build]
-builder = "nixpacks"
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "cd src && uvicorn api:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
-healthcheckTimeout = 120
+healthcheckTimeout = 300
 restartPolicyType = "on_failure"

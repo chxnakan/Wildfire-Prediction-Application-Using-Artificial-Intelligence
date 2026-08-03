@@ -1,0 +1,5 @@
+# Reproducible environment for the academic and poster figure scripts.
+-r requirements.txt
+
+matplotlib==3.11.0
+networkx==3.6.1

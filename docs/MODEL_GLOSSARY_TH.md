@@ -1,135 +1,125 @@
-# คลังศัพท์: โมเดลและเทคนิค (โปรเจกต์ Fire Date Predictor)
+# คลังศัพท์ FireWatch Thailand
 
-เอกสารนี้สรุป**ความหมาย**ของคำศัพท์ที่เกี่ยวกับโมเดลและเทคโนโลยีสารสนเทศ (IT) ใน pipeline นี้ — ใช้ประกอบรายงานหรือนำเสนอโครงงานได้
+เอกสารนี้อธิบายคำที่ใช้ในระบบปัจจุบัน ตัวเลขจริงต้องอ่านจาก
+`outputs/metadata/dataset_info.json` เสมอ
 
-> **ทำเป็น PDF:** เปิดไฟล์นี้ในเบราว์เซอร์ (หรือ VS Code Preview) → **พิมพ์ (Ctrl+P)** → เลือก **บันทึกเป็น PDF**  
-> หรือใช้ Pandoc: `pandoc docs/MODEL_GLOSSARY_TH.md -o MODEL_GLOSSARY_TH.pdf`
+## โจทย์ของโมเดล
 
----
+| คำ | ความหมายในโครงงาน |
+|---|---|
+| **Binary classification** | ตอบว่าใน cell จะมี FIRMS hotspot ในช่วง 1–3 วันข้างหน้าหรือไม่ |
+| **Probability** | ค่าระหว่าง 0–1 ของเหตุการณ์ข้างต้น เช่น 0.12 = 12% |
+| **Label / target** | `1` เมื่อ cell มี hotspot อย่างน้อยหนึ่งจุดใน t+1…t+3, ไม่เช่นนั้น `0` |
+| **Prediction horizon** | ช่วงเวลาที่โมเดลรองรับ ปัจจุบันคือ 3 วัน |
+| **Cell-day** | หน่วยข้อมูลหนึ่งแถว: cell หนึ่งตำแหน่ง ณ base date หนึ่งวัน |
+| **0.1° grid** | cell ประมาณ 11 กม. ในแนวเหนือ–ใต้ ไม่ใช่พิกัดไฟละเอียดระดับอาคาร |
+| **Historically active universe** | cell ที่เคยมี FIRMS อย่างน้อยหนึ่งครั้ง และเริ่มเข้าชุดข้อมูลตั้งแต่วันตรวจพบครั้งแรก |
 
-## 1. IT / ระบบสารสนเทศ (บริบทโปรเจกต์)
+`predicted_fire_date`, `days_until_fire`, MAE/RMSE/R² แบบจำนวนวัน เป็น field
+legacy เพื่อ compatibility เท่านั้น ไม่ใช่ผลลัพธ์ของโมเดลที่ใช้งานจริง
 
-| คำศัพท์ | ความหมาย (สั้น) |
-|---------|------------------|
-| **IT (Information Technology)** | เทคโนโลยีสารสนเทศ — ในบริบทนี้ครอบคลุมการเขียนโปรแกรม (Python), การเก็บข้อมูล (Parquet/JSON), API (FastAPI), และการฝึก/ใช้งานโมเดล ML |
-| **Backend** | ส่วนประมวลผลฝั่งเซิร์ฟเวอร์/สคริปต์ — เช่น `train.py`, `risk_map.py`, `api.py` ที่อ่านข้อมูลจริงแล้วสร้างผลลัพธ์ |
-| **Artifact** | ไฟล์ที่ได้หลังเทรน เช่น `lgbm_fire_date_model.pkl`, `dataset_info.json`, `full_features.parquet` |
-| **Pipeline** | ลำดับขั้นตอนต่อเนื่อง: โหลดข้อมูล → สร้างฟีเจอร์ → ฝึกโมเดล → ประเมิน → บันทึกไฟล์ → (ถ้ามี) อัปเดตแผนที่ |
+## โมเดลและการ train
 
----
+| คำ | ความหมาย |
+|---|---|
+| **LightGBM** | Gradient-boosted decision trees สำหรับข้อมูลตาราง |
+| **Ensemble** | เฉลี่ย probability จากโมเดลหลาย seed เพื่อลดความแปรปรวน |
+| **Hyperparameter** | ค่าที่กำหนดก่อน train เช่น learning rate, depth, leaves |
+| **Bayesian search** | เลือกชุด hyperparameter ถัดไปจากผลรอบก่อนอย่างมีระบบ |
+| **Early stopping** | หยุดเพิ่มต้นไม้เมื่อคะแนน validation ไม่ดีขึ้น |
+| **Class imbalance** | positive พบได้น้อยกว่า negative มาก ซึ่งเป็นธรรมชาติของ rare-event prediction |
+| **Negative undersampling** | ลด negative เฉพาะ train เพื่อควบคุม memory/สมดุลการเรียนรู้ ห้ามทำกับ calibration/test |
+| **Platt calibration** | ใช้ logistic regression แปลง raw score ให้ใกล้ probability จริง |
+| **Promotion gate** | เงื่อนไขก่อน candidate จะเปลี่ยน model ที่กำลัง serve; ถ้าไม่ผ่านให้เก็บ incumbent |
 
-## 2. โจทย์ของโมเดล (Regression)
+## การแบ่งข้อมูลที่กัน leakage
 
-| คำศัพท์ | ความหมาย |
-|---------|-----------|
-| **Regression (การถดถอย / การทำนายค่าต่อเนื่อง)** | โมเดลทำนาย**ตัวเลขจริง** (เช่น จำนวนวัน) ไม่ใช่แค่หมวดหมู่ |
-| **เป้าหมาย (target / label)** | ในที่นี้คือ `days_until_fire` = จำนวนวันจนถึงวันที่มีไฟครั้งถัดไป (ในขอบที่กำหนด เช่น 1–7 วัน) |
-| **ฟีเจอร์ (features)** | ตัวแปรอินพุตที่โมเดลใช้ทำนาย — เช่น lag การเผา, เพื่อนบ้านบนแผนที่, ปฏิทิน, (ถ้ามี) สภาพอากาศ |
+| คำ | ความหมาย |
+|---|---|
+| **Train** | ใช้ fit พารามิเตอร์โมเดล |
+| **Validation** | ใช้ early stopping และเลือก model |
+| **Calibration** | ใช้ fit calibrator และเลือก threshold ก่อนแตะ test |
+| **Held-out test** | ช่วงเวลาสุดท้ายที่ประเมินครั้งเดียว ไม่ใช้เลือก model/threshold |
+| **Whole-date split** | วันหนึ่งต้องอยู่ partition เดียว ห้ามแถวของวันเดียวกันข้ามชุด |
+| **Purge gap** | ตัดช่วง 7 วันระหว่าง partition เพื่อไม่ให้ forward label window ซ้อนกัน |
+| **Censored tail** | แถวท้ายที่ยังมองอนาคตครบ 3 วันไม่ได้ จึงไม่ใช้เป็น label “ไม่มีไฟ” |
+| **Time leakage** | feature หรือขั้นตอนเลือก model แอบใช้ข้อมูลจากอนาคต ทำให้ test ดูดีเกินจริง |
+| **Causal feature** | feature ที่ใช้ข้อมูลซึ่งทราบได้ ณ เวลา prediction เท่านั้น |
 
----
+## Metrics
 
-## 3. ไลบรารีและอัลกอริทึมหลัก
+| Metric | ความหมาย | อ่านอย่างไร |
+|---|---|---|
+| **ROC-AUC** | โอกาสที่โมเดลจะ rank positive สูงกว่า negative | 0.5 = random, 1 = perfect; ไม่ใช่ accuracy |
+| **Average Precision / PR-AUC** | คุณภาพ precision–recall ตลอด threshold | สำคัญเมื่อ positive มีน้อย ต้องอ่านคู่ positive rate |
+| **Precision** | จาก alert ทั้งหมด เป็น positive จริงกี่ส่วน | สูง = false alarm น้อย |
+| **Recall / Sensitivity** | จาก positive จริงทั้งหมด จับได้กี่ส่วน | สูง = miss น้อย |
+| **F1** | harmonic mean ของ precision และ recall | ใช้เมื่ออยากสมดุลสองค่า |
+| **Brier score** | ค่าเฉลี่ยความคลาดเคลื่อนกำลังสองของ probability | ต่ำกว่า = ดีกว่า |
+| **ECE** | ช่องว่างเฉลี่ยระหว่าง probability ที่ทายกับอัตราเกิดจริงใน bin | ต่ำกว่า = calibrated ดีกว่า |
+| **Alert rate** | สัดส่วน cell-days ที่ข้าม threshold | บอกภาระงานของ operator |
+| **Confusion matrix** | TP, FP, FN, TN ณ threshold หนึ่ง | ต้องดูจำนวนจริง ไม่ใช่เปอร์เซ็นต์อย่างเดียว |
+| **Baseline** | วิธีง่าย ๆ สำหรับเทียบ เช่น “เคยมีไฟใน 7 วันล่าสุด” | โมเดลควรแสดง uplift เหนือ baseline บน test เดียวกัน |
 
-### 3.1 LightGBM
+### TP / FP / FN / TN
 
-| รายการ | ความหมาย |
-|--------|-----------|
-| **LightGBM** | ไลบรารี **Gradient Boosting** แบบต้นไม้ตัดสินใจ — ฝึกทีละต้นไม้เพื่อแก้ error ของรุ่นก่อน เร็วและเหมาะกับข้อมูลตารางขนาดใหญ่ |
-| **`LGBMRegressor`** | คลาสสำหรับงาน **ทำนายค่าต่อเนื่อง** (regression) |
-| **`objective="regression_l1"`** ในโปรเจกต์นี้ | ให้การฝึกเน้น **ข้อผิดพลาดแบบ MAE (L1)** — โทษจากค่าผิดพลาดใหญ่แบบรุนแรงน้อยกว่า MSE |
+| คำ | ความหมาย |
+|---|---|
+| **TP (true positive)** | เตือนและมี hotspot ใน target window จริง |
+| **FP (false positive)** | เตือนแต่ไม่พบ hotspot ใน target window |
+| **FN (false negative)** | ไม่เตือนแต่มี hotspot |
+| **TN (true negative)** | ไม่เตือนและไม่พบ hotspot |
 
-### 3.2 XGBoost
+## Absolute tier กับ relative ranking
 
-| รายการ | ความหมาย |
-|--------|-----------|
-| **XGBoost** | อีกไลบรารี **Gradient Boosting** ยอดนิยม — ในโปรเจกต์นี้เป็นตัวเลือกหนึ่งในการแข่งกับ LightGBM |
-| **`objective="reg:absoluteerror"`** | เป้าหมายฝึกแบบ **ค่าคลาดเคลื่อนสัมบูรณ์ (MAE)** ใน XGBoost |
+| แนวคิด | ความหมาย |
+|---|---|
+| **HIGH** | probability ข้าม threshold แบบเน้น precision |
+| **WATCH** | threshold ต่ำกว่า HIGH เพื่อเฝ้าระวังและเพิ่ม recall |
+| **Background** | ต่ำกว่า alert threshold; ไม่ได้แปลว่าปลอดภัยแน่นอน |
+| **Top-K / Top 20%** | เลือกตามอันดับสัมพัทธ์เพื่อแบ่งทรัพยากร แม้ probability absolute จะต่ำ |
+| **Historical coverage** | สัดส่วน positive held-out ที่อยู่ในกลุ่มอันดับนั้น ไม่ใช่การรับประกันวันใดวันหนึ่ง |
 
-### 3.3 scikit-learn (ส่วนที่ใช้กับโมเดล)
+WATCH recall และ Top-20% coverage เป็นคนละ metric ห้ามเรียกแทนกัน
 
-| คำศัพท์ | ความหมาย |
-|---------|-----------|
-| **`TimeSeriesSplit`** | การแบ่งข้อมูลเป็น **หลายช่วงเวลา** สำหรับ cross-validation — แต่ละ fold ใช้**อดีต**ทำนาย**อนาคต** ไม่สลับลำดับแบบสุ่ม จึงลดการรั่วไหลของข้อมูลจากอนาคต |
-| **`RandomizedSearchCV`** | การค้นหา **hyperparameter** โดยสุ่มชุดค่าจากช่วงที่กำหนด จำนวน `n_iter` ครั้ง แล้วประเมินด้วย CV — ไม่ไล่ทุกค่าเหมือน Grid Search จึงประหยัดเวลา |
-| **Hyperparameter** | พารามิเตอร์ที่ตั้งก่อนฝึก (เช่น `learning_rate`, `num_leaves`) — ไม่ใช่น้ำหนักที่เรียนรู้จากข้อมูลโดยตรง |
-| **`refit="hybrid"`** (ในโปรเจกต์นี้) | หลังจบ CV จะ **ฝึกรอบสุดท้าย** ด้วยชุด hyperparameter ที่คะแนน **hybrid** (ดูข้อ 5) ดีที่สุด |
+## Drift และความสดของข้อมูล
 
----
+| คำ | ความหมาย |
+|---|---|
+| **Base-rate / prevalence** | สัดส่วน positive ในประชากรที่กำลังวัด |
+| **Seasonal drift** | prevalence หรือ distribution ต่างกันตามฤดู ทำให้ threshold เดิมถ่ายข้ามช่วงได้ไม่ดี |
+| **Data freshness** | เวลาของ observation ล่าสุดเทียบกับปัจจุบัน |
+| **Stale** | ยังมี cache แต่เก่าเกินเกณฑ์ ต้องแสดงคำเตือน |
+| **Unavailable** | request/source ล้มเหลว ต้องไม่แสดงเป็นศูนย์ที่ดูเหมือนยืนยันแล้ว |
+| **Confirmed zero** | ดึง source สำเร็จและผลลัพธ์ว่างจริง |
 
-## 4. ตัวชี้วัด (Metrics) — ความหมายทางคณิตศาสตร์
+## แหล่งข้อมูล
 
-ค่าต่อไปนี้คำนวณในฟังก์ชัน `evaluate()` ของ `model.py` โดยใช้ `y_true` = ค่าจริง, `y_pred` = ค่าทำนายแบบ**ต่อเนื่อง** (ก่อนปัดเป็นวันเต็มสำหรับบาง metric)
+| Source | บทบาท |
+|---|---|
+| **NASA FIRMS VIIRS** | history และ label หลักของโมเดล |
+| **GISTDA VIIRS** | live observation layer แยกจาก prediction |
+| **ERA5 / Open-Meteo** | weather context และ feature เมื่อมีข้อมูล |
+| **Hansen Global Forest Change** | tree cover และ tree loss |
 
-| ชื่อในโค้ด | สัญลักษณ์ / นิยามสั้น ๆ | ความหมายเชิงปฏิบัติ |
-|------------|------------------------|----------------------|
-| **`mae_days`** | \(\frac{1}{n}\sum \|y_{\text{true}} - y_{\text{pred}}\|\) | **ค่าผิดเฉลี่ยเป็นวัน** — ยิ่งใกล้ 0 ยิ่งดี; หน่วย “วัน” ตรงกับโจทย์ |
-| **`rmse_days`** | \(\sqrt{\frac{1}{n}\sum (y_{\text{true}} - y_{\text{pred}})^2}\) | **รากของค่าผิดพลาดกำลังสอง** — ลงโทษค่าผิดพลาดใหญ่มากกว่า MAE |
-| **`r2`** (R²) | สัดส่วนความแปรปรวนที่โมเดลอธิบายได้ | 1 = พอดีที่สุดในเชิงบรรทัดฐาน; ค่าลบ = แย่กว่า baseline ง่าย ๆ ในบางช่วงข้อมูล |
-| **`accuracy_within_1day`** | สัดส่วนที่ \(\|\text{round}(y_{\text{pred}}) - y_{\text{true}}\| \le 1\) (หลัง clip ให้อยู่ในขอบ horizon) | **ความแม่นยำแบบ “ใกล้จริงภายใน ±1 วัน”** หลังปัดคำทำนายเป็นจำนวนเต็ม — เหมาะกับการใช้งานเชิงปฏิบัติการ |
+FIRMS กับ GISTDA เป็นผลิตภัณฑ์ satellite hotspot คนละ source แต่ไม่ควรเรียกว่า
+“หลักฐานอิสระสมบูรณ์” เพราะมีข้อจำกัดด้าน overpass/cloud คล้ายกัน
 
-**หมายเหตุสำคัญ:**  
-- **`mae_days`** ใช้ความต่างจาก **`y_pred` แบบไม่ปัด**  
-- **`accuracy_within_1day`** ใช้ **`y_pred` ปัดเป็นจำนวนเต็ม** แล้วเทียบกับ `y_true`  
-ดังนั้นสองค่านี้วัดมุมต่างกันของ “ความดี” ของโมเดล
+## คำที่ควรใช้ในการนำเสนอ
 
-**MAE (ทั่วไป)** = Mean Absolute Error — ชื่อทั่วไปของแนวคิดเดียวกับ `mae_days` เมื่อหน่วยเป็น “วัน”
+- “ความเสี่ยงพบ hotspot ภายใน 3 วัน”
+- “จัดลำดับพื้นที่ให้ operator ตรวจสอบ”
+- “held-out chronological test”
+- “absolute threshold” และ “relative ranking”
+- “ข้อมูลไม่พร้อมใช้งาน” เมื่อ source ล้มเหลว
 
----
+คำที่ไม่ควรใช้:
 
-## 5. Hybrid score และการเลือกโมเดล
+- “ทำนายวันเกิดไฟ”
+- “จุดนี้จะเกิดไฟแน่นอน”
+- “AUC คือ accuracy”
+- “ไม่มีไฟ” เมื่อ live feed ล่ม
 
-ใน `model.py` การ tune และการเลือกว่า LightGBM หรือ XGBoost ชนะ ใช้แนวคิดรวม **MAE** กับ **ความแม่นยำ ±1 วัน**:
-
-- ใน CV: scorer ที่ maximize ค่าแบบ \(-(\text{MAE} - w \times \text{acc±1})\)  
-- บน validation: เลือกโมเดลที่ **ลด**ค่า \(\text{MAE} - w \times \text{acc±1}\) (ยิ่งต่ำยิ่งดี)  
-- **`w`** มาจาก `TRAIN_HYBRID_ACC_WEIGHT` (ค่าเริ่มต้น **3.5**)
-
-**ความหมาย:** ไม่เลือกแค่ MAE ต่ำสุดอย่างเดียว แต่ให้ค่า **acc±1** มีน้ำหนัก — สมดุลระหว่าง “ผิดเป็นวันน้อย” กับ “ตกขอบ ±1 วันน้อย”
-
----
-
-## 6. Ensemble — `build_ensemble` และ `EnsembleRegressor`
-
-| คำศัพท์ | ความหมาย |
-|---------|-----------|
-| **Ensemble (กลุ่มโมเดล)** | รวมหลายโมเดลย่อยเพื่อให้คำทำนาย**เสถียร**กว่าโมเดลเดี่ยว |
-| **`EnsembleRegressor`** (ในโปรเจกต์นี้) | คลาสที่ห่อ **หลายตัว regressor ที่ฝึกแล้ว** — เวลาทำนายใช้**ค่าเฉลี่ย**ของคำทำนายแต่ละตัว |
-| **`build_ensemble(...)`** | ฟังก์ชันที่ **ฝึกหลายโมเดล** ด้วย hyperparameter ชุดเดียวกัน แต่ **`random_state` ต่างกัน** เพื่อให้ความสุ่มต่างกันเล็กน้อย แล้วรวมเป็น `EnsembleRegressor` |
-| **จำนวนต้นไม้ใน ensemble** | ใน `train.py` ใช้ **11** ต้นไม้ (`n_ensemble=11`) หลังเลือก hyperparameter ที่ดีที่สุดแล้ว |
-
-**เหตุผล:** ค่าเฉลี่ยจากหลาย seed ช่วยลด **ความแปรปรวนของคำทำนาย** (variance) โดยไม่เปลี่ยนกรอบปัญหา
-
----
-
-## 7. น้ำหนักตัวอย่าง (sample weight)
-
-- **`sample_weight`**: แต่ละแถวในชุดฝึกมี**น้ำหนักไม่เท่ากัน** — แถวที่น้ำหนักมากมีผลต่อการลด error มากกว่า  
-- ใน `train.py` ใช้ช่วย **สมดุลคลาสของ label** และ **ให้ความสำคัญกับข้อมูลล่าสุด** (ตามที่ออกแบบในฟังก์ชันคำนวณน้ำหนัก)
-
----
-
-## 8. สรุปความสัมพันธ์แบบลำดับ (สำหรับนำเสนอ)
-
-1. เตรียม `X_train`, `y_train` (ฟีเจอร์ + จำนวนวันจนถึงไฟ)  
-2. ใช้ **`RandomizedSearchCV`** + **`TimeSeriesSplit`** ค้นหา hyperparameter ของแต่ละ candidate (LightGBM / XGBoost / …)  
-3. ใช้คะแนน **hybrid** เป็นตัว **refit** หลัง CV  
-4. ประเมินบน **validation** ด้วย `mae_days`, `rmse_days`, `r2`, `accuracy_within_1day` และคะแนนเลือกครอบครัว  
-5. ประเมินบน **test** (ข้อมูลที่ไม่ใช้เลือกโมเดล)  
-6. เรียก **`build_ensemble`** ฝึกหลายต้นไม้บน **train+val** แล้วบันทึกเป็นไฟล์ `.pkl`
-
----
-
-## 9. คำศัพท์เสริมที่มักถูกถาม
-
-| คำศัพท์ | ความหมาย |
-|---------|-----------|
-| **Baseline** | โมเดลอ้างอิงง่าย ๆ (เช่น ทายค่าเฉลี่ยของ y ตลอด test) — ใช้เช็คว่าโมเดลจริงดีกว่าค่าคงที่หรือไม่ |
-| **Held-out test** | ชุดทดสอบที่**ไม่เข้า**ขั้น tune / เลือก hyperparameter — วัดความทั่วไปได้ตรงกว่า |
-| **Overfitting** | โมเดลจำ noise ของ train มากเกิน — ทำนาย train ดีแต่ test แย่ |
-| **Cross-validation (CV)** | แบ่ง train เป็นหลายส่วนเพื่อประเมิน hyperparameter หลายรอบโดยไม่ใช้ test |
-
----
-
-*เอกสารนี้อ้างอิงพฤติกรรมของโค้ดใน `src/model.py` และ `src/train.py` ณ เวลาที่สร้างไฟล์ — หากพารามิเตอร์ใน repo เปลี่ยน ให้ตรวจสอบจากซอร์สจริงเป็นหลัก*
-
-แหล่งข้อมูล / API: ดู `docs/DATA_APIS_TH.md`
+ดูตัวเลขและข้อจำกัดล่าสุดที่
+[`MODEL_CARD.md`](MODEL_CARD.md) และคู่มือนำเสนอที่
+[`PRESENTATION_TH.md`](PRESENTATION_TH.md)

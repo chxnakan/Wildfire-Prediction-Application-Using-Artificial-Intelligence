@@ -15,7 +15,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
@@ -54,6 +54,32 @@ META_PATH  = os.path.join(_OUTPUT_DIR, "metadata", "dataset_info.json")
 RISKMAP_DIR  = os.path.join(_OUTPUT_DIR, "riskmap")
 GEOJSON_PATH = os.path.join(RISKMAP_DIR, "fire_dates_all.geojson")
 LATEST_PATH  = os.path.join(RISKMAP_DIR, "latest.json")
+
+# NRT FIRMS cache — its max acq_datetime is the true "data as of" instant
+# (finer than the daily base_date the model predicts from).
+_FIRMS_PATH = os.getenv("FIRMS_PATH") or os.path.join(BASE_DIR, "data", "firms", "firms_all.parquet")
+if not os.path.isabs(_FIRMS_PATH):
+    _FIRMS_PATH = os.path.join(BASE_DIR, _FIRMS_PATH)
+
+
+def _latest_data_time() -> Optional[str]:
+    """Max FIRMS acquisition timestamp as a UTC ISO string — the real moment
+    the freshest hotspot was observed, finer than the daily base_date. FIRMS
+    acq times are UTC; a naive timestamp is localized to UTC so the frontend
+    can convert to the viewer's zone. Returns None if unavailable."""
+    try:
+        if not os.path.exists(_FIRMS_PATH):
+            return None
+        col = pd.read_parquet(_FIRMS_PATH, columns=["acq_datetime"])["acq_datetime"]
+        latest = pd.to_datetime(col, errors="coerce").max()
+        if pd.isna(latest):
+            return None
+        ts = pd.Timestamp(latest)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        return ts.isoformat()
+    except Exception:
+        return None
 
 os.makedirs(RISKMAP_DIR, exist_ok=True)
 
@@ -118,7 +144,15 @@ COUNTRY_FILTER_ENABLED = os.getenv("COUNTRY_FILTER_ENABLED", "true").lower() in 
 # METADATA HELPERS
 # =========================================================
 
+# Metadata embedded in the promoted model bundle (set by load_assets).
+# Authoritative over dataset_info.json — the JSON can lag the bundle if a
+# crash lands between the two writes; the bundle can't tear.
+_BUNDLE_METADATA: Optional[dict] = None
+
+
 def _load_metadata() -> dict:
+    if _BUNDLE_METADATA is not None:
+        return _BUNDLE_METADATA
     if not exists(META_PATH):
         return {}
     try:
@@ -159,21 +193,13 @@ def load_assets():
     float32 already applied at the pyarrow→pandas boundary, then concat.
     Peak RAM stays under 2GB regardless of total size.
     """
-    # The pickled `_EnsembleRegressor` was saved with `__module__ = "__main__"`
-    # because train.py ran as __main__. When risk_map.py runs standalone, our
-    # __main__ doesn't have that class. Alias it before unpickling.
-    import sys
-    try:
-        import train as _train
-        _main = sys.modules.get("__main__")
-        if _main is not None:
-            for _name in ("_EnsembleRegressor", "_prob_to_days_for_compat"):
-                if hasattr(_train, _name) and not hasattr(_main, _name):
-                    setattr(_main, _name, getattr(_train, _name))
-    except ImportError:
-        pass
-
-    model = read_pickle(MODEL_PATH)
+    # Canonical loader (train.load_model_bundle): registers the pickled classes
+    # in __main__ and unwraps bundle-v1. Stash embedded metadata so
+    # _load_metadata() prefers it over dataset_info.json.
+    import train as _train
+    model, _meta = _train.load_model_bundle(MODEL_PATH)
+    global _BUNDLE_METADATA
+    _BUNDLE_METADATA = _meta if _meta is not None else None
 
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -325,11 +351,11 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
     # know whether a fire lands on day 1, 2 or 3 — so this module must never
     # manufacture an exact fire date from it. `probability` is the real,
     # calibrated model output; everything else below is display scaffolding.
-    if hasattr(model, "predict_proba"):
-        prob = np.asarray(model.predict_proba(X), dtype=float)
-    else:  # very old artifact — recover rank-only proxy from pseudo-days
-        prob = 1.0 - (np.asarray(model.predict(X), dtype=float) - 1.0) / 6.0
-    base["probability"] = np.clip(prob, 0.0, 1.0)
+    # Single source of truth: the API's /predictions/* and /predict/location
+    # score through this exact function too, so the GeoJSON and the API can
+    # never report a different probability for the same cell.
+    import inference
+    base["probability"] = inference.calibrated_probability(model, X)
 
     raw_pred = model.predict(X)   # monotone pseudo-days (compat / display bins)
     # Floor into integer bins. These bins are PROBABILITY-RANK buckets that
@@ -557,6 +583,18 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
     print(f"Urgency thresholds [{thresholds_source}]: "
           f"HIGH≥{thresholds['HIGH']:.3f} · MEDIUM≥{thresholds['MEDIUM']:.3f} "
           f"· tiers: {tier_counts}")
+    # Relative operational ranking (Top-k) — SEPARATE from the absolute tiers
+    # above. Deterministic; HIGH absolute threshold overrides. Adds rank /
+    # percentile / ranking_tier WITHOUT touching probability or the row order
+    # (merged back by cell so downstream display-cap logic is unaffected).
+    import inference as _inf
+    high_thr = float(thresholds.get("HIGH", 1.01)) if thresholds else None
+    if len(base):
+        ranked = _inf.assign_operational_ranking(
+            base, high_threshold=high_thr, watch_top_pct=10,
+            extended_watch_top_pct=20,
+        )[["lat_grid", "lon_grid", "rank", "percentile", "ranking_tier"]]
+        base = base.merge(ranked, on=["lat_grid", "lon_grid"], how="left")
     base.attrs["thresholds_source"] = thresholds_source
 
     return base, base_date, thresholds
@@ -566,144 +604,204 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
 # WRITE GEOJSON (append-then-overwrite-current-base-date)
 # =========================================================
 
+def _cell_key(lat: float, lon: float, grid_size: float) -> Tuple[int, int]:
+    """Canonical integer grid index for a coordinate — snap to the model's
+    0.1° grid so 'same cell' means exactly the training label's cell, free of
+    float-equality hazards. Shared definition for prediction and observation."""
+    return (int(round(lat / grid_size)), int(round(lon / grid_size)))
+
+
 def _revalidate_predictions(
     features: list,
     daily_df: pd.DataFrame,
-    radius_km: float = 25.0,
-    day_window: int = 1,
+    horizon_days: int,
+    spatial_radius_km: float = 25.0,
     operational_tiers: Optional[set] = None,
+    grid_size: float = 0.1,
 ) -> dict:
-    """Tag each historical predicted feature with hit / miss / future.
+    """Two SEPARATE, explicitly-named evaluations of stored predictions.
 
-    Hit definition: a real FIRMS detection within `radius_km` km of the
-    predicted cell AND within ±`day_window` days of the predicted date.
-    Defaults (25 km / ±1 day) — chosen because:
-      • the model's grid is 0.1° (~11 km) so 25 km = ~2 cells tolerance,
-        covering the case where the actual fire lands in a neighbour cell
-      • FIRMS pixel positional error is ~375 m but a single fire perimeter
-        can span several km, and adjacent fires often cluster
-      • the Compare page can still tighten this back to 15 km via its
-        slider for a strict audit
+    strict_model_target — the model's ACTUAL binary target: ≥1 FIRMS hotspot
+      in the SAME 0.1° cell on any day in ``[base_date+1, base_date+horizon]``
+      inclusive. This is the ONLY evaluation permitted to report model
+      hit/miss (and downstream precision/recall/F1). Each feature's
+      ``validation_status`` is this strict result.
 
-    Previous implementation required an EXACT (lat_grid, lon_grid, date)
-    match — that meant a real fire in the adjacent 0.1° cell (~11 km away)
-    counted as a miss. Hit rate then read low purely because of grid
-    boundary effects, not because the model was wrong.
+    operational_spatial_tolerance — a proximity DIAGNOSTIC only: a real fire
+      within ``spatial_radius_km`` of the cell within the same date window. It
+      is NOT model precision/recall and is surfaced under its own key so it can
+      never be mistaken for one. Stored per feature as ``spatial_diagnostic``.
 
-    `operational_tiers` limits the aggregate hit-rate denominator to those
-    urgency tiers (default {"HIGH", "MEDIUM"} — the ones an operator would
-    actually act on). LOW-tier predictions still get tagged with
-    hit/miss/future for the Compare-page audit, they just don't drag down
-    the headline sidebar number.
+    A prediction is ``future`` until observations cover the ENTIRE horizon
+    (``latest_observed >= base_date + horizon``) — not merely +horizon−1. The
+    previous code matched ±1 day around base_date+horizon, i.e. days +2..+4,
+    with a 25 km radius; both are fixed here.
     """
+    empty = {"hits": 0, "misses": 0, "future": 0, "hit_rate": None,
+             "evaluation": "strict_model_target",
+             "operational_spatial_tolerance": {"hits": 0, "misses": 0,
+                                               "future": 0, "hit_rate": None}}
     if daily_df is None or daily_df.empty:
-        return {"hits": 0, "misses": 0, "future": 0, "hit_rate": None}
+        return empty
 
     operational_tiers = operational_tiers or {"HIGH", "MEDIUM"}
+    horizon_days = int(horizon_days)
 
-    # Pre-group fired observations by date for fast lookup. For each
-    # prediction we scan a small window of dates rather than the full set.
+    # latest_observed comes from the full densified frame (zero-fire days are
+    # still observations) so maturity is judged correctly even before any fire.
+    latest_observed = pd.to_datetime(daily_df["date"]).max().date()
     fired = daily_df[daily_df["fire_count"] > 0].copy()
     fired["date"] = pd.to_datetime(fired["date"]).dt.date
+
+    # Strict lookup: set of (cell_index, date) that actually burned.
+    fired_cells: set = set()
+    # Spatial lookup: coords by date (for the radius diagnostic).
     obs_by_date: Dict[Any, List[Tuple[float, float]]] = {}
     for _, row in fired.iterrows():
-        obs_by_date.setdefault(row["date"], []).append(
-            (float(row["lat_grid"]), float(row["lon_grid"]))
-        )
-
-    latest_observed = pd.to_datetime(daily_df["date"]).max().date()
+        la, lo, d = float(row["lat_grid"]), float(row["lon_grid"]), row["date"]
+        fired_cells.add((_cell_key(la, lo, grid_size), d))
+        obs_by_date.setdefault(d, []).append((la, lo))
 
     def haversine_km(lat1, lon1, lat2, lon2):
         from math import radians, cos, sin, asin, sqrt
         r = 6371.0
-        dlat = radians(lat2 - lat1)
-        dlon = radians(lon2 - lon1)
+        dlat = radians(lat2 - lat1); dlon = radians(lon2 - lon1)
         a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
         return r * 2 * asin(sqrt(a))
 
-    # Per-snapshot tallies tracked as TWO numbers each: total (all tiers)
-    # and operational (HIGH+MEDIUM). The headline hit_rate is operational.
+    def _acc():
+        return {"hits": 0, "misses": 0, "future": 0,
+                "hits_all": 0, "misses_all": 0, "future_all": 0}
+    strict = _acc()
+    spatial = _acc()
     per_snapshot: Dict[str, Dict[str, int]] = {}
-    op_hits = op_misses = op_future = 0
-    all_hits = all_misses = all_future = 0
 
     for f in features:
         props = f.get("properties", {})
         if props.get("source") != "predicted":
             continue
-        target_str = props.get("predicted_fire_date")
-        if not target_str:
+        bd_str = props.get("base_date")
+        if not bd_str:
             continue
         try:
-            target_date = pd.to_datetime(target_str).date()
+            base_date = pd.to_datetime(bd_str).date()
         except (ValueError, TypeError):
             continue
 
-        bd = props.get("base_date") or "unknown"
-        bucket = per_snapshot.setdefault(bd, {
+        # Window = [base_date+1, base_date+horizon] inclusive (the label).
+        window = [base_date + timedelta(days=k) for k in range(1, horizon_days + 1)]
+        window_end = window[-1]
+        tier = props.get("urgency_level") or "NONE"
+        is_op = tier in operational_tiers
+        bucket = per_snapshot.setdefault(bd_str, {
             "hits": 0, "misses": 0, "future": 0,
             "hits_all": 0, "misses_all": 0, "future_all": 0,
         })
-        tier = props.get("urgency_level") or "NONE"
-        is_op = tier in operational_tiers
 
-        if target_date > latest_observed:
+        lat = float(props.get("lat", props.get("lat_grid", 0)))
+        lon = float(props.get("lon", props.get("lon_grid", 0)))
+
+        # future until the ENTIRE horizon window is observed.
+        if latest_observed < window_end:
             props["validation_status"] = "future"
-            all_future += 1; bucket["future_all"] += 1
-            if is_op: op_future += 1; bucket["future"] += 1
+            props["spatial_diagnostic"] = "future"
+            for acc in (strict, spatial):
+                acc["future_all"] += 1
+                if is_op:
+                    acc["future"] += 1
+            bucket["future_all"] += 1
+            if is_op:
+                bucket["future"] += 1
             continue
 
-        lat = float(props.get("lat", 0))
-        lon = float(props.get("lon", 0))
+        # STRICT: same cell burned on any day in the window.
+        pkey = _cell_key(lat, lon, grid_size)
+        strict_hit = any((pkey, d) in fired_cells for d in window)
 
-        hit = False
-        # Lat-band gate width: a bit larger than radius/111 to be safe at
-        # any latitude (0.3° ≈ 33 km, comfortably wider than radius_km=25).
-        lat_gate = max(0.3, radius_km / 80.0)
-        for offset in range(-day_window, day_window + 1):
-            for olat, olon in obs_by_date.get(target_date + timedelta(days=offset), ()):
+        # SPATIAL DIAGNOSTIC: a fire within radius on any day in the window.
+        lat_gate = max(0.3, spatial_radius_km / 80.0)
+        spatial_hit = False
+        for d in window:
+            for olat, olon in obs_by_date.get(d, ()):
                 if abs(olat - lat) > lat_gate:
                     continue
-                if haversine_km(lat, lon, olat, olon) <= radius_km:
-                    hit = True
+                if haversine_km(lat, lon, olat, olon) <= spatial_radius_km:
+                    spatial_hit = True
                     break
-            if hit:
+            if spatial_hit:
                 break
 
-        if hit:
-            props["validation_status"] = "hit"
-            all_hits += 1; bucket["hits_all"] += 1
-            if is_op: op_hits += 1; bucket["hits"] += 1
-        else:
-            props["validation_status"] = "miss"
-            all_misses += 1; bucket["misses_all"] += 1
-            if is_op: op_misses += 1; bucket["misses"] += 1
+        props["validation_status"] = "hit" if strict_hit else "miss"
+        props["spatial_diagnostic"] = "hit" if spatial_hit else "miss"
 
-    # Per-snapshot hit rates — operational (headline) and total (for Compare)
-    for _, bucket in per_snapshot.items():
-        op_valid  = bucket["hits"] + bucket["misses"]
-        all_valid = bucket["hits_all"] + bucket["misses_all"]
-        bucket["hit_rate"]     = round(bucket["hits"] / op_valid, 4)  if op_valid  > 0 else None
-        bucket["hit_rate_all"] = round(bucket["hits_all"] / all_valid, 4) if all_valid > 0 else None
+        for acc, is_hit in ((strict, strict_hit), (spatial, spatial_hit)):
+            key_all = "hits_all" if is_hit else "misses_all"
+            acc[key_all] += 1
+            if is_op:
+                acc["hits" if is_hit else "misses"] += 1
+        bucket["hits_all" if strict_hit else "misses_all"] += 1
+        if is_op:
+            bucket["hits" if strict_hit else "misses"] += 1
 
-    return {
-        "hits": op_hits,
-        "misses": op_misses,
-        "future": op_future,
-        "hit_rate": round(op_hits / (op_hits + op_misses), 4) if (op_hits + op_misses) > 0 else None,
-        "hits_all": all_hits,
-        "misses_all": all_misses,
-        "future_all": all_future,
-        "hit_rate_all": round(all_hits / (all_hits + all_misses), 4) if (all_hits + all_misses) > 0 else None,
-        "match_radius_km": radius_km,
-        "match_day_window": day_window,
+    for _, b in per_snapshot.items():
+        ov = b["hits"] + b["misses"]
+        av = b["hits_all"] + b["misses_all"]
+        b["hit_rate"] = round(b["hits"] / ov, 4) if ov else None
+        b["hit_rate_all"] = round(b["hits_all"] / av, 4) if av else None
+
+    def _summ(acc):
+        ov = acc["hits"] + acc["misses"]
+        av = acc["hits_all"] + acc["misses_all"]
+        return {
+            "hits": acc["hits"], "misses": acc["misses"], "future": acc["future"],
+            "hit_rate": round(acc["hits"] / ov, 4) if ov else None,
+            "hits_all": acc["hits_all"], "misses_all": acc["misses_all"],
+            "future_all": acc["future_all"],
+            "hit_rate_all": round(acc["hits_all"] / av, 4) if av else None,
+        }
+
+    result = _summ(strict)
+    result.update({
+        "evaluation": "strict_model_target",
+        "match_rule": "same 0.1° cell, any day in [base+1, base+horizon]",
+        "horizon_days": horizon_days,
         "operational_tiers": sorted(operational_tiers),
         "per_snapshot": per_snapshot,
-    }
+        # Proximity diagnostic — NOT model precision/recall.
+        "operational_spatial_tolerance": {
+            **_summ(spatial),
+            "match_radius_km": spatial_radius_km,
+            "note": "operational proximity diagnostic only — not model "
+                    "precision/recall",
+        },
+    })
+    return result
+
+
+def _ranking_policy_block(thresholds: dict, metrics: dict) -> dict:
+    """Ranking-policy metadata + held-out historical Top-k coverage (from the
+    model's test metrics — recall captured by the top 5/10/20%)."""
+    import inference as _inf
+    m = metrics or {}
+    coverage = {}
+    for pct in (5, 10, 20):
+        v = m.get(f"recall_captured_top_{pct}pct")
+        if v is not None:
+            coverage[f"top_{pct}pct"] = v
+    high_thr = float(thresholds.get("HIGH", 1.01)) if thresholds else None
+    return _inf.ranking_policy_metadata(
+        high_thr, watch_top_pct=10, extended_watch_top_pct=20,
+        historical_coverage=coverage)
 
 
 def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, thresholds: dict, metrics: dict, daily_df: Optional[pd.DataFrame] = None):
     base_date_str = base_date.strftime("%Y-%m-%d")
+    # The model's true horizon is imminent_days (default 3) — NOT the 7-day
+    # pseudo-day display range. Every metadata surface reports this horizon and
+    # the explicit risk window so API/GeoJSON/CSV/frontend agree.
+    horizon_days = int((_load_metadata() or {}).get("imminent_days", 3))
+    risk_window_start = (base_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    risk_window_end = (base_date + timedelta(days=horizon_days)).strftime("%Y-%m-%d")
 
     geojson = {"type": "FeatureCollection", "features": []}
     if exists(GEOJSON_PATH):
@@ -746,16 +844,28 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
     # validation metrics without a separate fetch.
     geojson["metadata"] = {
         "base_date": base_date_str,
-        "horizon_days": MAX_PREDICTION_DAYS,
+        # True observation instant of the freshest FIRMS hotspot (UTC ISO) and
+        # when this snapshot was generated — lets the UI show "data as of …"
+        # with a real time, not just the daily base_date.
+        "latest_data_time": _latest_data_time(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "horizon_days": horizon_days,
+        "risk_window_start": risk_window_start,
+        "risk_window_end": risk_window_end,
         "output_semantics": (
-            "probability = calibrated P(≥1 FIRMS hotspot within the risk "
-            "window). days_until_fire is a probability-rank display bucket, "
-            "NOT a forecast of the exact fire date."
+            "probability = calibrated P(≥1 FIRMS hotspot in this 0.1° cell "
+            f"during base_date+1..base_date+{horizon_days} inclusive). "
+            "days_until_fire / predicted_fire_date are DEPRECATED display "
+            "scaffolding, not a forecast of an exact fire date."
         ),
         "urgency_thresholds": thresholds,
         "thresholds_source": str(predicted.attrs.get("thresholds_source", "")) if hasattr(predicted, "attrs") else "",
         "suppressed_by_display_cap": int(predicted.attrs.get("n_suppressed_by_cap", 0)) if hasattr(predicted, "attrs") else 0,
         "metrics": metrics,
+        # Relative Top-k operational ranking policy (separate from the absolute
+        # calibrated tiers). Historical coverage = held-out captured-recall
+        # estimates from the model's test metrics — NOT a same-day guarantee.
+        "ranking_policy": _ranking_policy_block(thresholds, metrics),
         "history_window_days": HISTORY_WINDOW_DAYS,
         "long_history_window_days": LONG_HISTORY_WINDOW_DAYS,
     }
@@ -811,6 +921,10 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
                 # only date claim the model supports. Same for all cells.
                 "predicted_fire_date": str(r["predicted_fire_date"]),
                 "urgency_level": str(r["urgency_level"]),
+                # Relative Top-k operational ranking (separate from urgency_level).
+                "ranking_tier": str(r.get("ranking_tier", "LOW")),
+                "rank": int(r["rank"]) if pd.notna(r.get("rank")) else None,
+                "percentile": float(r["percentile"]) if pd.notna(r.get("percentile")) else None,
                 "confidence": float(r["prediction_confidence"]),
                 "raw_prediction": float(r["raw_prediction"]),
                 # Calibrated P(≥1 hotspot within the risk window) — the
@@ -840,14 +954,17 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
     # densified daily frame. Lets the dashboard show "model called this
     # cell to fire 3 days ago — did it actually burn?" at a glance.
     if daily_df is not None:
-        validation_summary = _revalidate_predictions(geojson["features"], daily_df)
+        validation_summary = _revalidate_predictions(
+            geojson["features"], daily_df, horizon_days=horizon_days,
+        )
         geojson["metadata"]["validation_summary"] = validation_summary
         if validation_summary.get("hit_rate") is not None:
             print(
-                f"Retrospective validation: {validation_summary['hits']} hits / "
+                f"Strict-target validation (same cell, base+1..base+{horizon_days}): "
+                f"{validation_summary['hits']} hits / "
                 f"{validation_summary['hits'] + validation_summary['misses']} validatable "
                 f"= {validation_summary['hit_rate']*100:.1f}% hit rate "
-                f"(±1 day window, {validation_summary['future']} still pending)"
+                f"({validation_summary['future']} still pending)"
             )
 
     write_json(geojson, GEOJSON_PATH, indent=2)
@@ -856,7 +973,9 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
         {
             "base_date": base_date_str,
             "observed_date": observed_date_str,
-            "prediction_horizon_days": MAX_PREDICTION_DAYS,
+            "horizon_days": horizon_days,
+            "risk_window_start": risk_window_start,
+            "risk_window_end": risk_window_end,
             "urgency_thresholds": thresholds,
             "metrics": metrics,
         },

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchNotifyLog, postNotify } from "../api";
+import { localIsoDate } from "../utils/dates";
 import { fmtTr, useLang } from "../utils/i18n";
-import { readProbability } from "../utils/probability";
+import { formatProbabilityPercent, readProbability } from "../utils/probability";
 import type {
   FireFeature,
   NotifyChannel,
@@ -18,7 +19,7 @@ interface Props {
 // Alert Dispatch page
 //
 // Operator workflow:
-//   1. Lands on /web/#notify → table auto-loads CRITICAL + HIGH cells
+//   1. Lands on /#notify → table defaults to actionable HIGH + WATCH cells
 //   2. Selects rows (single or multi) → right drawer opens with the cells
 //   3. Picks channel + template + recipients → preview renders
 //   4. Clicks "ส่งการแจ้งเตือน" → confirmation modal → POST /api/notify
@@ -44,40 +45,53 @@ const URGENCY_COLOR: Record<UrgencyLevel, string> = {
   NONE:     "#6b7280",
 };
 
+function isActionableUrgency(urgency: UrgencyLevel): boolean {
+  return urgency === "CRITICAL" ||
+    urgency === "HIGH" ||
+    urgency === "MEDIUM";
+}
+
+function displayTier(urgency: UrgencyLevel): string {
+  if (urgency === "MEDIUM") return "WATCH";
+  if (urgency === "LOW" || urgency === "NONE") return "BACKGROUND";
+  return urgency;
+}
+
 interface AlertRow {
   id: string;            // base_date|lat|lon
   lat: number;
   lon: number;
   province: string;
   urgency: UrgencyLevel;
-  daysUntilFire: number;
   fireCount30d: number;
   baseDate: string;
-  predictedDate: string;
   probability: number | null;
 }
 
+// Templates speak in the model's real terms: a calibrated probability of a
+// hotspot within the next 3-day risk window — NEVER an exact predicted date or
+// "fire in N days". {prob} = calibrated probability %, {tier} = risk tier.
 const TEMPLATES = [
   {
     id: "critical",
     label: "Critical (วิกฤต)",
     body:
-      "🔥 [CRITICAL] พื้นที่ {province} ({lat},{lon}) มีความเสี่ยงไฟป่าสูงมาก " +
-      "ทำนายจะเกิดภายใน {days} วัน กรุณาเตรียมพร้อมรับมือทันที",
+      "🔥 [{tier}] พื้นที่ {province} ({lat},{lon}) มีความเสี่ยงมีจุดไฟสูง " +
+      "(ความน่าจะเป็น {prob} ภายใน 3 วันข้างหน้า) กรุณาเฝ้าระวังและตรวจสอบพื้นที่",
   },
   {
     id: "high",
     label: "High Alert (เสี่ยงสูง)",
     body:
-      "⚠️ [HIGH] ตรวจพบความเสี่ยงไฟป่าระดับสูงที่ {province} ภายใน {days} วัน " +
-      "โปรดติดตามสถานการณ์",
+      "⚠️ [{tier}] ความเสี่ยงมีจุดไฟที่ {province} — ความน่าจะเป็น {prob} " +
+      "ภายใน 3 วันข้างหน้า โปรดติดตามสถานการณ์",
   },
   {
     id: "summary",
     label: "Daily Summary (รายงานประจำวัน)",
     body:
-      "📊 รายงานประจำวัน: CRITICAL {critical_count} จุด, HIGH {high_count} จุด, " +
-      "อัปเดต {date}",
+      "📊 รายงานประจำวัน (ความเสี่ยงภายใน 3 วันข้างหน้า): HIGH {critical_count} จุด, " +
+      "WATCH {high_count} จุด, อัปเดต {date}",
   },
 ] as const;
 
@@ -99,15 +113,20 @@ function renderTemplate(
   ctx: { row?: AlertRow; rows: AlertRow[]; today: string }
 ): string {
   const first = ctx.row ?? ctx.rows[0];
-  const criticalCount = ctx.rows.filter((r) => r.urgency === "CRITICAL").length;
+  // HIGH tier = urgency HIGH; WATCH tier = urgency MEDIUM (the WATCH alias).
   const highCount = ctx.rows.filter((r) => r.urgency === "HIGH").length;
+  const watchCount = ctx.rows.filter((r) => r.urgency === "MEDIUM").length;
+  const probPct = first && first.probability != null
+    ? formatProbabilityPercent(first.probability) : "—";
+  const tierLabel = first ? displayTier(first.urgency) : "—";
   return body
     .replace(/{province}/g, first?.province ?? "—")
     .replace(/{lat}/g, first?.lat?.toFixed(3) ?? "—")
     .replace(/{lon}/g, first?.lon?.toFixed(3) ?? "—")
-    .replace(/{days}/g, String(first?.daysUntilFire ?? "—"))
-    .replace(/{critical_count}/g, String(criticalCount))
-    .replace(/{high_count}/g, String(highCount))
+    .replace(/{prob}/g, probPct)
+    .replace(/{tier}/g, tierLabel)
+    .replace(/{critical_count}/g, String(highCount))
+    .replace(/{high_count}/g, String(watchCount))
     .replace(/{date}/g, ctx.today);
 }
 
@@ -137,17 +156,16 @@ function extractAlertRows(features: FireFeature[]): AlertRow[] {
       lon,
       province: p.province ?? "—",
       urgency: (p.urgency_level ?? "NONE") as UrgencyLevel,
-      daysUntilFire: p.days_until_fire ?? 0,
       fireCount30d: p.historical_fire_count_30d ?? 0,
       baseDate: latest,
-      predictedDate: p.predicted_fire_date ?? "—",
       probability: prob,
     });
   }
   return rows;
 }
 
-type SortKey = "urgency" | "days" | "fire30" | "province" | "prob";
+type SortKey = "urgency" | "fire30" | "province" | "prob";
+type UrgencyFilter = UrgencyLevel | "ALL" | "ACTIONABLE";
 
 export default function NotifyPage({ predictedAll }: Props) {
   const { t } = useLang();
@@ -166,7 +184,8 @@ export default function NotifyPage({ predictedAll }: Props) {
   const allRows = useMemo(() => extractAlertRows(predictedAll), [predictedAll]);
 
   // ── Filters / sort ──
-  const [urgencyFilter, setUrgencyFilter] = useState<UrgencyLevel | "ALL">("ALL");
+  const [urgencyFilter, setUrgencyFilter] =
+    useState<UrgencyFilter>("ACTIONABLE");
   const [provinceFilter, setProvinceFilter] = useState<string>("ALL");
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("urgency");
@@ -196,11 +215,6 @@ export default function NotifyPage({ predictedAll }: Props) {
   const [logFromDate, setLogFromDate] = useState("");
   const [logToDate, setLogToDate] = useState("");
 
-  // Auto-default urgency filter to CRITICAL+HIGH on first load (most useful)
-  useEffect(() => {
-    setUrgencyFilter("ALL");
-  }, []);
-
   // Fetch log on mount + after each send
   const reloadLog = async () => {
     setLogLoading(true);
@@ -228,7 +242,9 @@ export default function NotifyPage({ predictedAll }: Props) {
   // Filtered + sorted rows
   const rows = useMemo(() => {
     let r = allRows;
-    if (urgencyFilter !== "ALL") {
+    if (urgencyFilter === "ACTIONABLE") {
+      r = r.filter((row) => isActionableUrgency(row.urgency));
+    } else if (urgencyFilter !== "ALL") {
       r = r.filter((row) => row.urgency === urgencyFilter);
     }
     if (provinceFilter !== "ALL") {
@@ -245,7 +261,6 @@ export default function NotifyPage({ predictedAll }: Props) {
       let cmp = 0;
       switch (sortKey) {
         case "urgency": cmp = URGENCY_RANK[a.urgency] - URGENCY_RANK[b.urgency]; break;
-        case "days":    cmp = a.daysUntilFire - b.daysUntilFire; break;
         case "fire30":  cmp = a.fireCount30d - b.fireCount30d; break;
         case "province": cmp = a.province.localeCompare(b.province); break;
         case "prob":    cmp = (a.probability ?? 0) - (b.probability ?? 0); break;
@@ -264,16 +279,27 @@ export default function NotifyPage({ predictedAll }: Props) {
 
   // ── Selected rows for drawer ──
   const selectedRows = useMemo(
-    () => rows.filter((r) => selected.has(r.id)),
-    [rows, selected]
+    () => allRows.filter((r) => selected.has(r.id)),
+    [allRows, selected]
   );
+
+  // Drop selections that no longer exist after a fresh prediction snapshot.
+  useEffect(() => {
+    const validIds = new Set(allRows.map((row) => row.id));
+    setSelected((current) => {
+      const next = new Set([...current].filter((id) => validIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [allRows]);
 
   // ── Open drawer when clicking a single row ──
   const openDrawerForRow = (row: AlertRow) => {
     setSelected(new Set([row.id]));
     // Auto-pick template based on urgency
     if (row.urgency === "CRITICAL") setTemplateId("critical");
-    else if (row.urgency === "HIGH") setTemplateId("high");
+    else if (row.urgency === "HIGH" || row.urgency === "MEDIUM") {
+      setTemplateId("high");
+    }
     setDrawerOpen(true);
   };
 
@@ -297,7 +323,7 @@ export default function NotifyPage({ predictedAll }: Props) {
   };
 
   // ── Send flow ──
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localIsoDate();
   const tmpl = TEMPLATES.find((t) => t.id === templateId) ?? TEMPLATES[0];
   const previewMessage =
     selectedRows.length === 1
@@ -344,7 +370,16 @@ export default function NotifyPage({ predictedAll }: Props) {
       if (logToDate && t > `${logToDate}T23:59:59`) return false;
       return true;
     });
-    const headers = ["timestamp", "channel", "recipients_count", "zone_ids_count", "priority", "template", "status", "message_preview"];
+    const headers = [
+      "timestamp",
+      "channel",
+      "recipients_count",
+      "zone_ids_count",
+      "priority",
+      "template",
+      "status",
+      "message_length",
+    ];
     const csv = [
       headers.join(","),
       ...filtered.map((r) =>
@@ -361,12 +396,22 @@ export default function NotifyPage({ predictedAll }: Props) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `notify_log_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `notify_log_${localIsoDate()}.csv`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
+
+  const filteredLog = useMemo(
+    () => log.filter((record) => {
+      const timestamp = record.timestamp;
+      if (logFromDate && timestamp < logFromDate) return false;
+      if (logToDate && timestamp > `${logToDate}T23:59:59`) return false;
+      return true;
+    }),
+    [log, logFromDate, logToDate],
+  );
 
   // ── Keyboard: Escape closes drawer/modal ──
   useEffect(() => {
@@ -390,11 +435,22 @@ export default function NotifyPage({ predictedAll }: Props) {
     <div className="notify-page">
       <header className="notify-page-header">
         <div>
-          <h1>🔔 Alert Dispatch</h1>
+          <h1>{t("page.notify.title")}</h1>
           <p className="notify-page-subtitle">
             {t("notify.subtitle")} {t("notify.stub_note")}
           </p>
         </div>
+        <button
+          type="button"
+          className="action-btn primary"
+          onClick={() => {
+            setSelected(new Set());
+            setTemplateId("summary");
+            setDrawerOpen(true);
+          }}
+        >
+          {t("notify.daily_summary")}
+        </button>
       </header>
 
       {/* Counts strip */}
@@ -407,7 +463,9 @@ export default function NotifyPage({ predictedAll }: Props) {
             onClick={() => setUrgencyFilter(urgencyFilter === u ? "ALL" : u)}
             style={{ borderLeftColor: URGENCY_COLOR[u] }}
           >
-            <div className="alert-count-label" style={{ color: URGENCY_COLOR[u] }}>{u}</div>
+            <div className="alert-count-label" style={{ color: URGENCY_COLOR[u] }}>
+              {displayTier(u)}
+            </div>
             <div className="alert-count-value">{counts[u]}</div>
           </button>
         ))}
@@ -417,14 +475,15 @@ export default function NotifyPage({ predictedAll }: Props) {
       <div className="alert-filters">
         <select
           value={urgencyFilter}
-          onChange={(e) => setUrgencyFilter(e.target.value as UrgencyLevel | "ALL")}
+          onChange={(e) => setUrgencyFilter(e.target.value as UrgencyFilter)}
           aria-label="Urgency filter"
         >
+          <option value="ACTIONABLE">{t("notify.filter.actionable")}</option>
           <option value="ALL">{t("notify.filter.all_urgency")}</option>
           <option value="CRITICAL">CRITICAL</option>
           <option value="HIGH">HIGH</option>
-          <option value="MEDIUM">MEDIUM</option>
-          <option value="LOW">LOW</option>
+          <option value="MEDIUM">WATCH</option>
+          <option value="LOW">BACKGROUND</option>
         </select>
         <select
           value={provinceFilter}
@@ -469,25 +528,36 @@ export default function NotifyPage({ predictedAll }: Props) {
                 <th style={{ width: 32 }}>
                   <input
                     type="checkbox"
-                    checked={rows.length > 0 && rows.every((r) => selected.has(r.id))}
+                    checked={
+                      rows.some((r) => isActionableUrgency(r.urgency)) &&
+                      rows
+                        .filter((r) => isActionableUrgency(r.urgency))
+                        .every((r) => selected.has(r.id))
+                    }
                     onChange={(e) => {
-                      if (e.target.checked) setSelected(new Set([...selected, ...rows.map((r) => r.id)]));
+                      const actionableRows = rows.filter((r) =>
+                        isActionableUrgency(r.urgency)
+                      );
+                      if (e.target.checked) {
+                        setSelected(new Set([
+                          ...selected,
+                          ...actionableRows.map((r) => r.id),
+                        ]));
+                      }
                       else {
                         const next = new Set(selected);
-                        for (const r of rows) next.delete(r.id);
+                        for (const r of actionableRows) next.delete(r.id);
                         setSelected(next);
                       }
                     }}
-                    aria-label="Select all"
+                    aria-label={t("notify.select_all_actionable")}
                   />
                 </th>
                 <Th label="Urgency" sortKey="urgency" current={sortKey} dir={sortDir} onSort={onSort} />
                 <Th label="Province" sortKey="province" current={sortKey} dir={sortDir} onSort={onSort} />
                 <th>Location</th>
-                <Th label="Days" sortKey="days" current={sortKey} dir={sortDir} onSort={onSort} />
-                <Th label="Prob" sortKey="prob" current={sortKey} dir={sortDir} onSort={onSort} />
+                <Th label="Risk % (≤3d)" sortKey="prob" current={sortKey} dir={sortDir} onSort={onSort} />
                 <Th label="Fires 30d" sortKey="fire30" current={sortKey} dir={sortDir} onSort={onSort} />
-                <th>Predicted date</th>
                 <th></th>
               </tr>
             </thead>
@@ -500,13 +570,18 @@ export default function NotifyPage({ predictedAll }: Props) {
                       <input
                         type="checkbox"
                         checked={isSel}
+                        disabled={!isActionableUrgency(r.urgency)}
                         onChange={(e) => {
                           const next = new Set(selected);
                           if (e.target.checked) next.add(r.id);
                           else next.delete(r.id);
                           setSelected(next);
                         }}
-                        aria-label={`Select ${r.province}`}
+                        aria-label={
+                          isActionableUrgency(r.urgency)
+                            ? `Select ${r.province}`
+                            : t("notify.background.not_actionable")
+                        }
                       />
                     </td>
                     <td data-label="Urgency">
@@ -514,25 +589,31 @@ export default function NotifyPage({ predictedAll }: Props) {
                         className="urgency-pill"
                         style={{ background: URGENCY_COLOR[r.urgency] + "22", color: URGENCY_COLOR[r.urgency] }}
                       >
-                        {r.urgency}
+                        {displayTier(r.urgency)}
                       </span>
                     </td>
                     <td data-label="Province">{r.province}</td>
                     <td className="mono" data-label="Location">{r.lat.toFixed(3)}, {r.lon.toFixed(3)}</td>
-                    <td className="mono" data-label="Days">{r.daysUntilFire}</td>
-                    <td className="mono" data-label="Prob">
-                      {r.probability != null ? `${(r.probability * 100).toFixed(0)}%` : "—"}
+                    <td className="mono" data-label="Risk % (≤3d)">
+                      {formatProbabilityPercent(r.probability)}
                     </td>
                     <td className="mono" data-label="Fires 30d">{r.fireCount30d}</td>
-                    <td className="mono" data-label="Predicted">{r.predictedDate}</td>
                     <td data-label="">
                       <button
                         type="button"
                         className="action-btn"
                         style={{ padding: "4px 8px", fontSize: 11 }}
                         onClick={() => openDrawerForRow(r)}
+                        disabled={!isActionableUrgency(r.urgency)}
+                        title={
+                          isActionableUrgency(r.urgency)
+                            ? t("notify.row.prepare")
+                            : t("notify.background.not_actionable")
+                        }
                       >
-                        Notify →
+                        {isActionableUrgency(r.urgency)
+                          ? t("notify.row.prepare")
+                          : t("notify.row.monitor_only")}
                       </button>
                     </td>
                   </tr>
@@ -572,8 +653,9 @@ export default function NotifyPage({ predictedAll }: Props) {
       {/* Send drawer */}
       <div
         className={`send-drawer ${drawerOpen ? "open" : ""}`}
-        role="dialog"
-        aria-modal="true"
+        role={drawerOpen ? "dialog" : undefined}
+        aria-modal={drawerOpen ? "true" : undefined}
+        aria-hidden={!drawerOpen}
         aria-label="Send alert"
       >
         <div className="send-drawer-header">
@@ -807,11 +889,20 @@ export default function NotifyPage({ predictedAll }: Props) {
           <div className="call-log-body">
             {logError ? (
               <div className="error-banner" role="alert">⚠️ {logError}</div>
+            ) : logLoading && log.length === 0 ? (
+              <div className="empty-state" style={{ padding: 20 }} role="status">
+                <div className="empty-title">{t("notify.log.loading")}</div>
+              </div>
             ) : log.length === 0 ? (
               <div className="empty-state" style={{ padding: 20 }}>
                 <div className="empty-icon">📭</div>
                 <div className="empty-title">{t("notify.log.empty.title")}</div>
                 <div className="empty-hint">{t("notify.log.empty.hint")}</div>
+              </div>
+            ) : filteredLog.length === 0 ? (
+              <div className="empty-state" style={{ padding: 20 }}>
+                <div className="empty-title">{t("notify.log.filtered_empty")}</div>
+                <div className="empty-hint">{t("notify.log.filtered_empty.hint")}</div>
               </div>
             ) : (
               <table className="log-table">
@@ -828,14 +919,23 @@ export default function NotifyPage({ predictedAll }: Props) {
                   </tr>
                 </thead>
                 <tbody>
-                  {log
-                    .filter((r) => {
-                      const t = r.timestamp;
-                      if (logFromDate && t < logFromDate) return false;
-                      if (logToDate && t > `${logToDate}T23:59:59`) return false;
-                      return true;
-                    })
-                    .map((r) => (
+                  {filteredLog.map((r) => {
+                    const normalizedStatus = r.status.toLowerCase();
+                    const statusTone =
+                      normalizedStatus === "delivered" ||
+                      normalizedStatus === "sent"
+                        ? "good"
+                        : normalizedStatus === "failed" ||
+                            normalizedStatus === "error"
+                          ? "bad"
+                          : "ok";
+                    const statusIcon =
+                      statusTone === "good"
+                        ? "✓"
+                        : statusTone === "bad"
+                          ? "⚠"
+                          : "⏳";
+                    return (
                       <tr key={r.id}>
                         <td className="mono">{new Date(r.timestamp).toLocaleString()}</td>
                         <td>{r.channel}</td>
@@ -854,13 +954,25 @@ export default function NotifyPage({ predictedAll }: Props) {
                         <td className="mono">{r.zone_ids_count}</td>
                         <td>{r.template ?? "—"}</td>
                         <td>
-                          <span className="status-badge good" style={{ padding: "2px 6px", fontSize: 10 }}>
-                            ✓ {r.status}
+                          <span className={`status-badge ${statusTone}`} style={{ padding: "2px 6px", fontSize: 10 }}>
+                            {statusIcon} {r.status}
                           </span>
                         </td>
-                        <td className="log-message">{r.message_preview}</td>
+                        <td className="log-message">
+                          {r.message_preview ??
+                            (typeof r.message_length === "number"
+                              ? fmtTr(
+                                  t(
+                                    "notify.log.message_not_stored",
+                                    "Content not stored · {count} characters",
+                                  ),
+                                  { count: r.message_length },
+                                )
+                              : "—")}
+                        </td>
                       </tr>
-                    ))}
+                    );
+                  })}
                 </tbody>
               </table>
             )}
@@ -887,6 +999,12 @@ function Th({ label, sortKey, current, dir, onSort }: ThProps) {
       role="button"
       tabIndex={0}
       aria-sort={isCur ? (dir === "asc" ? "ascending" : "descending") : "none"}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSort(sortKey);
+        }
+      }}
     >
       {label}
       {isCur && <span className="sort-arrow">{dir === "asc" ? "▲" : "▼"}</span>}

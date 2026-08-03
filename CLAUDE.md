@@ -67,7 +67,8 @@ There is no Python test suite, linter, or build step.
 | File | Role |
 |---|---|
 | `fetch_firms.py` | Pulls VIIRS NRT hotspots from NASA FIRMS with retry/backoff. Accumulative parquet. |
-| `fetch_weather.py` | Real ERA5 daily aggregates from Open-Meteo Archive. Idempotent, checkpoints, retries failed batches. Optional quiet-hours wait window. |
+| `fetch_weather.py` | Real ERA5 daily aggregates from Open-Meteo Archive. Idempotent, checkpoints, retries failed batches. Optional quiet-hours wait window. Fetches at ERA5-native 0.25° (collapses ~6 grid cells per API coordinate — free-tier quota is priced per coordinate × time). |
+| `fetch_weather_cds.py` | Bulk ERA5 backfill via Copernicus CDS (needs free account + `~/.cdsapirc` + `pip install cdsapi xarray netcdf4`). Whole-bbox NetCDF per (variable, statistic, year) → same cache schema/units as fetch_weather.py; ET0 computed with FAO-56 from real ERA5 fields; never overwrites existing cache rows. Use for multi-year history; use fetch_weather.py for daily top-ups. |
 | `fetch_treecover.py` | Hansen GFC `treecover2000` + `lossyear` rasters → per-cell 0.1° aggregates. |
 | `fetch_gistda_*.py` | GISTDA hotspots / LULC. Not wired into training yet. |
 | `io_utils.py` | Format-agnostic table I/O — dispatches on `.csv` ↔ `.parquet`. **Use these instead of `pd.read_csv` / `pd.to_csv`** so files stay swappable. |
@@ -75,10 +76,13 @@ There is no Python test suite, linter, or build step.
 | `urban_areas.py` | Curated ~40 Thai urban centers with hand-tuned exclusion radii. Used at training (drop hotspots) and inference (drop predictions + annotate nearest city). |
 | `thailand_boundary.py` | 77-province GeoJSON merged → `is_in_thailand()` country mask + `find_province()` per-cell annotation. |
 | `features.py` | Lag/rolling/calendar/spatial-neighbor/streak features. Owns `FEATURES_CORE` + `FEATURES_WEATHER`. Every rolling window applies `.shift(1)` BEFORE `.rolling()` (past-only — see `# CAUSAL` comments). |
+| `thresholds.py` | **Reusable, leakage-safe alert-threshold selection** (shared by train.py + rolling_backtest.py). `f1_optimal_threshold` (HIGH), `recall_target_threshold` (WATCH, target `WATCH_TARGET_RECALL`=0.90, optional `WATCH_MIN_PRECISION` guard), `select_operational_thresholds` (HIGH+WATCH+MEDIUM-alias, optional per-month season-matched thresholds with insufficient-positive fallback, full calib metadata), `threshold_metrics` (P/R/F1/alert-rate/confusion), `topk_metrics` (P@K + recall captured), `prevalence_drift`. Chosen on **calib only**; enforces HIGH ≥ WATCH ≥ 0. |
 | `model.py` | **Legacy from the multi-model era.** train.py no longer uses its `select_best` / multi-candidate helpers; the binary classifier path is self-contained in train.py. Kept around because some tools still import `evaluate()` / `EnsembleRegressor`. |
 | `train.py` | End-to-end binary classifier pipeline (see "Training pipeline" below). |
-| `risk_map.py` | Loads model + features, predicts for latest base date, filters (history / urban / country / per-day cap), assigns urgency tiers, writes `outputs/riskmap/fire_dates_all.geojson` (append-mode). |
-| `api.py` | FastAPI: `/predictions/today`, `/predictions/timeline`, `/predictions/day/{n}`, `/predict/location`, `/metrics`, `/geojson`. Mounts `web/dist/` at `/` so SPA + API share port 8000. Starts the automation scheduler in its lifespan (disable with `SCHEDULER_ENABLED=false`). Boots in degraded mode (no crash) when no trained model exists yet. |
+| `inference.py` | **Single source of truth for user-facing model output.** `calibrated_probability()` (Platt-calibrated `predict_proba`), `probability_to_tier()` (High/Watch/Background from persisted `probability_tier_thresholds`), `score_cells()`, `snapshot_context()`. risk_map.py AND the API prediction endpoints score through this so `/predictions/*`, `/predict/location` and `/geojson` can never disagree. Never emits an exact fire date. |
+| `security.py` | Production safety middleware: env-gated CORS allowlist (`configure_security`), in-process per-IP rate limiter, request-ID + structured JSON access logging, security headers + Leaflet/CARTO-compatible CSP. Driven by `APP_ENV` (`production` ⇒ fail-closed). |
+| `risk_map.py` | Loads model + features, predicts for latest base date via `inference.calibrated_probability`, filters (history / urban / country / per-day cap), assigns absolute tiers, writes `outputs/riskmap/fire_dates_all.geojson` (append-mode; metadata carries `latest_data_time` + `generated_at`). |
+| `api.py` | FastAPI. Prediction surfaces (`/predictions/today`, `/predictions/tiers`, `/predict/location`) return calibrated `probability` + `risk_tier` + shared context — **no exact fire date**; degraded model ⇒ stable `503 {"error":"model_unavailable"}`. `/predictions/timeline` + `/predictions/day/{n}` are deprecated (`410`, pseudo-date semantics removed). Split probes: `/health/live` (always 200) + `/health/ready` (503 until model+metadata+fresh GeoJSON). `/api/admin/*` + `/api/notify*` are privileged (`_check_admin`, fail-closed in production); notify stores counts only, never recipients/message. Mounts `web/dist/` at `/`. Boots degraded (no crash) with no model. |
 | `db.py` | PostgreSQL persistence (hotspots / predictions / model runs / fetch log). **Every function is a silent no-op when `DATABASE_URL` is unset** — local dev needs no Postgres. psycopg3 dialect, `ON CONFLICT DO NOTHING` dedupe. |
 | `sync_worker.py` | One sync cycle: fetch FIRMS → detect new rows (parquet delta + DB rowcount) → if new, subprocess `train.py --predict-only` → always write `fetch_log`. Never raises. |
 | `scheduler.py` | APScheduler wiring: `sync_job` every `SYNC_INTERVAL_MINUTES` (10), `retrain_check_job` every 6 h retrains when the model is older than `RETRAIN_EVERY_DAYS` (3). Restart-safe (compares persisted timestamps, not interval clocks). `outputs/.train.lock` guards train vs. predict overlap. |
@@ -121,13 +125,23 @@ firms_all.parquet                      lag/roll)                    ▼
 10. **Persist** — model pkl + history + `dataset_info.json` (includes an `evaluation_protocol` audit block: split ranges, purge, prevalences, censored rows, what was selected where) + PNG report.
 11. **risk_map.run()** refreshes the GeoJSON.
 
-Protocol invariants are tested: `cd src && python tests/test_eval_protocol.py` (split disjointness, purge width, tail censoring, natural prevalence outside train, calibration independence).
+**Run the complete test suite** (protocol invariants, GISTDA pipeline, sync versioning, model promotion): `cd src && ../.venv/bin/python -m pytest tests -q`. All external APIs are mocked; no network or PostgreSQL needed.
+
+### Model artifact = single pickle bundle + quality gates
+
+`lgbm_fire_date_model.pkl` is a **bundle-v1** pickle `{"format": "bundle-v1", "model": _EnsembleRegressor, "metadata": {...}}` — model and feature contract travel together so one `os.replace()` promotes both atomically (the old two-file scheme tore on a mid-write kill, pairing a new model with a stale feature list). `dataset_info.json` is still written for the frontend but loaders prefer the bundle's embedded metadata. Legacy bare-model pkls still load.
+
+Training does **not** automatically replace the trusted model. `train.py` STEP 9b gates: test AUC ≥ `MODEL_GATE_MIN_AUC` (0.65), test PR-AUC ≥ `MODEL_GATE_MIN_AP_UPLIFT`× prevalence (1.5), and head-to-head vs the incumbent **on the same untouched test period** when feature contracts match (reject if AUC drop > `MODEL_GATE_MAX_AUC_DROP`). Rejected candidates land in `models/rejected/`; the incumbent + its risk map keep serving. On promotion the incumbent is kept at `models/previous.pkl` (rollback) and the scheduler fires a callback that **hot-reloads** the running API (`api.reload_model_state`; manual lever: `POST /api/admin/reload-model`). A failed reload keeps the previous in-memory model.
+
+### Sync = input-versioned, prediction-only, idempotent
+
+`sync_worker.run_sync()` computes a deterministic input version (latest FIRMS acq time | row count | weather mtime | schema tag). Unchanged version ⇒ **no-op**. Changed ⇒ **exactly one** `train.py --predict-only` subprocess, guarded by a PostgreSQL advisory lock (replicas can't double-predict) and recorded in `prediction_runs`. GISTDA polling is a separate job and **never triggers prediction** — the model has no GISTDA features, so a GISTDA-only change would re-produce an identical snapshot. Prediction failure ⇒ version not remembered (next cycle retries) and the last snapshot keeps serving.
 
 ### `_EnsembleRegressor` — the inference contract risk_map.py and api.py rely on
 
 The ensemble class in train.py is named `_EnsembleRegressor` for historical reasons; it wraps **binary classifiers**.
 
-- `predict_proba(X)` → 1-D `np.array` of **calibrated** `P(fire in next 3 days)` (raw ensemble mean → Platt calibrator fit on the calib split). This is the model's real output and what risk_map uses for tiers, ranking, and display.
+- `predict_proba(X)` → 1-D `np.array` of **calibrated** `P(fire in next 3 days)` (raw ensemble mean → a persisted Platt or isotonic calibrator fit on the calib split). This is the model's real output and what risk_map uses for tiers, ranking, and display. Legacy Platt bundles remain pickle-compatible.
 - `predict(X)` → 1-D pseudo-days via `_prob_to_days_for_compat` — monotone-in-probability **display scaffolding only** (the day-selector buckets). The binary target cannot resolve day-of-fire; never present these as date forecasts.
 - `feature_importances_` → averaged across ensemble.
 
@@ -150,8 +164,8 @@ The label `days_until_fire` is computed strictly from FUTURE rows, so any featur
 
 ### Feature contract
 
-- `FEATURES_CORE` (~134 cols) — always present.
-- `FEATURES_WEATHER` (~30 cols) — only emitted when ERA5 weather is present in the daily frame. Auto-dropped at training time when coverage falls below `MIN_WEATHER_COVERAGE` (default 20%) — sparse weather is more harmful than absent weather.
+- `FEATURES_CORE` (~135 cols) — always present (including archive-era satellite coverage).
+- `FEATURES_WEATHER` (~37 cols: 30 daily/lag/roll + 7 causal drought signals) — only emitted when ERA5 weather is present in the daily frame. Auto-dropped at training time when coverage falls below `MIN_WEATHER_COVERAGE` (default 20%) — sparse weather is more harmful than absent weather.
 - `resolve_features(df)` → subset actually present.
 - **`dataset_info.json["features"]` is the persisted contract** — risk_map.py / api.py prefer this list at runtime. Don't hardcode feature lists in those files.
 
@@ -159,7 +173,15 @@ If you add or remove features, delete `outputs/models/*.pkl` before retraining o
 
 ### Urgency tiers + risk_map filtering
 
-Tiers use **absolute calibrated-probability cutoffs** from `dataset_info.json["probability_tier_thresholds"]`, selected on the calib split at training time (HIGH = deployment threshold, MEDIUM = ≥85%-recall threshold). A genuinely low-risk day shows zero HIGH cells. Fallbacks, in order: legacy artifacts without persisted cutoffs get per-snapshot percentile **priority ranking** (explicitly labelled relative, not absolute risk); tiny snapshots (<10 cells) get fixed-domain days thresholds.
+Tiers use **absolute calibrated-probability cutoffs** from `dataset_info.json["probability_tier_thresholds"]`, selected on the calib split at training time via `thresholds.select_operational_thresholds` (never on test):
+
+- **HIGH** = F1-optimal cutoff → **urgent alert** (precision-oriented).
+- **WATCH** = lowest cutoff catching ≥ `WATCH_TARGET_RECALL` (default 0.90) of calibration fires → **monitoring list** (recall-oriented; expect more false positives). `MEDIUM` is a persisted **compatibility alias of WATCH**.
+- **LOW** = 0.0 → no operational alert.
+
+The two-threshold split exists because of **base-rate drift**: a single F1-optimal threshold picked on a high-prevalence calibration window collapses to ~13% recall on a low-prevalence test window. WATCH is robust to that; HIGH keeps precision. Training persists a **base-rate drift flag** (`test_metrics.prevalence_drift`: calib vs recent prevalence, ratio, `drift_flag`) surfaced in `/metrics`, the GeoJSON metadata, and a dashboard warning banner. Never force a fixed % of cells into HIGH — a genuinely low-risk day shows zero HIGH cells. Top-K rankings (`precision_at_top_K` / `recall_captured_top_K`) are **relative priority**, reported separately from the absolute tiers. Fallbacks: legacy artifacts without persisted cutoffs get per-snapshot percentile **priority ranking** (labelled relative); tiny snapshots (<10 cells) get fixed-domain days thresholds.
+
+**Activation:** the new WATCH cutoff + drift metadata are written by `train.py` — activate with a retrain (`cd src && python train.py`), or validate cross-season behaviour first with `python rolling_backtest.py` (which now shares `thresholds.py`). Existing saved models keep working (HIGH/MEDIUM read as before; WATCH falls back to the MEDIUM alias).
 
 Output semantics: `probability` = calibrated P(≥1 hotspot within 3 days). `days_until_fire` is a probability-rank display bucket; `predicted_fire_date` is the **risk-window end** (base_date + 3d, same for all cells) — the model never claims an exact fire date.
 

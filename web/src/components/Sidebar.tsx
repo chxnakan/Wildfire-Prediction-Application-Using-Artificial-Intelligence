@@ -8,8 +8,10 @@ import type {
   UrgencyThresholds,
   ValidationMetrics,
 } from "../types";
-import { computeFreshness, dateAdd } from "../utils/dates";
+import { calendarDayLag, computeFreshness, formatDataTime } from "../utils/dates";
+import { MIN_COMPARE_RATE_SAMPLE } from "../utils/compareStats";
 import { fmtTr, useLang } from "../utils/i18n";
+import { resolveTierMode } from "../utils/risk";
 import AccuracyHero from "./AccuracyHero";
 import ActionToolbar from "./ActionToolbar";
 import DataSourcesPanel from "./DataSourcesPanel";
@@ -32,6 +34,7 @@ interface SidebarProps {
   onDayChange: (d: DaySelection) => void;
   predicted: FireFeature[]; // for the snapshot — used by timeline + landcover + urgency
   visibleCount: number;
+  hiddenVeryLowCount: number;
   daySelectorMessage: string;
 
   // Urgency / metrics / hit-rate
@@ -58,64 +61,116 @@ interface SidebarProps {
 export default function Sidebar(p: SidebarProps) {
   const { lang, t } = useLang();
   const fresh = computeFreshness(p.activeBaseDate);
-  const isQuantileFallback = !!p.thresholds && Number(p.thresholds.CRITICAL) > 0;
-  const dateLocale = lang === "th" ? "th-TH" : "en-GB";
-  // Day-offset → human label. Uses the i18n dictionary for the first three
-  // offsets and "+N days" for the rest, with locale-appropriate date format.
-  const dayLabel = (d: number): string => {
-    if (d === 0) return t("sidebar.daypicker.today");
-    if (d === 1) return t("sidebar.daypicker.tomorrow");
-    if (d === 2) return t("sidebar.daypicker.dayafter");
-    return fmtTr(t("sidebar.daypicker.inNdays"), { n: d });
-  };
-  const fmtShortDate = (dateStr: string): string => {
-    try {
-      return new Date(dateStr).toLocaleDateString(dateLocale, { day: "numeric", month: "short" });
-    } catch { return dateStr; }
-  };
-
-  // Day counts for timeline + day selector hide-empty logic.
-  const dayCounts: Record<number, number> = {};
-  for (let i = 0; i <= 7; i++) dayCounts[i] = 0;
-  for (const f of p.predicted) {
-    const d = f.properties.days_until_fire;
-    if (d != null && d >= 0 && d <= 7) dayCounts[d]++;
-  }
-
+  // Tier-cutoff semantics, from risk_map.py's thresholds_source:
+  //   absolute — calibrated-probability cutoffs selected on the calib split
+  //   relative — percentile ranks of this snapshot (legacy artifact fallback)
+  //   days     — legacy fixed-domain days cutoffs
+  // Probability-style thresholds are 0..1 (CRITICAL uses a >1 "unused"
+  // sentinel); days thresholds are 0..7.
+  const tierMode = resolveTierMode(
+    p.thresholds,
+    p.metadata?.thresholds_source,
+  );
   const urgencyCounts: Record<UrgencyLevel, number> = {
     CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0, NONE: 0,
   };
-  let forest = 0, mixed = 0, open = 0;
+  let forest = 0, mixed = 0, open = 0, landcoverDataCount = 0;
   for (const f of p.predicted) {
     const u = f.properties.urgency_level;
-    if (u && u in urgencyCounts) urgencyCounts[u]++;
+    if (u && Object.prototype.hasOwnProperty.call(urgencyCounts, u)) {
+      urgencyCounts[u]++;
+    }
     const c = f.properties.tree_cover_pct_2000;
-    if (c != null) {
+    if (typeof c === "number" && Number.isFinite(c)) {
+      landcoverDataCount++;
       if (c >= 50) forest++;
       else if (c >= 10) mixed++;
       else open++;
     }
   }
+  const isLowRiskSnapshot =
+    tierMode === "absolute" &&
+    urgencyCounts.CRITICAL === 0 &&
+    urgencyCounts.HIGH === 0 &&
+    urgencyCounts.MEDIUM === 0 &&
+    urgencyCounts.LOW > 0 &&
+    urgencyCounts.NONE === 0;
+  const criticalEnabled =
+    urgencyCounts.CRITICAL > 0 ||
+    tierMode === "days" ||
+    (
+      typeof p.thresholds?.CRITICAL === "number" &&
+      p.thresholds.CRITICAL <= 1
+    );
 
-  const fmtRange = (v: number | undefined) =>
-    v == null ? "≤ —" : `≤ ${Number(v).toFixed(1)} d`;
+  const fmtRange = (v: number | undefined) => {
+    if (v == null || !Number.isFinite(Number(v))) return "—";
+    if (tierMode !== "days") {
+      // Probability cutoffs; >1 is the "tier unused" sentinel.
+      return Number(v) > 1 ? "not used" : `≥ ${(Number(v) * 100).toFixed(2)}%`;
+    }
+    return `≤ ${Number(v).toFixed(1)} d`;
+  };
+  const highLegend = fmtTr(t("tier.high.desc"), {
+    threshold: fmtRange(p.thresholds?.HIGH),
+  });
+  const watchRecall = p.metrics?.watch_test_metrics?.recall;
+  const watchLegend = fmtTr(t(
+    typeof watchRecall === "number" && isFinite(watchRecall)
+      ? "tier.watch.desc.with_recall"
+      : "tier.watch.desc"
+  ), {
+    threshold: fmtRange(p.thresholds?.MEDIUM),
+    recall:
+      typeof watchRecall === "number" && isFinite(watchRecall)
+        ? `${(watchRecall * 100).toFixed(1)}%`
+        : "",
+  });
+  const prevalenceDrift = p.metrics?.prevalence_drift;
+  const finiteFixed = (
+    value: number | null | undefined,
+    digits: number,
+    multiplier = 1,
+  ) =>
+    typeof value === "number" && Number.isFinite(value)
+      ? (value * multiplier).toFixed(digits)
+      : "—";
 
   return (
     <div id="sidebar">
       <div className="header">
-        <h1>🔥 Fire Date Predictor</h1>
-        <p className="subtitle">NASA FIRMS · real-data wildfire forecasting</p>
+        <h1>{t("sidebar.brand.title")}</h1>
+        <p className="subtitle">{t("sidebar.brand.subtitle")}</p>
       </div>
 
       {/* Layer toggles — top of sidebar for quick access */}
       <LayerPills
         options={p.options}
         liveFireMeta={p.liveFireMeta}
+        hiddenVeryLowCount={p.hiddenVeryLowCount}
         onChange={p.onOptionsChange}
       />
 
       {/* Quick stats — at-a-glance Critical / High / Total */}
-      <QuickStats urgencyCounts={urgencyCounts} visibleCount={p.visibleCount} />
+      <QuickStats
+        urgencyCounts={urgencyCounts}
+        visibleCount={p.visibleCount}
+        criticalEnabled={criticalEnabled}
+      />
+      {isLowRiskSnapshot && (
+        <div className="low-risk-notice" role="status">
+          <span className="low-risk-notice-icon" aria-hidden="true">✓</span>
+          <div>
+            <strong>{t("sidebar.lowrisk.title")}</strong>
+            <span>
+              {fmtTr(t("sidebar.lowrisk.body"), {
+                date: p.activeBaseDate,
+                count: urgencyCounts.LOW,
+              })}
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Base Date */}
       <div className="info-card">
@@ -127,6 +182,14 @@ export default function Sidebar(p: SidebarProps) {
         </div>
         <div className="info-value">{p.activeBaseDate || "Loading..."}</div>
         {fresh && fresh.msg && <div className="info-sub">{fresh.msg}</div>}
+        {(() => {
+          const dataTime = formatDataTime(p.metadata?.latest_data_time, lang);
+          return dataTime ? (
+            <div className="info-sub" title={p.metadata?.latest_data_time}>
+              🛰 {t("sidebar.datatime.label")}: <strong>{dataTime}</strong>
+            </div>
+          ) : null;
+        })()}
 
         <div className="date-picker-row">
           <label className="date-picker-label" htmlFor="baseDatePicker">
@@ -142,14 +205,16 @@ export default function Sidebar(p: SidebarProps) {
               Latest ({p.allBaseDates[p.allBaseDates.length - 1] ?? "—"})
             </option>
             {[...p.allBaseDates].reverse().map((d) => {
-              const today = new Date();
-              today.setHours(0, 0, 0, 0);
-              const dObj = new Date(d);
-              dObj.setHours(0, 0, 0, 0);
-              const lag = Math.round((today.getTime() - dObj.getTime()) / 86400000);
+              const lag = calendarDayLag(d);
               const isLatest =
                 d === p.allBaseDates[p.allBaseDates.length - 1];
-              const suffix = isLatest ? "newest" : `${lag} d behind today`;
+              const suffix = isLatest
+                ? "newest"
+                : lag == null
+                  ? "invalid date"
+                  : lag < 0
+                    ? `${Math.abs(lag)} d ahead of today`
+                    : `${lag} d behind today`;
               return (
                 <option key={d} value={d}>
                   {d} ({suffix})
@@ -169,7 +234,9 @@ export default function Sidebar(p: SidebarProps) {
             value={p.selectedProvince}
             onChange={(e) => p.onProvinceChange(e.target.value)}
           >
-            <option value="all">All provinces ({p.provinces.length})</option>
+            <option value="all">
+              All available provinces ({p.provinces.length})
+            </option>
             {p.provinces.map((name) => (
               <option key={name} value={name}>
                 {name}
@@ -181,60 +248,60 @@ export default function Sidebar(p: SidebarProps) {
 
       {/* Action toolbar — production actions: export, share, threshold, details */}
       <ActionToolbar
-        predicted={p.predicted}
+        exportCount={
+          p.selectedDay === "all"
+            ? p.predicted.length
+            : p.selectedDay === "High"
+              ? urgencyCounts.HIGH
+              : p.selectedDay === "Watch"
+                ? urgencyCounts.MEDIUM
+                : urgencyCounts.LOW
+        }
+        onExport={p.onExportCsv}
         metrics={p.metrics}
         onShowDetails={p.onShowInfoModal}
         onShowAlertSettings={p.onShowAlertSettings}
-        baseDate={p.activeBaseDate}
       />
 
       {/* Hero Accuracy — multi-card grid; "model is good" metrics first */}
-      <AccuracyHero metrics={p.metrics} onShowDetails={p.onShowInfoModal} />
+      <AccuracyHero
+        metrics={p.metrics}
+        rankingPolicy={p.metadata?.ranking_policy ?? null}
+        onShowDetails={p.onShowInfoModal}
+      />
 
-      {/* Day Selector */}
+      {/* Risk-tier filter — replaces the former day-0..7 pseudo-date buckets.
+          The binary model has no per-day resolution: it reports a calibrated
+          probability of a hotspot within the next 3 days, mapped to tiers. */}
       <div className="section">
-        <h3>📆 {t("sidebar.daypicker.label")}</h3>
+        <h3>🎯 {t("sidebar.tierfilter.label")}</h3>
         <div className="day-selector">
-          <button
-            className={`day-btn ${p.selectedDay === "all" ? "active" : ""}`}
-            onClick={() => p.onDayChange("all")}
-            title={t("sidebar.daypicker.label")}
-          >
-            {t("sidebar.daypicker.all")}
-          </button>
-          {([0, 1, 2, 3, 4, 5, 6, 7] as const).map((d) => {
-            const count = dayCounts[d];
-            const hasData = count > 0;
-            const dateStr = dateAdd(p.activeBaseDate, d);
-            const dateLabel = (() => {
-              if (d <= 2) return dayLabel(d);
-              return fmtShortDate(dateStr);
-            })();
-            const fullDate = fmtShortDate(dateStr);
-            const key = String(d) as DaySelection;
-            const ptsSuffix = t("sidebar.daypicker.points_suffix");
+          {(["all", "High", "Watch", "Background"] as const).map((tier) => {
+            const count =
+              tier === "all" ? p.predicted.length
+              : tier === "High" ? urgencyCounts.HIGH
+              : tier === "Watch" ? urgencyCounts.MEDIUM
+              : urgencyCounts.LOW;
+            const hasData = tier === "all" || count > 0;
+            const label = tier === "all" ? t("sidebar.daypicker.all") : tier;
             return (
               <button
-                key={d}
-                className={`day-btn ${p.selectedDay === key ? "active" : ""}`}
-                onClick={() => hasData && p.onDayChange(key)}
+                key={tier}
+                className={`day-btn ${p.selectedDay === tier ? "active" : ""}`}
+                onClick={() => hasData && p.onDayChange(tier as DaySelection)}
                 disabled={!hasData}
                 style={{
                   flexDirection: "column",
-                  padding: "6px 4px",
+                  padding: "6px 8px",
                   gap: 1,
                   opacity: hasData ? 1 : 0.35,
                   cursor: hasData ? "pointer" : "default",
                 }}
-                title={
-                  hasData
-                    ? `${fullDate} · ${count} ${ptsSuffix}`
-                    : `${fullDate} · no predictions for this day`
-                }
+                title={`${label} · ${count}`}
               >
-                <span style={{ fontSize: 11, fontWeight: 700 }}>{dateLabel}</span>
+                <span style={{ fontSize: 11, fontWeight: 700 }}>{label}</span>
                 <span style={{ fontSize: 9, opacity: 0.7 }}>
-                  {hasData ? `${count} ${ptsSuffix}` : "—"}
+                  {hasData ? count : "—"}
                 </span>
               </button>
             );
@@ -244,51 +311,28 @@ export default function Sidebar(p: SidebarProps) {
           {p.daySelectorMessage}
           <br/>
           <span style={{ fontSize: 10, color: "var(--text-3)" }}>
-            {t("sidebar.range.label")}: {p.activeBaseDate} {t("sidebar.range.to")}: {dateAdd(p.activeBaseDate, 7)}
+            {t("sidebar.tierfilter.hint")}
           </span>
         </div>
-      </div>
-
-      {/* Timeline */}
-      <div className="section">
-        <h3>📅 {t("sidebar.fires7d.title")}</h3>
-        <div id="timeline">
-          {(() => {
-            const items: JSX.Element[] = [];
-            const ptsSuffix = t("sidebar.daypicker.points_suffix");
-            for (let i = 0; i <= 7; i++) {
-              const count = dayCounts[i];
-              if (count === 0) continue;
-              const dateStr = dateAdd(p.activeBaseDate, i);
-              const label = dayLabel(i);
-              const shortDate = fmtShortDate(dateStr);
-              items.push(
-                <div
-                  key={i}
-                  className="timeline-item has-fires"
-                  onClick={() => p.onDayChange(String(i) as DaySelection)}
-                  title={`${dateStr} · ${count} ${ptsSuffix}`}
-                >
-                  <div className="timeline-day">{label}</div>
-                  <div className="timeline-date">{shortDate}</div>
-                  <div className="timeline-count">
-                    {count} {ptsSuffix}
-                  </div>
-                </div>
-              );
-            }
-            if (items.length === 0)
-              items.push(
-                <div key="none" className="timeline-item">
-                  <div className="timeline-day" style={{ opacity: 0.6 }}>
-                    {t("sidebar.fires7d.empty")}
-                  </div>
-                  <div className="timeline-count" style={{ opacity: 0.6 }}>—</div>
-                </div>
-              );
-            return items;
-          })()}
+        {/* WATCH favours recall — it deliberately over-alerts to avoid misses. */}
+        <div className="tier-legend" style={{ fontSize: 10, color: "var(--text-3)", marginTop: 6, lineHeight: 1.5 }}>
+          <div><strong style={{ color: "#ef4444" }}>● {t("tier.high")}</strong> — {highLegend}</div>
+          <div><strong style={{ color: "#f59e0b" }}>● {t("tier.watch")}</strong> — {watchLegend}</div>
         </div>
+        {/* Base-rate drift warning, when the model flags it in metadata. */}
+        {prevalenceDrift?.drift_flag && (
+          <div className="drift-warning" style={{
+            marginTop: 8, padding: "6px 8px", borderRadius: 6, fontSize: 10,
+            background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.4)",
+            color: "var(--text-2)",
+          }}>
+            ⚠️ {fmtTr(t("drift.warning"), {
+              calib: finiteFixed(prevalenceDrift.calib_prevalence, 1, 100),
+              recent: finiteFixed(prevalenceDrift.recent_prevalence, 1, 100),
+              ratio: finiteFixed(prevalenceDrift.ratio, 1),
+            })}
+          </div>
+        )}
       </div>
 
       {/* Urgency */}
@@ -298,15 +342,24 @@ export default function Sidebar(p: SidebarProps) {
           {(["critical", "high", "medium", "low"] as const).map((tier) => {
             const key = tier.toUpperCase() as UrgencyLevel;
             const upper = key as keyof UrgencyThresholds;
-            const tip = {
+            const displayLabel =
+              tier === "medium" ? "WATCH"
+              : tier === "low" ? "BACKGROUND"
+              : tier.toUpperCase();
+            const tip = (tierMode !== "days" ? {
+              critical: "Not produced by the current model — no calibrated CRITICAL cutoff.",
+              high: "Calibrated fire probability at or above the deployment alert threshold. Act first.",
+              medium: "Probability above the WATCH recall-target cutoff — recall-oriented monitoring list (may include false positives).",
+              low: "Below alert cutoffs — background risk, shown for completeness.",
+            } : {
               critical: "Fire predicted within 24 hours of the base date. Triage first.",
               high: "Fire predicted within ~2 days. Watch closely.",
               medium: "Fire predicted within ~4 days. Plan ahead.",
               low: "Fire predicted within the full 7-day horizon. Background risk.",
-            }[tier];
+            })[tier];
             return (
               <div key={tier} className={`urgency-card ${tier}`} title={tip}>
-                <div className="urgency-label">{tier.toUpperCase()}</div>
+                <div className="urgency-label">{displayLabel}</div>
                 <div className="urgency-count">{urgencyCounts[key]}</div>
                 <div className="urgency-desc">
                   {fmtRange(p.thresholds?.[upper])}
@@ -317,12 +370,19 @@ export default function Sidebar(p: SidebarProps) {
         </div>
         <div className="threshold-note">
           {p.thresholds == null
-            ? "No calibrated thresholds in metadata — falling back to legacy 0/2/4/7 cutoffs."
-            : isQuantileFallback ? (
+            ? "Threshold metadata is unavailable. Cells keep their persisted tiers, but numeric cutoffs are not shown."
+            : tierMode === "absolute" ? (
               <>
-                <strong>Quantile mode:</strong> model output too narrow for fixed
-                cutoffs, so tiers are 25/50/75 percentile ranks of this snapshot's
-                raw predictions — relative ordering, not absolute risk.
+                <strong>Absolute risk tiers:</strong> calibrated-probability
+                cutoffs selected on the calibration split at training time —
+                HIGH = deployment threshold; WATCH (= MEDIUM alias) = recall-target cutoff.
+                Zero HIGH cells on a genuinely low-risk day is expected.
+              </>
+            ) : tierMode === "relative" ? (
+              <>
+                <strong>Priority ranking:</strong> percentile ranks of this
+                snapshot only (legacy model artifact without calibrated
+                cutoffs) — relative ordering, not absolute risk.
               </>
             ) : (
               "Fixed-domain cutoffs (CRITICAL=0d, HIGH≤2d, MEDIUM≤4d, LOW≤7d)."
@@ -337,25 +397,32 @@ export default function Sidebar(p: SidebarProps) {
           <div className="landcover-row">
             <span className="landcover-bar forest" />
             <span className="landcover-label">Forest (≥50%)</span>
-            <span className="landcover-count">{forest || "—"}</span>
+            <span className="landcover-count">
+              {landcoverDataCount > 0 ? forest : "—"}
+            </span>
           </div>
           <div className="landcover-row">
             <span className="landcover-bar mixed" />
             <span className="landcover-label">Mixed (10–50%)</span>
-            <span className="landcover-count">{mixed || "—"}</span>
+            <span className="landcover-count">
+              {landcoverDataCount > 0 ? mixed : "—"}
+            </span>
           </div>
           <div className="landcover-row">
             <span className="landcover-bar open" />
             <span className="landcover-label">Open / Grassland (&lt;10%)</span>
-            <span className="landcover-count">{open || "—"}</span>
+            <span className="landcover-count">
+              {landcoverDataCount > 0 ? open : "—"}
+            </span>
           </div>
         </div>
         <div className="landcover-note">
-          Tree cover bucket per cell from Hansen GFC v1.11. Open cells correlate
-          with agricultural-burn signals; forest cells suggest wildfire risk.
+          Tree-cover bucket per cell from Hansen GFC v1.11. This is descriptive
+          context only; it does not identify a fire's cause or distinguish
+          agricultural burning from wildfire.
         </div>
         <button className="export-btn" onClick={p.onExportCsv}>
-          ⬇ Export visible cells (CSV)
+          ⬇ Export selected cells (CSV)
         </button>
       </div>
 
@@ -370,12 +437,12 @@ export default function Sidebar(p: SidebarProps) {
 
       <div className="info-footer">
         <small style={{ display: "block", lineHeight: 1.6 }}>
-          <b>🔥 Thailand Wildfire Imminence Predictor v0.5</b>
+          <b>🔥 FireWatch Thailand · research preview</b>
           <br />
           Open-source · MIT License
           <br />
           <a
-            href="https://github.com/0Maruz/Science-Project-version-3"
+            href="https://github.com/0Maruz/Wildfire-Prediction-Project"
             target="_blank"
             rel="noopener noreferrer"
             style={{ color: "var(--accent)" }}
@@ -383,16 +450,29 @@ export default function Sidebar(p: SidebarProps) {
             🐙 GitHub source
           </a>
           {" · "}
-          <a href="docs/MODEL_CARD.md" style={{ color: "var(--accent)" }}>
+          <a
+            href="https://github.com/0Maruz/Wildfire-Prediction-Project/blob/main/docs/MODEL_CARD.md"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--accent)" }}
+          >
             📋 Model Card
           </a>
           {" · "}
-          <a href="docs/METHODOLOGY.md" style={{ color: "var(--accent)" }}>
+          <a
+            href="https://github.com/0Maruz/Wildfire-Prediction-Project/blob/main/docs/METHODOLOGY.md"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ color: "var(--accent)" }}
+          >
             📐 Methodology
           </a>
           <br />
           <span style={{ color: "var(--text-3)", fontSize: 10 }}>
-            Data: NASA FIRMS + ECMWF ERA5 · No synthetic values · Calibrated (Platt sigmoid)
+            Data provenance is listed above · no fabricated live observations
+            {p.metrics?.calibration_method
+              ? ` · Calibration: ${p.metrics.calibration_method}`
+              : " · Calibration metadata unavailable"}
             <br />
             ⚠ Research-grade — not for life-safety decisions
           </span>
@@ -411,43 +491,54 @@ function HitRate({
   metadata: GeoJsonMetadata | null;
   activeBaseDate: string;
 }) {
-  const perSnap = metadata?.validation_summary?.per_snapshot ?? {};
+  const validation = metadata?.validation_summary;
+  const perSnap = validation?.per_snapshot ?? {};
   const bucket = perSnap[activeBaseDate];
+  const tiers = (validation?.operational_tiers ?? [])
+    .map((tier) => tier === "MEDIUM" ? "WATCH" : tier)
+    .join("+");
+  const tierLabel = tiers || "operational alert tiers";
+  const matchRule = validation?.match_rule?.trim() || null;
+  const horizonDays = validation?.horizon_days;
+  const methodText =
+    matchRule ??
+    (typeof horizonDays === "number" && Number.isFinite(horizonDays)
+      ? `outcome checked within the ${horizonDays}-day model window`
+      : "validation method was not recorded in this snapshot");
 
   let value = "—";
-  let suffix = "no past predictions yet";
-  let detail = "For this snapshot · 15 km / ±1 day · HIGH+MEDIUM tiers";
-
-  // Read methodology config off the validation summary if risk_map persisted
-  // it; fall back to the defaults the backend now uses.
-  const vs = metadata?.validation_summary as unknown as {
-    match_radius_km?: number; match_day_window?: number;
-    operational_tiers?: string[];
-  } | undefined;
-  const radiusKm = vs?.match_radius_km ?? 15;
-  const dayWindow = vs?.match_day_window ?? 1;
-  const tiers = vs?.operational_tiers?.join("+") ?? "HIGH+MEDIUM";
+  let suffix = "no validation record";
+  let detail = `${activeBaseDate} · ${tierLabel}`;
 
   if (!bucket) {
-    suffix = "no validation data";
-    detail = "Older snapshots may have been pruned by retention policy.";
+    detail = "This snapshot has no retained validation record.";
   } else {
     const hits = bucket.hits ?? 0;
     const misses = bucket.misses ?? 0;
     const future = bucket.future ?? 0;
     const validatable = hits + misses;
-    if (validatable === 0) {
-      suffix = `${future} pending`;
-      detail = `All predicted dates are in the future; check back after ${
-        future > 0 ? "FIRMS catches up" : "the next refresh"
-      }.`;
-    } else {
+    if (validatable > 0) {
       const pct = (hits / validatable) * 100;
-      value = `${pct.toFixed(0)}%`;
-      suffix = `${hits} / ${validatable} hits`;
+      const enoughForRate = validatable >= MIN_COMPARE_RATE_SAMPLE;
+      value = enoughForRate ? `${pct.toFixed(0)}%` : "—";
+      suffix = enoughForRate
+        ? `${hits} / ${validatable} closed alerts matched`
+        : `${hits} / ${validatable} matched · rate withheld (n < ${MIN_COMPARE_RATE_SAMPLE})`;
       detail =
-        `${activeBaseDate} · ${tiers} · ${radiusKm} km / ±${dayWindow} day` +
-        (future > 0 ? ` · ${future} still pending` : "");
+        `${activeBaseDate} · ${tierLabel} · ${methodText}` +
+        (future > 0 ? ` · ${future} outcome${future === 1 ? "" : "s"} pending` : "");
+    } else if (future > 0) {
+      suffix = `${future} pending`;
+      const windowLabel =
+        typeof horizonDays === "number" && Number.isFinite(horizonDays)
+          ? `${horizonDays}-day`
+          : "model";
+      detail =
+        `The ${future === 1 ? "alert's" : "alerts'"} ${windowLabel} ` +
+        "outcome window has not closed yet.";
+    } else {
+      suffix = "no operational alerts";
+      detail = `No ${tierLabel} cells were issued for this snapshot.`;
     }
   }
 
@@ -456,7 +547,7 @@ function HitRate({
       <h3>🎯 Hit Rate vs FIRMS</h3>
       <div
         className="hitrate-card"
-        title={`Of the past predictions (${tiers} tiers only) whose target date has passed, what fraction had a real FIRMS detection within ${radiusKm} km and ±${dayWindow} day. LOW-tier predictions are excluded from the headline since they are background-rank cells, not operational alerts (see Compare page for the full-distribution audit).`}
+        title={`Of archived ${tierLabel} alerts whose outcome window closed, what fraction matched a real FIRMS detection under the persisted rule: ${methodText}. Background cells are excluded from this alert-level rate.`}
       >
         <div className="hitrate-headline">
           <span id="hitrateValue">{value}</span>
@@ -465,10 +556,10 @@ function HitRate({
         <div className="hitrate-detail">{detail}</div>
       </div>
       <div className="metrics-note">
-        Each historical HIGH/MEDIUM prediction is checked against FIRMS
-        detections within {radiusKm} km and ±{dayWindow} day of its predicted
-        fire date. "Hit" = a real fire was detected near the predicted location
-        and time. LOW-tier cells are tracked in the Compare page audit.
+        Archived {tierLabel} alerts are checked against FIRMS using the
+        persisted validation rule: {methodText}. This is an alert hit rate,
+        not held-out model recall. Background cells remain available in the
+        Predicted vs Actual audit.
       </div>
     </div>
   );
@@ -479,15 +570,25 @@ function HitRate({
 function LayerPills({
   options,
   liveFireMeta,
+  hiddenVeryLowCount,
   onChange,
 }: {
   options: DisplayOptions;
   liveFireMeta: LiveFireMeta;
+  hiddenVeryLowCount: number;
   onChange: (o: Partial<DisplayOptions>) => void;
 }) {
   const { t } = useLang();
-  const liveCount = liveFireMeta.status === "ok" ? liveFireMeta.count : null;
+  const liveCount =
+    liveFireMeta.status === "idle" ? null : liveFireMeta.count;
   const liveError = liveFireMeta.status === "error";
+  const lastSuccess = liveFireMeta.lastSuccessAt
+    ? new Date(liveFireMeta.lastSuccessAt)
+    : null;
+  const lastSuccessLabel =
+    lastSuccess && Number.isFinite(lastSuccess.getTime())
+      ? lastSuccess.toLocaleString()
+      : "—";
 
   return (
     <div className="layer-pills">
@@ -495,6 +596,7 @@ function LayerPills({
         type="button"
         className={`layer-pill predicted${options.showPredicted ? " active" : ""}`}
         onClick={() => onChange({ showPredicted: !options.showPredicted })}
+        aria-pressed={options.showPredicted}
         title={t("sidebar.display.predicted")}
       >
         <span className="layer-pill-dot" style={{ background: "#f97316" }} />
@@ -505,6 +607,7 @@ function LayerPills({
         type="button"
         className={`layer-pill observed${options.showObserved ? " active" : ""}`}
         onClick={() => onChange({ showObserved: !options.showObserved })}
+        aria-pressed={options.showObserved}
         title={t("sidebar.display.observed")}
       >
         <span className="layer-pill-dot" style={{ background: "#ff6b35" }} />
@@ -515,16 +618,39 @@ function LayerPills({
         type="button"
         className={`layer-pill live${options.showLiveFires ? " active" : ""}${liveError ? " error-state" : ""}`}
         onClick={() => onChange({ showLiveFires: !options.showLiveFires })}
+        aria-pressed={options.showLiveFires}
+        aria-busy={liveFireMeta.status === "loading"}
         title={
           liveFireMeta.status === "error"
             ? fmtTr(t("sidebar.live.error"), { msg: liveFireMeta.error ?? "network error" })
-            : t("sidebar.display.live")
+            : liveFireMeta.isStale
+              ? fmtTr(t("sidebar.live.stale"), {
+                  when: lastSuccessLabel,
+                })
+              : t("sidebar.display.live")
         }
       >
         <span className="layer-pill-dot" style={{ background: "#06b6d4" }} />
         {t("sidebar.display.live")}
         {liveCount !== null && liveCount > 0 && (
           <span className="layer-pill-count">· {liveCount}</span>
+        )}
+        {liveFireMeta.isStale && liveFireMeta.status !== "error" && (
+          <span className="layer-pill-count" title={t("sidebar.live.stale_short")}>⚠</span>
+        )}
+      </button>
+
+      <button
+        type="button"
+        className={`layer-pill very-low${options.hideVeryLowRisk ? " active" : ""}`}
+        onClick={() => onChange({ hideVeryLowRisk: !options.hideVeryLowRisk })}
+        aria-pressed={options.hideVeryLowRisk}
+        title={t("sidebar.display.hide_very_low_hint")}
+      >
+        <span className="layer-pill-dot" style={{ background: "#94a3b8" }} />
+        {t("sidebar.display.hide_very_low")}
+        {options.hideVeryLowRisk && (
+          <span className="layer-pill-count">· {hiddenVeryLowCount}</span>
         )}
       </button>
 
@@ -537,23 +663,34 @@ function LayerPills({
 function QuickStats({
   urgencyCounts,
   visibleCount,
+  criticalEnabled,
 }: {
   urgencyCounts: Record<UrgencyLevel, number>;
   visibleCount: number;
+  criticalEnabled: boolean;
 }) {
   return (
     <div className="quick-stats-strip">
-      <div className="quick-stat critical" title="CRITICAL urgency — fire predicted within 24 h">
-        <div className="quick-stat-value">{urgencyCounts.CRITICAL}</div>
+      <div
+        className="quick-stat critical"
+        title={
+          criticalEnabled
+            ? "CRITICAL tier — highest urgency"
+            : "No calibrated CRITICAL cutoff in this model"
+        }
+      >
+        <div className="quick-stat-value">
+          {criticalEnabled ? urgencyCounts.CRITICAL : "—"}
+        </div>
         <div className="quick-stat-label">Critical</div>
       </div>
-      <div className="quick-stat high" title="HIGH urgency — fire predicted within ~2 days">
+      <div className="quick-stat high" title="HIGH tier — calibrated fire probability above the alert threshold">
         <div className="quick-stat-value">{urgencyCounts.HIGH}</div>
         <div className="quick-stat-label">High</div>
       </div>
-      <div className="quick-stat medium" title="MEDIUM urgency — fire predicted within ~4 days">
+      <div className="quick-stat medium" title="WATCH tier — probability above the recall-target watch cutoff">
         <div className="quick-stat-value">{urgencyCounts.MEDIUM}</div>
-        <div className="quick-stat-label">Medium</div>
+        <div className="quick-stat-label">Watch</div>
       </div>
       <div className="quick-stat total" title="Total visible predictions">
         <div className="quick-stat-value">{visibleCount}</div>

@@ -32,5 +32,27 @@ scikit-optimize==0.10.2
 scipy==1.17.1
 # matplotlib  # uncomment if you want PNG training reports
 
+# Optional — bulk ERA5 backfill via Copernicus CDS (fetch_weather_cds.py).
+# Needs a free CDS account + ~/.cdsapirc; not required for Open-Meteo path.
+# cdsapi>=0.7
+# xarray>=2024.0
+# netcdf4>=1.6
+
 # Legacy model.py only (not used by active training pipeline)
 # xgboost==3.2.0
+
+# Testing
+pytest>=8.0
+# Fails a hanging TestClient lifespan with a thread dump instead of hanging CI
+# (see pytest.ini timeout config).
+pytest-timeout>=2.3
+# Starlette 1.3 / FastAPI 0.136's TestClient imports `httpx2` first and only
+# falls back to the deprecated `httpx` path (which can hang on Python 3.14).
+# Installing httpx2 uses the supported backend. Separate import name from the
+# app's own `httpx` dependency, so this is purely additive.
+httpx2>=2.7
+
+# Optional — bulk ERA5 backfill via Copernicus CDS (fetch_weather_cds.py)
+# cdsapi>=0.7
+# xarray>=2024.1
+# netcdf4>=1.6

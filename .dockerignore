@@ -12,7 +12,9 @@
 .idea
 .vscode
 .venv
+**/.venv
 __pycache__
+**/__pycache__
 *.pyc
 .DS_Store
 *.log
@@ -27,6 +29,9 @@ web/dist
 # volume has fresh contents, the in-image copies are ignored.
 # Exclude the training-history dir to keep image weight down.
 outputs/models/history
+# A stray local environment has previously been created under src/outputs.
+# It is never an application input and can add ~1 GB to a build context.
+src/outputs
 src.zip
 
 # Local-only / secrets

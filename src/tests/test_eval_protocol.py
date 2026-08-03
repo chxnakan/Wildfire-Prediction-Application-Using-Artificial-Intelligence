@@ -170,6 +170,40 @@ def test_split_too_short_raises():
     raise AssertionError("short dataset should refuse a purged 4-way split")
 
 
+def test_champion_split_five_way_ordering_and_purge():
+    """CHAMPION block sits between calib and test, all five blocks disjoint,
+    every boundary purged > purge_days. Final test comes strictly last."""
+    df = _synthetic_frame(n_days=300)
+    split = date_grouped_split(df["date"], purge_days=7, champion_fraction=0.10)
+    assert "champion" in split.masks
+    assert split.n_dates_purged == 4 * split.purge_days
+    order = ["train", "val", "calib", "champion", "test"]
+    prev_max = None
+    for name in order:
+        dates = pd.to_datetime(df["date"][split.masks[name]])
+        assert len(dates) > 0, f"{name} empty"
+        if prev_max is not None:
+            gap = (dates.min() - prev_max).days
+            assert gap > 7, f"purge violated before {name}: {gap}d"
+        prev_max = dates.max()
+
+
+def test_champion_default_off_keeps_four_way():
+    df = _synthetic_frame(n_days=200)
+    split = date_grouped_split(df["date"], purge_days=7)
+    assert "champion" not in split.masks
+    assert set(split.masks) == {"train", "val", "calib", "test"}
+
+
+def test_champion_and_test_share_no_dates():
+    df = _synthetic_frame(n_days=300)
+    split = date_grouped_split(df["date"], purge_days=7, champion_fraction=0.10)
+    champ = set(pd.to_datetime(df["date"][split.masks["champion"]]).unique())
+    test = set(pd.to_datetime(df["date"][split.masks["test"]]).unique())
+    assert not (champ & test)
+    # promotion decisions on champion therefore cannot see any final-test date
+
+
 if __name__ == "__main__":
     test_split_dates_are_disjoint()
     test_purge_gap_is_wide_enough()

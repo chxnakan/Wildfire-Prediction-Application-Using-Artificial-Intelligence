@@ -1,5 +1,6 @@
 import type { ScientificStats, BootstrapCI } from "../types";
 import { downloadCsv } from "../utils/csvExport";
+import { scientificSampleSplits } from "../utils/scientificStats";
 
 interface Props {
   stats: ScientificStats;
@@ -66,15 +67,11 @@ export default function StatisticsSection({ stats }: Props) {
 
 // ── Dataset Split ───────────────────────────────────────────
 function DatasetSplitTable({ samples }: { samples: ScientificStats["samples"] }) {
-  const rows = [
-    { label: "Training",   data: samples.train },
-    { label: "Validation", data: samples.val },
-    { label: "Test",       data: samples.test },
-  ];
+  const rows = scientificSampleSplits(samples);
   return (
     <section className="report-section">
       <SectionHead
-        title="📋 Dataset breakdown (chronological 60/20/20 split)"
+        title="📋 Dataset breakdown (chronological 4-way purged split)"
         hint="จำนวนข้อมูล train/val/test · ไม่มีการ shuffle (เรียงตามวันที่)"
         exportFilename="dataset_split.csv"
         exportRows={() => [
@@ -102,8 +99,14 @@ function DatasetSplitTable({ samples }: { samples: ScientificStats["samples"] })
               <td><b>{r.label}</b></td>
               <td className="mono right">{r.data.n.toLocaleString()}</td>
               <td className="mono right">{r.data.positives.toLocaleString()}</td>
-              <td className="mono right">{(r.data.positive_rate * 100).toFixed(2)}%</td>
-              <td className="mono small">{r.data.date_range[0]} → {r.data.date_range[1]}</td>
+              <td className="mono right">
+                {r.data.positive_rate == null
+                  ? "—"
+                  : `${(r.data.positive_rate * 100).toFixed(2)}%`}
+              </td>
+              <td className="mono small">
+                {r.data.date_range[0] ?? "—"} → {r.data.date_range[1] ?? "—"}
+              </td>
             </tr>
           ))}
           <tr style={{ borderTop: "2px solid var(--border)" }}>

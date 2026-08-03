@@ -1,11 +1,16 @@
 #!/usr/bin/env python
-"""Rolling monthly evaluation of the deployed model.
+"""IN-SAMPLE descriptive monthly evaluation of the deployed model.
 
-Slides a 1-month evaluation window over the entire feature timeline and
-records AUC, F1, precision, recall, ECE, and class-positive rate for each
-month. Result is written to `outputs/metadata/rolling_eval.json` so the
-operator can see *stability* of model quality over time — does the model
-hold up off-burn-season? Does AUC drift?
+⚠️  This is NOT out-of-sample stability. It applies ONE already-deployed model
+over its ENTIRE feature timeline — which INCLUDES the months the model trained
+on — so the per-month AUC is partly in-sample and must never be headlined as
+"stability" or "out-of-sample". For genuine walk-forward / rolling-origin
+stability (retrain per fold), use `src/rolling_backtest.py`.
+
+Slides a 1-month window over the timeline and records AUC, F1, precision,
+recall, ECE, and positive rate per month → `outputs/metadata/rolling_eval.json`
+(tagged `evaluation_type: in_sample_descriptive`). Useful only as a descriptive
+diagnostic of where the model's scores vary across the calendar.
 
 Memory-frugal like post_calibrate.py: predicts probabilities chunk-by-chunk
 so the full 4.4M-row feature matrix is never resident in memory.
@@ -22,7 +27,6 @@ import sys
 import time
 from typing import Any, Dict, List
 
-import joblib
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -73,19 +77,13 @@ def _eval_window(y: np.ndarray, p: np.ndarray, thr: float) -> Dict[str, float]:
 
 def main() -> None:
     t0 = time.time()
-    print("[1/3] Loading model + scanning parquet...")
-    # train.py defines _EnsembleRegressor; when train.py runs as __main__
-    # joblib pickles it with __module__ = "__main__". Other entry points
-    # (this script, api.py, standalone risk_map.py) need the class
-    # aliased into their own __main__ before unpickling.
-    _main_mod = sys.modules.get("__main__")
-    if _main_mod is not None:
-        for _name in ("_EnsembleRegressor", "_prob_to_days_for_compat"):
-            if hasattr(train, _name) and not hasattr(_main_mod, _name):
-                setattr(_main_mod, _name, getattr(train, _name))
-    model = joblib.load(MODEL_PATH)
-    if not isinstance(model, train._EnsembleRegressor):
-        raise SystemExit(f"Not _EnsembleRegressor: {type(model)}")
+    print("[1/3] Loading model bundle + scanning parquet...")
+    # Canonical loader: registers pickled classes in __main__ and unwraps
+    # bundle-v1 (joblib.load returned the raw dict and the old isinstance check
+    # rejected it). Shared with api / risk_map / scientific_stats.
+    model, _bundle_meta = train.load_model_bundle(MODEL_PATH)
+    if not hasattr(model, "predict_proba"):
+        raise SystemExit(f"Loaded model has no predict_proba: {type(model)}")
 
     pf = pq.ParquetFile(FEATURES_PATH)
     schema_cols = pf.schema_arrow.names
@@ -160,51 +158,30 @@ def main() -> None:
           f"mean={summary['auc_mean']:.3f}  std={summary['auc_std']:.3f}  "
           f"min={summary['auc_min']:.3f}  max={summary['auc_max']:.3f}")
 
+    # IMPORTANT: this is an IN-SAMPLE, DESCRIPTIVE curve. It applies ONE already
+    # deployed model over its ENTIRE timeline, which includes the months the
+    # model trained on — so it must NEVER be reported as out-of-sample
+    # stability. For genuine rolling-origin (walk-forward, out-of-sample)
+    # stability, use src/rolling_backtest.py, which retrains per fold.
+    summary["evaluation_type"] = "in_sample_descriptive"
+    summary["out_of_sample"] = False
+    summary["note"] = (
+        "In-sample descriptive monthly AUC of a single deployed model over its "
+        "whole timeline (includes training months). NOT out-of-sample "
+        "stability — use rolling_backtest.py for that.")
     with open(OUT_PATH, "w") as f:
         json.dump({"summary": summary, "months": results}, f, indent=2, default=str)
-    print(f"\nWrote {OUT_PATH}")
+    print(f"\nWrote {OUT_PATH}  [in-sample descriptive — not out-of-sample]")
 
-    # Patch dataset_info.json + GeoJSON so the dashboard's Reports page can
-    # render the rolling AUC chart without a separate fetch — mirrors what
-    # scripts/scientific_stats.py does for its bootstrap CIs.
-    inline_months = [
-        {"month": r["month"], "auc": r["auc"], "positive_rate": r["positive_rate"], "n": r["n"]}
-        for r in results
-    ]
-    try:
-        meta_path = os.path.join(ROOT, "outputs", "metadata", "dataset_info.json")
-        with open(meta_path) as f:
-            meta = json.load(f)
-        tm = meta.setdefault("model", {}).setdefault("test_metrics", {})
-        tm["rolling_by_month"] = inline_months
-        tm["stability_months"] = summary["months_evaluated"]
-        tm["stability_valid_months"] = summary["valid_months"]
-        tm["stability_auc_mean"] = summary["auc_mean"]
-        tm["stability_auc_std"] = summary["auc_std"]
-        tm["stability_auc_min"] = summary["auc_min"]
-        tm["stability_auc_max"] = summary["auc_max"]
-        with open(meta_path, "w") as f:
-            json.dump(meta, f, indent=2, default=str)
-        print(f"✓ Patched {meta_path}")
-
-        gj_path = os.path.join(ROOT, "outputs", "riskmap", "fire_dates_all.geojson")
-        if os.path.exists(gj_path):
-            with open(gj_path) as f:
-                gj = json.load(f)
-            gj_metrics = gj.setdefault("metadata", {}).setdefault("metrics", {})
-            gj_metrics["rolling_by_month"] = inline_months
-            gj_metrics["stability_months"] = summary["months_evaluated"]
-            gj_metrics["stability_valid_months"] = summary["valid_months"]
-            gj_metrics["stability_auc_mean"] = summary["auc_mean"]
-            gj_metrics["stability_auc_std"] = summary["auc_std"]
-            gj_metrics["stability_auc_min"] = summary["auc_min"]
-            gj_metrics["stability_auc_max"] = summary["auc_max"]
-            with open(gj_path, "w") as f:
-                json.dump(gj, f)
-            print(f"✓ Patched {gj_path}")
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"⚠ Could not patch dataset_info/geojson: {exc}")
-
+    # DELIBERATELY does NOT patch dataset_info.json or the GeoJSON. This curve
+    # is IN-SAMPLE (the deployed model applied over its own training months), so
+    # writing stability_auc_* / rolling_by_month into canonical metadata made
+    # the frontend present it as genuine out-of-sample "stability". It isn't.
+    # The report lives only in its own file; for real out-of-sample stability
+    # use src/rolling_backtest.py (walk-forward, retrains per fold).
+    print("ℹ️  Canonical dataset_info.json / GeoJSON NOT modified — this is an "
+          "in-sample descriptive report only (use rolling_backtest.py for "
+          "out-of-sample stability).")
     print(f"Done in {time.time() - t0:.1f}s")
 
 

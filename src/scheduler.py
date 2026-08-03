@@ -17,6 +17,10 @@ Overlap safety:
   - max_instances=1 + coalesce=True on every job (no pile-ups after sleep)
   - outputs/.train.lock guards train.py vs. the sync job's predict subprocess
     (both write full_features.parquet)
+
+Each job family has its own opt-out switch.  This matters for presentation
+mode: the live GISTDA observation layer may keep polling while FIRMS sync and
+model retraining remain disabled.
 """
 
 import json
@@ -51,11 +55,27 @@ TRAIN_TIMEOUT_S = int(os.getenv("TRAIN_TIMEOUT_S", str(3 * 3600)))
 _scheduler = None
 
 
+def _env_enabled(name: str, default: bool = True) -> bool:
+    """Read an opt-in/opt-out environment flag without changing defaults."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # ─── jobs ─────────────────────────────────────────────────────────────────────
 
 def sync_job():
     from sync_worker import run_sync
     run_sync()
+
+
+def gistda_poll_job():
+    # Single-poller safety lives inside poll_once (PostgreSQL advisory
+    # lock) — this job body stays a thin shim so replicas that lose the
+    # lock exit in microseconds.
+    from gistda_poller import poll_once
+    poll_once()
 
 
 def _last_train_time():
@@ -89,6 +109,36 @@ def _read_metrics_from_meta() -> dict:
         return {}
 
 
+def _read_promotion_from_meta() -> dict:
+    """Promotion block written by train.py's quality gates. Note: on a
+    REJECTED candidate, train.py does not touch dataset_info.json, so a
+    stale promotion block here means 'incumbent unchanged' — the model
+    pkl's mtime disambiguates."""
+    try:
+        with open(META_PATH) as f:
+            return json.load(f).get("promotion") or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+# Callbacks fired (best-effort) after a training run PROMOTES a new model —
+# api.py registers its hot-reload here at startup, avoiding a circular
+# import (api imports scheduler; scheduler must not import api).
+_on_model_promoted: list = []
+
+
+def register_model_promoted_callback(fn) -> None:
+    _on_model_promoted.append(fn)
+
+
+def _fire_model_promoted() -> None:
+    for fn in list(_on_model_promoted):
+        try:
+            fn()
+        except Exception:
+            log.exception("model-promoted callback failed")
+
+
 def retrain_check_job():
     last = _last_train_time()
     if last is not None:
@@ -112,16 +162,30 @@ def retrain_now(trigger: str = "manual") -> dict:
         f.write(str(os.getpid()))
     log.info("Retraining started (trigger=%s, args=%s)", trigger, TRAIN_ARGS)
     try:
+        model_path = os.path.join(OUTPUT_DIR, "models", "lgbm_fire_date_model.pkl")
+        mtime_before = os.path.getmtime(model_path) if os.path.isfile(model_path) else 0
         proc = subprocess.run(
             [sys.executable, "train.py", *TRAIN_ARGS],
             cwd=SRC_DIR, timeout=TRAIN_TIMEOUT_S,
             capture_output=True, text=True,
         )
         if proc.returncode == 0:
+            # Promotion happened iff train.py's gates replaced the bundle —
+            # the pkl mtime moving is the ground truth (a rejected candidate
+            # leaves both the pkl and dataset_info.json untouched).
+            mtime_after = os.path.getmtime(model_path) if os.path.isfile(model_path) else 0
+            promoted = mtime_after > mtime_before
+            promo = _read_promotion_from_meta() if promoted else {}
+            reason = promo.get("reason") if promoted else \
+                "candidate rejected by quality gates (incumbent retained)"
             metrics = _read_metrics_from_meta()
-            db.finish_model_run(run_id, "done", metrics=metrics)
-            log.info("Retraining finished OK — metrics: %s", metrics)
-            return {"status": "done", "metrics": metrics}
+            db.finish_model_run(run_id, "done", metrics=metrics,
+                                promoted=promoted, promotion_reason=reason)
+            log.info("Retraining finished — promoted=%s (%s)", promoted, reason)
+            if promoted:
+                _fire_model_promoted()
+            return {"status": "done", "promoted": promoted,
+                    "reason": reason, "metrics": metrics}
         err = (proc.stderr or "")[-4000:]
         db.finish_model_run(run_id, "failed", error=err)
         log.error("Retraining failed (rc=%s): %s", proc.returncode, err)
@@ -150,8 +214,14 @@ def start() -> bool:
         return True
     from apscheduler.schedulers.background import BackgroundScheduler
 
+    sync_enabled = _env_enabled("SCHEDULER_SYNC_ENABLED")
+    retrain_enabled = _env_enabled("SCHEDULER_RETRAIN_ENABLED")
+    gistda_enabled = _env_enabled("GISTDA_ENABLED")
+
     # A crashed process can leave a stale lock behind — clear it on boot.
-    if os.path.exists(TRAIN_LOCK):
+    # A GISTDA-only presentation process never needs this lock and therefore
+    # must not mutate it.
+    if (sync_enabled or retrain_enabled) and os.path.exists(TRAIN_LOCK):
         log.warning("Removing stale train lock from previous run")
         try:
             os.remove(TRAIN_LOCK)
@@ -159,24 +229,42 @@ def start() -> bool:
             pass
 
     _scheduler = BackgroundScheduler(timezone="UTC")
-    _scheduler.add_job(
-        sync_job, "interval",
-        minutes=SYNC_INTERVAL_MINUTES,
-        id="sync", max_instances=1, coalesce=True,
-        misfire_grace_time=120,
-        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30),
-    )
-    _scheduler.add_job(
-        retrain_check_job, "interval",
-        hours=RETRAIN_CHECK_HOURS,
-        id="retrain_check", max_instances=1, coalesce=True,
-        misfire_grace_time=3600,
-        next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5),
-    )
+    enabled_jobs: list[str] = []
+    if sync_enabled:
+        _scheduler.add_job(
+            sync_job, "interval",
+            minutes=SYNC_INTERVAL_MINUTES,
+            id="sync", max_instances=1, coalesce=True,
+            misfire_grace_time=120,
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30),
+        )
+        enabled_jobs.append("sync")
+    if retrain_enabled:
+        _scheduler.add_job(
+            retrain_check_job, "interval",
+            hours=RETRAIN_CHECK_HOURS,
+            id="retrain_check", max_instances=1, coalesce=True,
+            misfire_grace_time=3600,
+            next_run_time=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+        enabled_jobs.append("retrain_check")
+    # GISTDA live-hotspot poller — every GISTDA_POLL_SECONDS (default 300).
+    # This is the ONLY place GISTDA polling starts; the browser and the
+    # API endpoints never trigger fetches themselves.
+    if gistda_enabled:
+        _scheduler.add_job(
+            gistda_poll_job, "interval",
+            seconds=int(os.getenv("GISTDA_POLL_SECONDS", "300")),
+            id="gistda_poll", max_instances=1, coalesce=True,
+            misfire_grace_time=60,
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=10),
+        )
+        enabled_jobs.append("gistda_poll")
     _scheduler.start()
-    log.info("Scheduler started: sync every %d min, retrain check every %d h "
-             "(retrain when model older than %s days)",
-             SYNC_INTERVAL_MINUTES, RETRAIN_CHECK_HOURS, RETRAIN_EVERY_DAYS)
+    log.info(
+        "Scheduler started with jobs: %s",
+        ", ".join(enabled_jobs) if enabled_jobs else "none",
+    )
     return True
 
 

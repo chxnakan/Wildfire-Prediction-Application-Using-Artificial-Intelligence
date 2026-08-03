@@ -23,6 +23,7 @@
 
 const DAYS_ANCHORS  = [0.0, 0.5, 1.5, 2.5, 4.0, 5.5, 7.0];
 const PROB_ANCHORS  = [1.0, 0.70, 0.50, 0.35, 0.20, 0.10, 0.00];
+export const VERY_LOW_PROBABILITY_CUTOFF = 0.0001; // <0.01%
 
 export function rawPredToProb(rawPred: number | undefined | null): number | null {
   if (typeof rawPred !== "number" || !isFinite(rawPred)) return null;
@@ -48,7 +49,55 @@ export function readProbability(props: {
 } | null | undefined): number | null {
   if (!props) return null;
   if (typeof props.probability === "number" && isFinite(props.probability)) {
-    return Math.max(0, Math.min(1, props.probability));
+    // Never silently turn a malformed percentage/unit into a plausible model
+    // score. If the persisted value is outside the probability domain, fall
+    // back to the legacy field when available; otherwise report it as missing.
+    if (props.probability >= 0 && props.probability <= 1) {
+      return props.probability;
+    }
   }
   return rawPredToProb(props.raw_prediction);
+}
+
+// Keep every operator-facing cell probability at the same precision. Returning
+// a number separately from the display string lets visual bars keep a numeric
+// width while labels and exports retain trailing zeroes (for example 0.10%).
+export function probabilityPercent(
+  probability: number | null | undefined,
+): number | null {
+  if (
+    typeof probability !== "number" ||
+    !isFinite(probability) ||
+    probability < 0 ||
+    probability > 1
+  ) {
+    return null;
+  }
+  return Number((probability * 100).toFixed(2));
+}
+
+export function isVeryLowProbability(
+  probability: number | null | undefined,
+): boolean {
+  return (
+    typeof probability === "number" &&
+    isFinite(probability) &&
+    probability >= 0 &&
+    probability < VERY_LOW_PROBABILITY_CUTOFF
+  );
+}
+
+export function formatProbabilityPercent(
+  probability: number | null | undefined,
+): string {
+  if (
+    typeof probability === "number" &&
+    isFinite(probability) &&
+    probability > 0 &&
+    isVeryLowProbability(probability)
+  ) {
+    return "<0.01%";
+  }
+  const percent = probabilityPercent(probability);
+  return percent === null ? "—" : `${percent.toFixed(2)}%`;
 }

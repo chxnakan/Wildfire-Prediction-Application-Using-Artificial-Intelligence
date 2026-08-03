@@ -1,7 +1,6 @@
-// Transparency / provenance panel — shows where every data column comes from.
-// Each row links to the original public source so a sceptical reader can
-// verify the numbers aren't made up. Key trust message: "real data only,
-// no synthetic / random / interpolated values."
+// Transparency / provenance panel — shows where the source observations and
+// derived model inputs come from. Derived aggregates and reanalysis fields are
+// named as such; the UI never claims every feature is a raw measurement.
 
 interface Source {
   icon: string;
@@ -14,9 +13,17 @@ interface Source {
 
 const SOURCES: Source[] = [
   {
+    icon: "🔥",
+    name: "GISTDA NRT VIIRS + MODIS",
+    description: "จุดความร้อนใกล้เวลาจริงจากระบบติดตามของประเทศไทย ใช้เป็น live overlay แยกจากผลทำนาย",
+    url: "https://fire.gistda.or.th/",
+    license: "Public operational feed",
+    contributes: "live hotspot map, live counts, land-use/province context (not a model probability)",
+  },
+  {
     icon: "🛰",
-    name: "NASA FIRMS VIIRS NRT",
-    description: "Near-real-time hotspots ทุก 3 ชั่วโมง จากดาวเทียม Suomi NPP + NOAA-20",
+    name: "NASA FIRMS VIIRS NRT + Archive",
+    description: "Hotspots จาก 3 ดาวเทียม (Suomi-NPP + NOAA-20 + NOAA-21) · archive ย้อนหลังถึงปี 2012",
     url: "https://firms.modaps.eosdis.nasa.gov/",
     license: "Open / US Government",
     contributes: "fire_count, FRP, brightness, confidence + spatial-neighbor features",
@@ -24,10 +31,10 @@ const SOURCES: Source[] = [
   {
     icon: "🌤",
     name: "ECMWF ERA5 Reanalysis",
-    description: "อุณหภูมิ ความชื้น ลม ฝน ระดับ 0.25° (ผ่าน Open-Meteo Archive API)",
+    description: "อุณหภูมิ ความชื้น ลม ฝน ระดับ 0.25° (Open-Meteo Archive + Copernicus CDS)",
     url: "https://open-meteo.com/en/docs/historical-weather-api",
     license: "CC-BY 4.0",
-    contributes: "temp_max/min, precip_sum, wind_max, et0 — coverage ~38% ตอนนี้",
+    contributes: "temp_max/min, precip_sum, wind_max, et0 — เปิดใช้เป็น feature เมื่อ coverage ≥ 20% (กำลัง backfill)",
   },
   {
     icon: "🌳",
@@ -52,8 +59,9 @@ export default function DataSourcesPanel() {
     <div className="section">
       <h3>📡 Data Sources</h3>
       <p style={{ fontSize: 11, color: "var(--text-3)", marginBottom: 10 }}>
-        ทุก feature มาจาก <b>แหล่งข้อมูลสาธารณะที่ตรวจสอบได้</b>.
-        ไม่มี synthetic / random / interpolated values.
+        ข้อมูลต้นทางมาจาก <b>แหล่งสาธารณะที่ตรวจสอบได้</b> แล้วระบบสร้าง
+        temporal/spatial aggregates และ cell-day rows ตามวิธีใน Model Card;
+        จำนวน live hotspot จะไม่ถูกแทนด้วยข้อมูลสมมติเมื่อ feed ล้มเหลว
       </p>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>

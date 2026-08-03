@@ -6,14 +6,16 @@ import { useLang } from "../utils/i18n";
 // 4-second timeout — if the backend doesn't respond we degrade to "offline"
 // gracefully. Pulse animation only on "live" so a frozen page doesn't lie.
 //
-// "stale" appears when FIRMS data is > 5 days old (the backend reports
-// data_stale_days in /health).
+// "stale" appears when the API is not ready or the served GeoJSON is >5 days
+// old (`ready` / `geojson_age_days` from the current /health schema).
 
 const POLL_INTERVAL_MS = 60_000;
 
 export default function LiveStatusBadge() {
   const { t } = useLang();
-  const [status, setStatus] = useState<LiveStatus>("offline");
+  // Neutral until the first health response. Starting at OFFLINE caused a
+  // false red flash on every healthy page load.
+  const [status, setStatus] = useState<LiveStatus | "checking">("checking");
   const [lastCheck, setLastCheck] = useState<Date | null>(null);
 
   useEffect(() => {
@@ -33,11 +35,13 @@ export default function LiveStatusBadge() {
   }, []);
 
   const label =
-    status === "live" ? "LIVE" :
-    status === "stale" ? "STALE" : "OFFLINE";
+    status === "live" ? "API LIVE" :
+    status === "stale" ? "API DEGRADED" :
+    status === "checking" ? "API CHECK" : "API OFFLINE";
   const description =
     status === "live" ? t("livestatus.live") :
     status === "stale" ? t("livestatus.stale") :
+    status === "checking" ? t("analytics.feed.status.loading") :
     t("livestatus.offline");
 
   return (
@@ -45,6 +49,7 @@ export default function LiveStatusBadge() {
       className={`live-status ${status}`}
       title={`${description}\nLast check: ${lastCheck?.toLocaleTimeString() ?? "—"}`}
       aria-live="polite"
+      aria-busy={status === "checking"}
     >
       <span className={`live-dot ${status}`} aria-hidden="true" />
       <span className="live-label">{label}</span>

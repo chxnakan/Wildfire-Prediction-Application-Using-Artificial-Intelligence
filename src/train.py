@@ -85,6 +85,7 @@ from features import (
     resolve_features,
 )
 from storage import resolve_existing, write_json, write_pickle, write_table
+import thresholds as thresholds_mod
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -151,19 +152,30 @@ def _compute_sample_weights(
     dates: pd.Series,
     recency_halflife_days: float = 45.0,
     multi_sat: Optional[np.ndarray] = None,
+    class_weighting: bool = True,
 ) -> np.ndarray:
-    """Inverse-class-frequency × recency decay × multi-satellite confirmation bonus.
+    """Recency decay × optional inverse-class-frequency × optional multi-sat bonus.
+
+    ``class_weighting=False`` drops the inverse-class-frequency component —
+    required by IMBALANCE_MODE A/B/C, where class balancing must be applied
+    exactly ONCE (the legacy default D stacked undersampling × class weights ×
+    scale_pos_weight ≈ a ~120× positive up-weighting at 3% natural prevalence,
+    which badly inflates raw probabilities).
 
     multi_sat: int8 array (same length as y) — number of VIIRS satellites that
-    confirmed the fire at the target date. 2-sat detections get a 1.3× boost;
-    3-sat get 1.5×. Kept gentle to avoid destabilising the ensemble (previous
-    runs with heavier boosts increased variance).
+    confirmed the fire at the target date; gentle 1.1×/1.2× boost. NOTE this is
+    derived from the FUTURE target date, so weighting by it changes the
+    estimand toward "multi-satellite-confirmed fires" — toggle via
+    MULTISAT_WEIGHTING (audited in item 9).
     """
-    label_counts = y.value_counts()
-    n_classes = max(len(label_counts), 1)
-    n_samples = max(len(y), 1)
-    class_weight_map = (n_samples / (n_classes * label_counts)).to_dict()
-    sw_class = y.map(class_weight_map).to_numpy().astype(float)
+    if class_weighting:
+        label_counts = y.value_counts()
+        n_classes = max(len(label_counts), 1)
+        n_samples = max(len(y), 1)
+        class_weight_map = (n_samples / (n_classes * label_counts)).to_dict()
+        sw_class = y.map(class_weight_map).to_numpy().astype(float)
+    else:
+        sw_class = np.ones(len(y), dtype=float)
 
     max_date = pd.to_datetime(dates).max()
     days_ago = (max_date - pd.to_datetime(dates)).dt.days.to_numpy().astype(float)
@@ -406,6 +418,205 @@ def _prob_to_days_for_compat(prob: np.ndarray) -> np.ndarray:
     )
 
 
+# ─────────────────────────────────────────────
+# Model promotion: quality gates + atomic bundle swap
+# ─────────────────────────────────────────────
+#
+# The promoted artifact is a SINGLE pickle bundle {"format": "bundle-v1",
+# "model": ..., "metadata": ...} so the model and its feature contract
+# travel together — one os.replace() promotes both atomically. (The old
+# two-file scheme (pkl + dataset_info.json) tore on this very machine: a
+# kill between the two writes left a new model paired with a stale feature
+# list, which silently mispredicts.) dataset_info.json is still written for
+# the frontend/docs, but loaders prefer the bundle's embedded metadata.
+
+MODEL_GATE_MIN_AUC = float(os.getenv("MODEL_GATE_MIN_AUC", "0.65"))
+MODEL_GATE_MIN_AP_UPLIFT = float(os.getenv("MODEL_GATE_MIN_AP_UPLIFT", "1.5"))
+# Head-to-head tolerances vs the incumbent on the SAME comparison set.
+MODEL_GATE_MAX_AUC_DROP = float(os.getenv("MODEL_GATE_MAX_AUC_DROP", "0.002"))
+MODEL_GATE_MAX_ECE_INCREASE = float(os.getenv("MODEL_GATE_MAX_ECE_INCREASE", "0.005"))
+# Optional candidate-level operating gates (skipped when unset / <=0).
+MODEL_GATE_MIN_WATCH_RECALL = float(os.getenv("MODEL_GATE_MIN_WATCH_RECALL", "0.0"))
+MODEL_GATE_MIN_WATCH_PRECISION = float(os.getenv("MODEL_GATE_MIN_WATCH_PRECISION", "0.0"))
+MODEL_GATE_MAX_ALERT_RATE = float(os.getenv("MODEL_GATE_MAX_ALERT_RATE", "1.0"))
+# A feature-contract change must NOT auto-promote on floors alone (default);
+# set true only for a deliberate, reviewed contract migration.
+MODEL_GATE_ALLOW_FEATURE_CHANGE = os.getenv(
+    "MODEL_GATE_ALLOW_FEATURE_CHANGE", "false").lower() in ("1", "true", "yes")
+
+
+def register_model_classes_in_main() -> None:
+    """Alias train's pickled classes into ``__main__`` so an artifact pickled
+    while train.py ran as a script (``__module__ == "__main__"``) unpickles from
+    ANY process. Idempotent. This is the single registration point every entry
+    point uses via ``load_model_bundle`` — no more per-module copies."""
+    import sys
+    main_mod = sys.modules.get("__main__")
+    if main_mod is None:
+        return
+    for name in ("_EnsembleRegressor", "_prob_to_days_for_compat"):
+        obj = globals().get(name)
+        if obj is not None and not hasattr(main_mod, name):
+            setattr(main_mod, name, obj)
+
+
+def load_model_bundle(path: str):
+    """Canonical loader for promoted model artifacts — the ONE place the API,
+    risk_map, scientific_stats and rolling_eval load models, so pickle
+    registration and bundle handling can never drift between them.
+
+    Registers the pickled classes in ``__main__`` first, then unpickles.
+    Supports the ``bundle-v1`` dict and legacy bare-model artifacts. Returns
+    ``(model, metadata_or_None)`` (metadata is None for legacy artifacts).
+    Raises with a clear message on a corrupt/missing artifact so callers fail
+    loudly rather than serving a half-loaded model.
+    """
+    from storage import read_pickle
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model artifact not found: {path}")
+    register_model_classes_in_main()
+    obj = read_pickle(path)
+    if obj is None:
+        raise ValueError(f"Corrupt model artifact (unpickled to None): {path}")
+    if isinstance(obj, dict):
+        if obj.get("format") == "bundle-v1":
+            model = obj.get("model")
+            if model is None:
+                raise ValueError(f"Corrupt bundle-v1 at {path}: missing 'model' field")
+            return model, obj.get("metadata")
+        raise ValueError(
+            f"Unrecognized dict artifact at {path} (format="
+            f"{obj.get('format')!r}); expected a bundle-v1 bundle or a bare model.")
+    if not (hasattr(obj, "predict_proba") or hasattr(obj, "predict")):
+        raise ValueError(
+            f"Loaded object at {path} is not a usable model (type={type(obj).__name__}).")
+    return obj, None
+
+
+def _evaluate_promotion_gates(
+    candidate_auc: float,
+    candidate_ap: float,
+    test_prevalence: float,
+    X_test,
+    y_test_bin,
+    feature_cols: List[str],
+    promoted_path: str,
+    candidate_brier: Optional[float] = None,
+    candidate_ece: Optional[float] = None,
+    candidate_watch_recall: Optional[float] = None,
+    candidate_watch_precision: Optional[float] = None,
+    candidate_alert_rate: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """Decide whether the candidate may replace the trusted model.
+
+    NOTE ON THE COMPARISON SET: ideally the head-to-head runs on a dedicated
+    promotion/champion split that is NOT the final held-out test (see the
+    five-way protocol note in the docstring of `main`). Until that split
+    exists the comparison uses ``X_test`` — the caller must treat any promotion
+    metric as champion-selection, not the final reported test number.
+
+    Gates (all configurable via MODEL_GATE_* env):
+      1. Absolute floors: AUC ≥ MIN_AUC; PR-AUC ≥ MIN_AP_UPLIFT × prevalence.
+      2. Operating floors (skipped when unset): WATCH recall ≥ MIN_WATCH_RECALL,
+         WATCH precision ≥ MIN_WATCH_PRECISION, alert rate ≤ MAX_ALERT_RATE.
+      3. Head-to-head vs the incumbent on the SAME set: candidate AUC ≥
+         incumbent − MAX_AUC_DROP, AP ≥ incumbent AP, Brier ≤ incumbent Brier,
+         ECE ≤ incumbent ECE + MAX_ECE_INCREASE.
+
+    Fail-closed: a feature-contract change does NOT auto-promote on floors
+    alone (returns pending review unless MODEL_GATE_ALLOW_FEATURE_CHANGE); an
+    incumbent-comparison error REJECTS (never fail-open). The promote message
+    says "candidate ≥ incumbent" ONLY when strictly ≥ on both AUC and AP, else
+    "within allowed regression tolerance".
+    """
+    if candidate_auc < MODEL_GATE_MIN_AUC:
+        return False, f"REJECTED: test AUC {candidate_auc:.4f} < floor {MODEL_GATE_MIN_AUC}"
+    ap_floor = MODEL_GATE_MIN_AP_UPLIFT * max(test_prevalence, 1e-9)
+    if candidate_ap < ap_floor:
+        return False, (f"REJECTED: test PR-AUC {candidate_ap:.4f} < "
+                       f"{MODEL_GATE_MIN_AP_UPLIFT}× prevalence ({ap_floor:.4f})")
+    # Operating floors (only enforced when configured > 0 / < 1).
+    if MODEL_GATE_MIN_WATCH_RECALL > 0 and candidate_watch_recall is not None \
+            and candidate_watch_recall < MODEL_GATE_MIN_WATCH_RECALL:
+        return False, (f"REJECTED: WATCH recall {candidate_watch_recall:.4f} < "
+                       f"floor {MODEL_GATE_MIN_WATCH_RECALL}")
+    if MODEL_GATE_MIN_WATCH_PRECISION > 0 and candidate_watch_precision is not None \
+            and candidate_watch_precision < MODEL_GATE_MIN_WATCH_PRECISION:
+        return False, (f"REJECTED: WATCH precision {candidate_watch_precision:.4f} < "
+                       f"floor {MODEL_GATE_MIN_WATCH_PRECISION}")
+    if MODEL_GATE_MAX_ALERT_RATE < 1.0 and candidate_alert_rate is not None \
+            and candidate_alert_rate > MODEL_GATE_MAX_ALERT_RATE:
+        return False, (f"REJECTED: alert rate {candidate_alert_rate:.4f} > "
+                       f"ceiling {MODEL_GATE_MAX_ALERT_RATE}")
+
+    if not os.path.isfile(promoted_path):
+        return True, "PROMOTED: passed floors; no incumbent model to compare against"
+
+    try:
+        current_model, current_meta = load_model_bundle(promoted_path)
+    except Exception as exc:
+        # Fail CLOSED — never promote past an unverifiable incumbent.
+        return False, (f"REJECTED (fail-closed): could not load incumbent for "
+                       f"head-to-head comparison ({exc})")
+
+    current_features = (current_meta or {}).get("features")
+    if current_features != list(feature_cols):
+        if not MODEL_GATE_ALLOW_FEATURE_CHANGE:
+            return False, (
+                "PENDING MANUAL REVIEW: feature contract differs from the "
+                "incumbent — not auto-promoted on floors alone. Set "
+                "MODEL_GATE_ALLOW_FEATURE_CHANGE=true for a reviewed migration.")
+        return True, ("PROMOTED: feature contract changed (allowed by "
+                      "MODEL_GATE_ALLOW_FEATURE_CHANGE) — head-to-head skipped")
+
+    try:
+        cur_proba = current_model.predict_proba(X_test)
+        cur_auc = float(roc_auc_score(y_test_bin, cur_proba))
+        cur_ap = float(average_precision_score(y_test_bin, cur_proba))
+        cur_brier = float(brier_score_loss(y_test_bin, cur_proba))
+        cur_ece = expected_calibration_error(y_test_bin, cur_proba)
+    except Exception as exc:
+        return False, (f"REJECTED (fail-closed): incumbent scoring failed ({exc})")
+
+    fails = []
+    if candidate_auc < cur_auc - MODEL_GATE_MAX_AUC_DROP:
+        fails.append(f"AUC {candidate_auc:.4f} < incumbent {cur_auc:.4f} − {MODEL_GATE_MAX_AUC_DROP}")
+    if candidate_ap < cur_ap:
+        fails.append(f"AP {candidate_ap:.4f} < incumbent {cur_ap:.4f}")
+    if candidate_brier is not None and candidate_brier > cur_brier:
+        fails.append(f"Brier {candidate_brier:.4f} > incumbent {cur_brier:.4f}")
+    if candidate_ece is not None and candidate_ece > cur_ece + MODEL_GATE_MAX_ECE_INCREASE:
+        fails.append(f"ECE {candidate_ece:.4f} > incumbent {cur_ece:.4f} + {MODEL_GATE_MAX_ECE_INCREASE}")
+    if fails:
+        return False, ("REJECTED: candidate worse than incumbent on the same "
+                       "comparison set — " + "; ".join(fails))
+
+    # Passed all head-to-head gates. Only claim "≥ incumbent" when TRUE.
+    strictly_ge = candidate_auc >= cur_auc and candidate_ap >= cur_ap
+    verdict = ("candidate ≥ incumbent" if strictly_ge
+               else "within allowed regression tolerance")
+    return True, (f"PROMOTED: {verdict} on same comparison set "
+                  f"(AUC {candidate_auc:.4f} vs {cur_auc:.4f}, "
+                  f"AP {candidate_ap:.4f} vs {cur_ap:.4f})")
+
+
+def _promote_bundle(bundle: dict, model_dir: str, promoted_path: str) -> None:
+    """Atomically install the candidate as the promoted model.
+
+    Sequence: write candidate to a temp file in the SAME directory (required
+    for os.replace atomicity), keep the incumbent at previous.pkl for
+    rollback, then one os.replace(). Readers see either the old complete
+    bundle or the new complete bundle — never a mixture.
+    """
+    import shutil
+    os.makedirs(model_dir, exist_ok=True)
+    candidate_path = os.path.join(model_dir, ".candidate.pkl.tmp")
+    write_pickle(bundle, candidate_path)
+    if os.path.isfile(promoted_path):
+        shutil.copy2(promoted_path, os.path.join(model_dir, "previous.pkl"))
+    os.replace(candidate_path, promoted_path)
+
+
 def expected_calibration_error(
     y_true: np.ndarray, proba: np.ndarray, n_bins: int = 10
 ) -> float:
@@ -477,6 +688,18 @@ def _build_search(
     # outer CV n_jobs=1 (sequential folds) so LightGBM's inner n_jobs=-1 gets
     # the full machine. cores²-thread oversubscription cratered the previous
     # run (load avg ~50, each fit 4-5× slower than expected).
+    #
+    # Tuning objective (audited item 3): ROC-AUC is insensitive to the rare
+    # positive class the alerts actually care about — at 3% prevalence a model
+    # can look excellent on AUC while ranking positives poorly at the top.
+    # Default is now average_precision (PR-AUC); override via TUNE_SCORING.
+    # Threshold selection stays separate (calib only). Both AUC and AP are
+    # reported on test regardless of the tuning objective.
+    scoring = os.getenv("TUNE_SCORING", "average_precision")
+    if scoring not in ("average_precision", "roc_auc"):
+        log.warning("TUNE_SCORING=%r unsupported — using average_precision", scoring)
+        scoring = "average_precision"
+    log.info("Hyperparameter search scoring objective: %s", scoring)
     if _BAYES_AVAILABLE and BayesSearchCV is not None and Categorical is not None:
         search_spaces = {k: Categorical(v) for k, v in PARAM_GRID.items()}
         try:
@@ -484,7 +707,7 @@ def _build_search(
                 estimator=estimator,
                 search_spaces=search_spaces,
                 n_iter=n_iter,
-                scoring="roc_auc",
+                scoring=scoring,
                 cv=cv,
                 random_state=random_state,
                 n_jobs=1,
@@ -499,7 +722,7 @@ def _build_search(
         estimator=estimator,
         param_distributions=PARAM_GRID,
         n_iter=n_iter,
-        scoring="roc_auc",
+        scoring=scoring,
         cv=cv,
         random_state=random_state,
         n_jobs=1,
@@ -570,15 +793,14 @@ def _refit_ensemble_with_early_stopping(
 
 
 class _EnsembleRegressor:
-    """Binary-classifier ensemble with optional Platt calibrator — picklable.
+    """Binary-classifier ensemble with an optional picklable calibrator.
 
     predict_proba(X) returns calibrated P(fire-in-3-days), shape (n,).
     predict(X) returns pseudo-days for risk_map.py / api.py — monotone in
     probability so bucket tiers still rank by imminence.
 
-    If `calibrator` is set (Platt sigmoid fit on val), raw ensemble probability
-    passes through it before being returned. This makes "0.7" actually mean
-    "≈70% of cells at this score really burn within 3 days".
+    Backward compatibility: historical Platt calibrators expose
+    ``predict_proba``; isotonic and similar regressors expose ``predict``.
     """
 
     def __init__(
@@ -587,7 +809,7 @@ class _EnsembleRegressor:
         calibrator: Any = None,
     ) -> None:
         self.models = models
-        self.calibrator = calibrator   # sklearn LogisticRegression (1-D in, prob out)
+        self.calibrator = calibrator
 
     def _raw_proba(self, X: Any) -> np.ndarray:
         probs = np.stack(
@@ -599,8 +821,13 @@ class _EnsembleRegressor:
         raw = self._raw_proba(X)
         if self.calibrator is None:
             return raw
-        # Platt scaler: 1-D logistic regression on raw probability
-        return self.calibrator.predict_proba(raw.reshape(-1, 1))[:, 1]
+        if hasattr(self.calibrator, "predict_proba"):
+            calibrated = self.calibrator.predict_proba(raw.reshape(-1, 1))[:, 1]
+        elif hasattr(self.calibrator, "predict"):
+            calibrated = self.calibrator.predict(raw)
+        else:
+            raise TypeError("calibrator must expose predict_proba() or predict()")
+        return np.clip(np.asarray(calibrated, dtype=float), 0.0, 1.0)
 
     def predict(self, X: Any) -> np.ndarray:
         return _prob_to_days_for_compat(self.predict_proba(X))
@@ -791,15 +1018,27 @@ def _render_training_report(
 
     ax = fig.add_subplot(gs[4, :])
     if len(y_test_true) > 0:
+        # gaussian_kde evaluation is O(n²) — on a 630k-row natural-prevalence
+        # test set that is ~4×10¹¹ kernel evaluations (hours of CPU; it
+        # wedged two training runs before this cap). A 20k subsample renders
+        # an indistinguishable density scatter in seconds.
+        MAX_KDE_POINTS = 20_000
+        if len(y_test_true) > MAX_KDE_POINTS:
+            rng = np.random.default_rng(0)
+            sel = rng.choice(len(y_test_true), MAX_KDE_POINTS, replace=False)
+            y_plot_true = y_test_true[sel]
+            y_plot_pred = y_test_pred[sel]
+        else:
+            y_plot_true, y_plot_pred = y_test_true, y_test_pred
         try:
             from scipy.stats import gaussian_kde
-            xy = np.vstack([y_test_true.astype(float), y_test_pred.astype(float)])
+            xy = np.vstack([y_plot_true.astype(float), y_plot_pred.astype(float)])
             density = gaussian_kde(xy)(xy)
         except Exception:
-            density = np.ones_like(y_test_true, dtype=float)
+            density = np.ones_like(y_plot_true, dtype=float)
         idx = np.argsort(density)
         sc = ax.scatter(
-            y_test_true[idx], y_test_pred[idx],
+            y_plot_true[idx], y_plot_pred[idx],
             c=density[idx], cmap="viridis", s=12, alpha=0.7,
         )
         plt.colorbar(sc, ax=ax, label="Density")
@@ -1107,6 +1346,11 @@ def main(
     #   calib — probability calibration + threshold selection (natural prev.)
     #   test  — touched exactly once, at the end, at natural prevalence
     PURGE_DAYS = 7
+    # Optional dedicated PROMOTION/champion block between calib and test
+    # (CHAMPION_FRACTION > 0 ⇒ 5-way split). Promotion gates then compare on
+    # champion, keeping the FINAL test untouched by model selection. Default 0
+    # = legacy 4-way behaviour.
+    champion_fraction = float(os.getenv("CHAMPION_FRACTION", "0.0"))
     try:
         split = date_grouped_split(
             feats["date"],
@@ -1114,6 +1358,7 @@ def main(
             calib_fraction=calib_fraction,
             test_fraction=test_fraction,
             purge_days=PURGE_DAYS,
+            champion_fraction=champion_fraction,
         )
     except ValueError as exc:
         n_dates = int(pd.Series(feats["date"]).nunique())
@@ -1132,13 +1377,18 @@ def main(
     train_df = feats[split.masks["train"]]
     val_df   = feats[split.masks["val"]]
     calib_df = feats[split.masks["calib"]]
+    champion_df = (feats[split.masks["champion"]]
+                   if "champion" in split.masks else None)
     test_df  = feats[split.masks["test"]]
     del feats
     gc.collect()
 
     split_prevalence = {}
-    for name, part in (("train", train_df), ("val", val_df),
-                       ("calib", calib_df), ("test", test_df)):
+    _parts = [("train", train_df), ("val", val_df), ("calib", calib_df)]
+    if champion_df is not None:
+        _parts.append(("champion", champion_df))
+    _parts.append(("test", test_df))
+    for name, part in _parts:
         prev = float(part["_y_bin"].mean()) if len(part) else 0.0
         split_prevalence[name] = round(prev, 5)
         log.info(
@@ -1154,15 +1404,40 @@ def main(
             int(calib_df["_y_bin"].sum()), int(test_df["_y_bin"].sum()),
         )
 
-    # Undersample negatives in TRAIN ONLY (fitting efficiency). val keeps its
-    # natural prevalence for early stopping; a separately-undersampled copy
-    # of val joins the final ensemble fit. calib/test are never resampled.
-    train_df_us = _undersample_negatives(train_df, "_y_bin", NEG_TO_POS_RATIO, random_state=random_state)
-    log.info(
-        "Train undersample (%d:1): %d → %d rows (pos=%d)",
-        NEG_TO_POS_RATIO, len(train_df), len(train_df_us),
-        int(train_df_us["_y_bin"].sum()),
-    )
+    # ── Class-imbalance handling (IMBALANCE_MODE, audited item 2) ────────────
+    # The legacy default (D) STACKS three corrections — 4:1 undersampling ×
+    # inverse-class-frequency sample weights × scale_pos_weight≈4 — an
+    # effective ~120× positive up-weighting at 3% natural prevalence that
+    # inflates raw probabilities and leans entirely on Platt to repair them.
+    # Modes (class balancing applied exactly once unless D):
+    #   A: natural prevalence, NO class weighting            (memory-heavy)
+    #   B: natural prevalence + scale_pos_weight only        (memory-heavy)
+    #   C: 4:1 undersampling + analytic prior correction, no extra weighting
+    #   D: legacy stacked behavior (default, backward-compatible)
+    imbalance_mode = os.getenv("IMBALANCE_MODE", "D").upper()
+    if imbalance_mode not in ("A", "B", "C", "D"):
+        log.warning("IMBALANCE_MODE=%r invalid — using D", imbalance_mode)
+        imbalance_mode = "D"
+    natural_pos = int(train_df["_y_bin"].sum())
+    natural_neg = int(len(train_df) - natural_pos)
+
+    if imbalance_mode in ("A", "B"):
+        train_df_us = train_df.copy()
+        log.info("IMBALANCE_MODE=%s: natural prevalence, no undersampling "
+                 "(%d rows — memory-heavy)", imbalance_mode, len(train_df_us))
+        undersample_beta = 1.0
+    else:
+        train_df_us = _undersample_negatives(
+            train_df, "_y_bin", NEG_TO_POS_RATIO, random_state=random_state)
+        kept_neg = int(len(train_df_us) - train_df_us["_y_bin"].sum())
+        # β = fraction of natural negatives kept — the analytic prior
+        # correction for mode C: p_natural = β·p / (β·p + (1 − p)).
+        undersample_beta = kept_neg / max(natural_neg, 1)
+        log.info(
+            "Train undersample (%d:1): %d → %d rows (pos=%d, beta=%.4f)",
+            NEG_TO_POS_RATIO, len(train_df), len(train_df_us),
+            int(train_df_us["_y_bin"].sum()), undersample_beta,
+        )
     del train_df
     gc.collect()
 
@@ -1175,17 +1450,24 @@ def main(
     y_test_days = test_df["days_until_fire"].to_numpy()
 
 
-    log.info("==== STEP 4b: compute sample weights (recency + class balance + multi-sat) ====")
+    log.info("==== STEP 4b: compute sample weights (mode %s) ====", imbalance_mode)
+    # multi_sat weighting is derived from the FUTURE target date (item 9): it
+    # shifts the estimand toward multi-satellite-confirmed fires. Toggleable so
+    # an ablation can measure exactly what it changes. Default on (legacy).
+    multisat_enabled = os.getenv("MULTISAT_WEIGHTING", "true").lower() in ("1", "true", "yes")
     multi_sat_train = (
         train_df_us["multi_sat_confirmed"].to_numpy()
-        if "multi_sat_confirmed" in train_df_us.columns else None
+        if (multisat_enabled and "multi_sat_confirmed" in train_df_us.columns) else None
     )
     if multi_sat_train is not None:
         n2 = int((multi_sat_train >= 2).sum())
         n3 = int((multi_sat_train >= 3).sum())
         log.info("  Multi-satellite confirmed positives: 2-sat=%d  3-sat=%d", n2, n3)
+    # Class-frequency weighting only in legacy mode D — modes A/B/C apply class
+    # balancing exactly once (none / scale_pos_weight / undersampling).
     sample_weight_train = _compute_sample_weights(
-        pd.Series(y_train_bin), train_df_us["date"], multi_sat=multi_sat_train
+        pd.Series(y_train_bin), train_df_us["date"], multi_sat=multi_sat_train,
+        class_weighting=(imbalance_mode == "D"),
     )
     log.info(
         "Sample weights: min=%.3f max=%.3f mean=%.3f",
@@ -1194,13 +1476,16 @@ def main(
         float(sample_weight_train.mean()),
     )
 
-    # scale_pos_weight to correct residual class imbalance after undersampling
     pos_train = int(y_train_bin.sum())
     neg_train = int(len(y_train_bin) - pos_train)
-    scale_pos_weight = neg_train / max(pos_train, 1)
+    if imbalance_mode in ("B", "D"):
+        # B: the ONE balancing mechanism. D: legacy stacking (documented above).
+        scale_pos_weight = neg_train / max(pos_train, 1)
+    else:
+        scale_pos_weight = 1.0
     log.info(
-        "scale_pos_weight = %.3f  (pos=%d, neg=%d in undersampled train)",
-        scale_pos_weight, pos_train, neg_train,
+        "scale_pos_weight = %.3f  (mode %s; pos=%d, neg=%d in train frame)",
+        scale_pos_weight, imbalance_mode, pos_train, neg_train,
     )
 
     log.info(
@@ -1234,7 +1519,8 @@ def main(
     best_params = dict(search.best_params_)
     log.info("⏱️  Tuning time: %.1f seconds", t_tune_elapsed)
     log.info("Best params: %s", best_params)
-    log.info("Best CV score (ROC-AUC): %.4f", float(search.best_score_))
+    tuning_scoring = getattr(search, "scoring", os.getenv("TUNE_SCORING", "average_precision"))
+    log.info("Best CV score (%s): %.4f", tuning_scoring, float(search.best_score_))
 
     log.info("==== STEP 6: fit ensemble on train, early stopping on val ====")
     t_refit_start = time.time()
@@ -1279,36 +1565,37 @@ def main(
     # All operating points are now chosen here, locked, and evaluated
     # exactly once on test below.
     log.info("==== STEP 6c: select operating thresholds on calib ====")
-    prec_c, rec_c, thr_c = precision_recall_curve(y_calib_bin, calib_proba)
-    f1_c = 2 * prec_c * rec_c / np.clip(prec_c + rec_c, 1e-9, None)
-    # precision_recall_curve returns len(thr)+1 points; align to thresholds
-    best_i = int(np.argmax(f1_c[:-1])) if len(thr_c) else 0
-    deploy_thr = float(thr_c[best_i]) if len(thr_c) else 0.5
-    calib_f1 = float(f1_c[best_i]) if len(thr_c) else 0.0
-    calib_prec_at_thr = float(prec_c[best_i]) if len(thr_c) else 0.0
-    calib_rec_at_thr = float(rec_c[best_i]) if len(thr_c) else 0.0
-
-    # Tier cutoffs (absolute probabilities for the risk map):
-    #   HIGH   = the deployment threshold (F1-optimal on calib)
-    #   MEDIUM = lowest threshold still catching ≥85% of calib fires
-    recall_target = 0.85
-    med_candidates = thr_c[rec_c[:-1] >= recall_target] if len(thr_c) else np.array([])
-    thr_medium = float(med_candidates.max()) if len(med_candidates) else deploy_thr / 2.0
-    thr_medium = min(thr_medium, deploy_thr * 0.999)  # keep MEDIUM strictly below HIGH
-    prob_tier_thresholds = {
-        "HIGH": round(deploy_thr, 4),
-        "MEDIUM": round(thr_medium, 4),
-        "LOW": 0.0,
-        "selected_on": "calib",
-        "calib_f1_at_high": round(calib_f1, 4),
-        "calib_precision_at_high": round(calib_prec_at_thr, 4),
-        "calib_recall_at_high": round(calib_rec_at_thr, 4),
-        "calib_recall_target_medium": recall_target,
-    }
+    # HIGH (F1-optimal, precision-oriented urgent alert) + WATCH (recall-target
+    # monitoring list) are both chosen on calib via the shared, leakage-safe
+    # selector in thresholds.py. Season-matched per-month thresholds are also
+    # computed when a month has enough positives (falls back to global
+    # otherwise). MEDIUM stays as a compatibility alias of WATCH.
+    thr_config = thresholds_mod.validate_config()
+    log.info("Threshold config: %s", thr_config)
+    prob_tier_thresholds = thresholds_mod.select_operational_thresholds(
+        y_calib_bin, calib_proba, dates=calib_df["date"],
+        group_by_month=True,
+    )
+    deploy_thr = float(prob_tier_thresholds["HIGH"])
+    watch_thr = float(prob_tier_thresholds["WATCH"])
+    calib_f1 = prob_tier_thresholds["high_metrics"]["f1"]
+    calib_prec_at_thr = prob_tier_thresholds["high_metrics"]["precision"]
+    calib_rec_at_thr = prob_tier_thresholds["high_metrics"]["recall"]
+    # Backward-compat alias keys some tools (risk_map string) still read.
+    prob_tier_thresholds["calib_f1_at_high"] = calib_f1
+    prob_tier_thresholds["calib_precision_at_high"] = calib_prec_at_thr
+    prob_tier_thresholds["calib_recall_at_high"] = calib_rec_at_thr
+    prob_tier_thresholds["calib_recall_target_medium"] = \
+        prob_tier_thresholds["watch_target_recall"]
+    _wfb = prob_tier_thresholds.get("watch_fallback_reason")
     log.info(
-        "Thresholds (calib): deploy/HIGH=%.4f (F1=%.3f, P=%.3f, R=%.3f)  MEDIUM=%.4f (recall≥%.0f%%)",
+        "Thresholds (calib): HIGH=%.4f (F1=%.3f P=%.3f R=%.3f)  "
+        "WATCH=%.4f (target R>=%.0f%%, calib R=%.3f P=%.3f)%s",
         deploy_thr, calib_f1, calib_prec_at_thr, calib_rec_at_thr,
-        thr_medium, recall_target * 100,
+        watch_thr, prob_tier_thresholds["watch_target_recall"] * 100,
+        prob_tier_thresholds["watch_metrics"]["recall"],
+        prob_tier_thresholds["watch_metrics"]["precision"],
+        f" [fallback: {_wfb}]" if _wfb else "",
     )
 
     log.info(
@@ -1339,14 +1626,49 @@ def main(
     rec = float(recall_score(y_test_bin, test_pred_bin, zero_division=0))
     f1 = float(f1_score(y_test_bin, test_pred_bin, zero_division=0))
 
-    # Precision @ K: among top-K highest-probability cells, what fraction are positive?
+    # Precision @ K + recall captured by top-K (relative-ranking view — kept
+    # distinct from the absolute-probability tiers). Shared implementation.
     n_test = len(test_proba)
-    pak_metrics = {}
-    for k_pct in (0.05, 0.10, 0.20):
-        k = max(int(n_test * k_pct), 1)
-        topk_idx = np.argsort(-test_proba)[:k]
-        pak = float(np.mean(y_test_bin[topk_idx]))
-        pak_metrics[f"precision_at_top_{int(k_pct*100)}pct"] = round(pak, 4)
+    pak_metrics = thresholds_mod.topk_metrics(y_test_bin, test_proba)
+
+    # Full HIGH + WATCH operating-point reports on the untouched test set
+    # (thresholds were locked on calib in STEP 6c; measured once here).
+    high_test_metrics = thresholds_mod.threshold_metrics(y_test_bin, test_proba, deploy_thr)
+    watch_test_metrics = thresholds_mod.threshold_metrics(y_test_bin, test_proba, watch_thr)
+
+    # Multi-target trade-off table measured on TEST (report-only — the cutoffs
+    # were chosen on CALIB in STEP 6c, never on test). Gives the owner the real
+    # precision/recall cost of catching more fires under this test window's
+    # (drifted) prevalence.
+    watch_tradeoff_test = []
+    for row in prob_tier_thresholds.get("watch_tradeoff", []):
+        tm_t = thresholds_mod.threshold_metrics(y_test_bin, test_proba, row["threshold"])
+        # Name the CALIB target apart from the REALIZED test metric so no one
+        # reads a calibration target as a held-out/production recall.
+        watch_tradeoff_test.append({
+            "target_recall": row["target_recall"],           # chosen on calib
+            "calib_threshold": row["threshold"],             # selected on calib
+            "calib_recall": row.get("recall"),               # recall on calib
+            "actual_test_recall": tm_t["recall"],            # transferred to test
+            "actual_test_precision": tm_t["precision"],
+            "actual_test_f1": tm_t["f1"],
+            "actual_test_alert_rate": tm_t["alert_rate"],
+            "actual_test_confusion_matrix": tm_t["confusion_matrix"],
+        })
+
+    # Base-rate drift monitor: calibration prevalence vs the most-recent
+    # (held-out) observed prevalence. A DIAGNOSTIC computed after thresholds
+    # are locked — it never feeds back into selection. A large ratio explains
+    # why a single fixed threshold under-recalls across seasons.
+    _calib_prev = float(prob_tier_thresholds.get("calib_prevalence", y_calib_bin.mean()))
+    drift_status = thresholds_mod.prevalence_drift(_calib_prev, float(y_test_bin.mean()))
+    if drift_status["drift_flag"]:
+        log.warning(
+            "⚠️  BASE-RATE DRIFT: calib prevalence %.4f vs recent %.4f (%.1fx) — "
+            "single-threshold recall is unreliable; WATCH list mitigates this.",
+            drift_status["calib_prevalence"], drift_status["recent_prevalence"],
+            drift_status["ratio"],
+        )
 
     # Calibration quality on test (measured, not fitted, here)
     test_ece = expected_calibration_error(y_test_bin, test_proba)
@@ -1408,6 +1730,14 @@ def main(
         "deployment_recall": round(deploy_rec, 4),
         "deployment_f1": round(deploy_f1, 4),
         "deployment_accuracy": round(deploy_acc, 4),
+        # Full HIGH + WATCH operating-point reports (precision/recall/F1/
+        # alert-rate/confusion at each locked threshold) + WATCH cutoff + the
+        # base-rate drift diagnostic.
+        "watch_threshold": round(watch_thr, 4),
+        "high_test_metrics": high_test_metrics,
+        "watch_test_metrics": watch_test_metrics,
+        "watch_tradeoff_test": watch_tradeoff_test,
+        "prevalence_drift": drift_status,
         # Calibration — fitted on calib, measured here on test.
         "ece": round(test_ece, 4),
         "ece_calib_before_calibration": round(calib_ece_before, 4),
@@ -1537,15 +1867,9 @@ def main(
     }
     pred_spread = pred_stats["p75"] - pred_stats["p25"]
 
-    log.info("==== STEP 8: persist artifacts ====")
+    log.info("==== STEP 8: prepare candidate artifacts (NOT yet promoted) ====")
     model_path = os.path.join(p["model_dir"], "lgbm_fire_date_model.pkl")
-    write_pickle(best_model, model_path)
-    log.info("Saved model → %s", model_path)
-
-    history_dir = os.path.join(p["model_dir"], "history")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    history_path = os.path.join(history_dir, f"{timestamp}_lightgbm.pkl")
-    write_pickle(best_model, history_path)
 
     feature_importance: List[Dict[str, Any]] = []
     if hasattr(best_model, "feature_importances_") and best_model.feature_importances_ is not None:
@@ -1612,6 +1936,13 @@ def main(
             "censored_tail_rows": int(n_censored),
             "censored_horizon_days": IMMINENT_DAYS,
             "undersampling": f"train only, {NEG_TO_POS_RATIO}:1 neg:pos",
+            "imbalance_mode": imbalance_mode,
+            "undersample_beta": round(float(undersample_beta), 6),
+            "prior_correction_note": (
+                "mode C raw-probability prior correction: "
+                "p_natural = beta*p / (beta*p + (1 - p)); Platt calibration on "
+                "the natural-prevalence calib split also absorbs this shift"),
+            "multisat_weighting": bool(multi_sat_train is not None),
             "calibration_fitted_on": "calib (natural prevalence, disjoint from fit data)",
             "threshold_selected_on": "calib",
             "test_evaluations": 1,
@@ -1658,6 +1989,8 @@ def main(
                 "f1": overall_bin["f1"],
                 "brier_score": overall_bin["brier_score"],
                 "threshold_selected_on": overall_bin["threshold_selected_on"],
+                # Truthy value lights the dashboard's "Calibrated" badge.
+                "calibration_method": overall_bin["calibration_method"],
                 "baselines": overall_bin["baselines"],
                 "precision_at_top_5pct": overall_bin["precision_at_top_5pct"],
                 "precision_at_top_10pct": overall_bin["precision_at_top_10pct"],
@@ -1669,6 +2002,17 @@ def main(
                 "deployment_recall": overall_bin["deployment_recall"],
                 "deployment_f1": overall_bin["deployment_f1"],
                 "deployment_accuracy": overall_bin["deployment_accuracy"],
+                # WATCH operating point + full HIGH/WATCH reports + drift flag
+                # (frontend distinguishes urgent HIGH from the WATCH monitoring
+                # list and surfaces the base-rate drift warning).
+                "watch_threshold": overall_bin["watch_threshold"],
+                "high_test_metrics": overall_bin["high_test_metrics"],
+                "watch_test_metrics": overall_bin["watch_test_metrics"],
+                "watch_tradeoff_test": overall_bin["watch_tradeoff_test"],
+                "prevalence_drift": overall_bin["prevalence_drift"],
+                "recall_captured_top_5pct": overall_bin["recall_captured_top_5pct"],
+                "recall_captured_top_10pct": overall_bin["recall_captured_top_10pct"],
+                "recall_captured_top_20pct": overall_bin["recall_captured_top_20pct"],
                 "reliability_bins": overall_bin["reliability_bins"],
                 # Test-set baseline for "uplift" framing in the dashboard.
                 # A random ranker's precision@K equals the positive rate.
@@ -1704,11 +2048,89 @@ def main(
         "training_time_seconds": round(total_elapsed, 2),
     }
 
-    meta_path = os.path.join(p["meta_dir"], "dataset_info.json")
-    write_json(metadata, meta_path, indent=2, default=str)
-    log.info("Saved metadata → %s", meta_path)
+    # ==== STEP 9b: quality gates → promote or reject ═════════════════════
+    # The trusted production model is replaced ONLY when the candidate
+    # passes the gates. A worse (or invalid) candidate is preserved for
+    # inspection under models/rejected/ and the incumbent keeps serving.
+    log.info("==== STEP 9b: promotion gates ====")
+    # With a champion split (CHAMPION_FRACTION > 0) the promotion decision runs
+    # ENTIRELY on the champion block: candidate metrics are recomputed there and
+    # the incumbent head-to-head scores the same champion rows. The FINAL test
+    # numbers above are then reported AFTER — and independent of — this decision.
+    if champion_df is not None and len(champion_df):
+        X_champ = champion_df[feature_cols]
+        y_champ = champion_df["_y_bin"].to_numpy()
+        champ_proba = best_model.predict_proba(X_champ)
+        gate_auc = float(roc_auc_score(y_champ, champ_proba)) if len(np.unique(y_champ)) > 1 else 0.0
+        gate_ap = float(average_precision_score(y_champ, champ_proba)) if len(np.unique(y_champ)) > 1 else 0.0
+        gate_brier = float(brier_score_loss(y_champ, champ_proba))
+        gate_ece = expected_calibration_error(y_champ, champ_proba)
+        gate_watch = thresholds_mod.threshold_metrics(y_champ, champ_proba, watch_thr)
+        gate_X, gate_y, gate_prev = X_champ, y_champ, float(y_champ.mean())
+        comparison_set = "champion (dedicated promotion split — final test untouched)"
+        log.info("Promotion comparison on CHAMPION split: AUC=%.4f AP=%.4f", gate_auc, gate_ap)
+    else:
+        gate_auc, gate_ap, gate_brier, gate_ece = auc, ap, brier, test_ece
+        gate_watch = watch_test_metrics
+        gate_X, gate_y, gate_prev = X_test, y_test_bin, float(y_test_bin.mean())
+        comparison_set = "held_out_test (champion-selection until CHAMPION_FRACTION > 0)"
 
-    if not skip_risk_map:
+    promoted, reason = _evaluate_promotion_gates(
+        candidate_auc=gate_auc,
+        candidate_ap=gate_ap,
+        test_prevalence=gate_prev,
+        X_test=gate_X,
+        y_test_bin=gate_y,
+        feature_cols=feature_cols,
+        promoted_path=model_path,
+        candidate_brier=gate_brier,
+        candidate_ece=gate_ece,
+        candidate_watch_recall=gate_watch.get("recall"),
+        candidate_watch_precision=gate_watch.get("precision"),
+        candidate_alert_rate=gate_watch.get("alert_rate"),
+    )
+    metadata["promotion"] = {
+        "promoted": bool(promoted),
+        "reason": reason,
+        "model_version": metadata["trained_at"],
+        "comparison_set": comparison_set,
+        "champion_fraction": champion_fraction,
+        "gates": {
+            "min_auc": MODEL_GATE_MIN_AUC,
+            "min_ap_uplift": MODEL_GATE_MIN_AP_UPLIFT,
+            "max_auc_drop_vs_incumbent": MODEL_GATE_MAX_AUC_DROP,
+            "max_ece_increase": MODEL_GATE_MAX_ECE_INCREASE,
+            "min_watch_recall": MODEL_GATE_MIN_WATCH_RECALL,
+            "min_watch_precision": MODEL_GATE_MIN_WATCH_PRECISION,
+            "max_alert_rate": MODEL_GATE_MAX_ALERT_RATE,
+            "allow_feature_change": MODEL_GATE_ALLOW_FEATURE_CHANGE,
+        },
+    }
+    log.info("%s", reason)
+
+    bundle = {"format": "bundle-v1", "model": best_model, "metadata": metadata}
+    meta_path = os.path.join(p["meta_dir"], "dataset_info.json")
+
+    if promoted:
+        _promote_bundle(bundle, p["model_dir"], model_path)
+        log.info("Promoted model bundle → %s (incumbent kept at previous.pkl)", model_path)
+        # Display metadata AFTER the bundle swap — the bundle is the
+        # authoritative pair; this JSON is for the frontend/docs.
+        write_json(metadata, meta_path, indent=2, default=str)
+        log.info("Saved metadata → %s", meta_path)
+        history_path = os.path.join(p["model_dir"], "history",
+                                    f"{timestamp}_lightgbm.pkl")
+        write_pickle(bundle, history_path)
+    else:
+        rejected_dir = os.path.join(p["model_dir"], "rejected")
+        os.makedirs(rejected_dir, exist_ok=True)
+        rejected_path = os.path.join(rejected_dir, f"{timestamp}_lightgbm.pkl")
+        write_pickle(bundle, rejected_path)
+        log.warning("Candidate NOT promoted — kept for inspection at %s. "
+                    "The trusted model and its metadata are unchanged.",
+                    rejected_path)
+
+    if not skip_risk_map and promoted:
         log.info("==== STEP 10: refresh risk map ====")
         # Free the largest training objects before risk_map loads its own
         # ~3.5 GB parquet. `del locals()[name]` is a Python no-op (locals()
@@ -1725,6 +2147,9 @@ def main(
             generate_risk_map()
         except Exception as exc:
             log.warning("risk_map.run() failed: %s", exc)
+    elif not promoted:
+        log.info("Risk map NOT refreshed — last snapshot from the trusted "
+                 "model keeps serving.")
 
     return metadata
 

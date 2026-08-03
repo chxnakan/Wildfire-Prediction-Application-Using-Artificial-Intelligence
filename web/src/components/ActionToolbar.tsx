@@ -1,86 +1,73 @@
 import { useState } from "react";
-import type { FireFeature, ValidationMetrics } from "../types";
-import { readProbability } from "../utils/probability";
+import type { ValidationMetrics } from "../types";
+import { useLang } from "../utils/i18n";
 
 interface Props {
-  predicted: FireFeature[];
+  exportCount: number;
+  onExport: () => void;
   metrics: ValidationMetrics | null;
   onShowDetails: () => void;
   onShowAlertSettings: () => void;
-  baseDate: string;
 }
 
 // Top-of-sidebar action bar — quick operator actions:
-//   • Export the currently-visible cells as CSV (operator field-day handoff)
-//   • Share the current view as a copy-paste URL
-//   • Open the alert-settings modal to play with thresholds
+//   • Export the current province/tier selection as CSV. The parent owns the
+//     canonical exporter so this button and the lower export button cannot
+//     disagree about filters or CSV escaping.
+//   • Copy the current route URL (filters are intentionally not claimed to be
+//     encoded in the link)
+//   • Explain the persisted HIGH/WATCH operating points
 //   • Open the technical details modal
 export default function ActionToolbar({
-  predicted, metrics, onShowDetails, onShowAlertSettings, baseDate,
+  exportCount, onExport, metrics, onShowDetails, onShowAlertSettings,
 }: Props) {
+  const { t } = useLang();
   const [shareStatus, setShareStatus] = useState<string | null>(null);
-
-  const handleExport = () => {
-    if (!predicted.length) return;
-    const headers = [
-      "lat", "lon", "predicted_fire_date", "days_until_fire", "probability_pct",
-      "urgency_level", "historical_fire_count_30d", "nearest_urban_area",
-      "nearest_urban_distance_km", "province",
-    ];
-    const rows = predicted.map((f) => {
-      const [lon, lat] = f.geometry.coordinates;
-      const p = f.properties;
-      const prob = readProbability(p);
-      return [
-        lat.toFixed(4),
-        lon.toFixed(4),
-        p.predicted_fire_date ?? "",
-        p.days_until_fire ?? "",
-        prob != null ? (prob * 100).toFixed(1) : "",
-        p.urgency_level ?? "",
-        p.historical_fire_count_30d ?? "",
-        p.nearest_urban_area ?? "",
-        p.nearest_urban_distance_km != null ? Number(p.nearest_urban_distance_km).toFixed(1) : "",
-        p.province ?? "",
-      ].map((v) => {
-        const s = String(v);
-        return s.includes(",") ? `"${s}"` : s;
-      }).join(",");
-    });
-    const csv = [headers.join(","), ...rows].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `fire_predictions_${baseDate}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
 
   const handleShare = async () => {
     const url = window.location.href;
     try {
-      await navigator.clipboard.writeText(url);
-      setShareStatus("✓ คัดลอกแล้ว");
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(url);
+      } else {
+        // Clipboard API is restricted to secure contexts in several browsers;
+        // the local demo commonly runs on http://0.0.0.0. Keep a scoped legacy
+        // fallback so copying the page link still works there.
+        const input = document.createElement("textarea");
+        input.value = url;
+        input.setAttribute("readonly", "");
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        let copied = false;
+        try {
+          input.select();
+          copied = document.execCommand("copy");
+        } finally {
+          input.remove();
+        }
+        if (!copied) throw new Error("Copy command was rejected");
+      }
+      setShareStatus(`✓ ${t("sidebar.copied")}`);
       setTimeout(() => setShareStatus(null), 2000);
     } catch {
-      setShareStatus("❌ คัดลอกไม่ได้");
+      setShareStatus(`❌ ${t("sidebar.copy_failed")}`);
       setTimeout(() => setShareStatus(null), 2000);
     }
   };
 
-  const isCalibrated = metrics?.calibration_method != null;
+  const isCalibrated =
+    metrics?.calibration_method != null ||
+    metrics?.threshold_selected_on === "calib";
 
   return (
     <div className="action-toolbar">
       <button
         className="action-btn"
         type="button"
-        onClick={handleExport}
-        disabled={!predicted.length}
-        title={predicted.length ? `Export ${predicted.length} cells as CSV` : "ไม่มี cells ให้ export"}
+        onClick={onExport}
+        disabled={exportCount === 0}
+        title={exportCount > 0 ? `Export ${exportCount} selected cells as CSV` : "ไม่มี cells ให้ export"}
       >
         <span className="action-btn-icon">📥</span>
         <span>Export CSV</span>
@@ -89,16 +76,16 @@ export default function ActionToolbar({
         className="action-btn"
         type="button"
         onClick={handleShare}
-        title="คัดลอก URL ปัจจุบัน"
+        title={t("sidebar.copy_page_link")}
       >
         <span className="action-btn-icon">🔗</span>
-        <span>{shareStatus ?? "Share"}</span>
+        <span>{shareStatus ?? t("btn.share")}</span>
       </button>
       <button
         className="action-btn"
         type="button"
         onClick={onShowAlertSettings}
-        title="ปรับ alert threshold + ดูผล"
+        title="ดูเกณฑ์ HIGH / WATCH ที่บันทึกไว้"
         disabled={!isCalibrated}
       >
         <span className="action-btn-icon">⚙️</span>

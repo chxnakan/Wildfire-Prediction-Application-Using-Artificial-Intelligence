@@ -44,6 +44,11 @@ AGG_COLUMNS = [
     "n_satellites_today",
 ]
 
+# Dataset-coverage feature kept separate from AGG_COLUMNS: unlike
+# n_satellites_today (cell-level confirmations), this is a date-level property
+# and must be copied onto zero-fire rows during densification.
+SATELLITE_COVERAGE_COLUMN = "n_active_satellites"
+
 # Names produced by fetch_weather.py — must match features.WEATHER_COLUMNS.
 WEATHER_COLUMNS = ["temp_max", "temp_min", "precip_sum", "wind_max", "et0"]
 
@@ -250,6 +255,16 @@ def grid_and_aggregate(
     df["_is_night"] = night_hours.astype(int)
     df["_is_afternoon"] = afternoon_hours.astype(int)
 
+    # Number of satellite products actually present in the input archive on
+    # this date. This explicitly marks the SNPP-only vs multi-satellite data
+    # eras without pretending that a platform was represented before its
+    # archive becomes available. It is known from the data feed at prediction
+    # time and is not derived from the future target.
+    coverage_by_date = (
+        df.groupby("date")["dataset"].nunique().sort_index().cummax()
+        .rename(SATELLITE_COVERAGE_COLUMN)
+    )
+
     daily = df.groupby(["lat_grid", "lon_grid", "date"], as_index=False).agg(
         fire_count=("frp", "count"),
         frp_sum=("frp", "sum"),
@@ -261,6 +276,9 @@ def grid_and_aggregate(
         night_fire_count=("_is_night", "sum"),
         afternoon_fire_count=("_is_afternoon", "sum"),
         n_satellites_today=("dataset", "nunique"),
+    )
+    daily[SATELLITE_COVERAGE_COLUMN] = (
+        daily["date"].map(coverage_by_date).astype("int8")
     )
 
     return daily.sort_values(["lat_grid", "lon_grid", "date"]).reset_index(drop=True)
@@ -291,6 +309,11 @@ def densify_active_cells(daily: pd.DataFrame) -> pd.DataFrame:
 
     daily = daily.copy()
     daily["date"] = pd.to_datetime(daily["date"]).dt.date
+    coverage_by_date = None
+    if SATELLITE_COVERAGE_COLUMN in daily.columns:
+        coverage_by_date = (
+            daily.groupby("date")[SATELLITE_COVERAGE_COLUMN].max().sort_index().cummax()
+        )
 
     # First detection per cell — rows strictly before this are excluded.
     first_seen = (
@@ -302,6 +325,11 @@ def densify_active_cells(daily: pd.DataFrame) -> pd.DataFrame:
 
     cells = daily[["lat_grid", "lon_grid"]].drop_duplicates().reset_index(drop=True)
     date_range = pd.date_range(daily["date"].min(), daily["date"].max(), freq="D").date
+    if coverage_by_date is not None:
+        # Carry the last observed archive era through a country-wide no-fire
+        # day. cummax/ffill are past-only and prevent platform outages or a
+        # quiet day from masquerading as an older satellite era.
+        coverage_by_date = coverage_by_date.reindex(date_range).ffill().fillna(0)
     dense_idx = cells.assign(_k=1).merge(
         pd.DataFrame({"date": date_range, "_k": 1}), on="_k"
     ).drop(columns="_k")
@@ -317,6 +345,12 @@ def densify_active_cells(daily: pd.DataFrame) -> pd.DataFrame:
 
     out = dense_idx.merge(daily, on=["lat_grid", "lon_grid", "date"], how="left")
     out[AGG_COLUMNS] = out[AGG_COLUMNS].fillna(0.0)
+    if coverage_by_date is not None:
+        # Date-level feed coverage applies equally to cells with and without a
+        # detection today. Missing dates remain explicit zero coverage.
+        out[SATELLITE_COVERAGE_COLUMN] = (
+            out["date"].map(coverage_by_date).fillna(0).astype("int8")
+        )
 
     log.info(
         "Densified %d cells × %d days causally: %d rows "

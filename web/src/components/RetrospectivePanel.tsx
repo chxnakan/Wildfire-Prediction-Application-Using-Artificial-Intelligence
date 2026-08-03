@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import type { FireFeature } from "../types";
+import { isActionableUrgency } from "../utils/risk";
 
 interface Props {
   allFeatures: FireFeature[];  // ALL features from GeoJSON (not just current snapshot)
@@ -8,13 +9,14 @@ interface Props {
 // Retrospective validation panel — answers "do past predictions actually
 // match reality?". The append-mode GeoJSON tags every past prediction with
 // validation_status:
-//   "hit"    — a real fire happened within the predicted ±1-day window
-//   "miss"   — no real fire (or fire happened far outside the window)
+//   "hit"    — the same cell recorded FIRMS during base_date+1 … +3
+//   "miss"   — no FIRMS hotspot in that cell during the complete window
 //   "future" — prediction window hasn't closed yet
 //
-// We aggregate by base_date so the operator can see a track-record across
-// the last N runs. This is the strongest "we're not making it up" signal:
-// past commitments + observable outcomes.
+// The operator headline is restricted to actionable HIGH/WATCH tiers.
+// Including Background rows would answer a different question and would make
+// the "alert track record" look like a model-wide precision estimate.
+const MIN_RATE_SAMPLE = 20;
 interface BaseDateStats {
   baseDate: string;
   hits: number;
@@ -31,7 +33,7 @@ function aggregate(features: FireFeature[]): BaseDateStats[] {
     const p = f.properties;
     const bd = p.base_date;
     const st = p.validation_status;
-    if (!bd || !st) continue;
+    if (!bd || !st || !isActionableUrgency(p.urgency_level)) continue;
     let entry = map.get(bd);
     if (!entry) {
       entry = {
@@ -74,7 +76,7 @@ const TIER_COLORS: Record<string, string> = {
 export default function RetrospectivePanel({ allFeatures }: Props) {
   const stats = useMemo(() => aggregate(allFeatures), [allFeatures]);
 
-  // Overall summary across all decided rows (excluding future)
+  // Overall summary across actionable decided rows (excluding future).
   const overall = useMemo(() => {
     let hit = 0, miss = 0, future = 0;
     for (const s of stats) {
@@ -89,10 +91,10 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
   if (stats.length === 0) {
     return (
       <div className="section">
-        <h3>🎯 Past Predictions</h3>
+        <h3>🎯 Actionable Alert Outcomes</h3>
         <p style={{ fontSize: 11, color: "var(--text-3)" }}>
-          ยังไม่มีข้อมูล retrospective. Predictions ใหม่จะถูก validate อัตโนมัติ
-          เมื่อเวลาผ่านไป
+          ยังไม่มี HIGH/WATCH snapshot ที่มี validation status ข้อมูลใหม่จะถูก
+          ประเมินเมื่อช่วง base_date+1 ถึง base_date+3 ปิดครบแล้ว
         </p>
       </div>
     );
@@ -100,9 +102,9 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
 
   return (
     <div className="section">
-      <h3>🎯 Past Predictions (Real Outcomes)</h3>
+      <h3>🎯 Actionable Alert Outcomes</h3>
       <p style={{ fontSize: 11, color: "var(--text-3)", marginBottom: 8 }}>
-        Predictions ในอดีต vs FIRMS ground truth — track record ทุก base_date
+        HIGH/WATCH ในอดีตเทียบกับ FIRMS แบบ same-cell ในช่วง 3 วัน
       </p>
 
       {/* Overall summary */}
@@ -119,11 +121,13 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
           Overall track record
         </div>
         <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 4 }}>
-          <span style={{ fontSize: 24, fontWeight: 700, color: overall.rate >= 0.4 ? "#22c55e" : overall.rate >= 0.2 ? "#eab308" : "#ef4444" }}>
-            {(overall.rate * 100).toFixed(1)}%
+          <span style={{ fontSize: 24, fontWeight: 700, color: overall.decided >= MIN_RATE_SAMPLE ? "#60a5fa" : "var(--text-3)" }}>
+            {overall.decided >= MIN_RATE_SAMPLE
+              ? `${(overall.rate * 100).toFixed(1)}%`
+              : "sample small"}
           </span>
           <span style={{ fontSize: 11, color: "var(--text-2)" }}>
-            {overall.hit} hits / {overall.decided} validated  ({overall.future} pending)
+            {overall.hit} hits / {overall.decided} decided alerts ({overall.future} pending)
           </span>
         </div>
       </div>
@@ -133,11 +137,8 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
         {stats.slice(0, 8).map((s) => {
           const decided = s.hits + s.misses;
           const isFutureOnly = decided === 0 && s.future > 0;
-          const color = isFutureOnly
-            ? "var(--text-3)"
-            : s.hitRate >= 0.5 ? "#22c55e"
-            : s.hitRate >= 0.25 ? "#eab308"
-            : "#ef4444";
+          const canShowRate = decided >= MIN_RATE_SAMPLE;
+          const color = canShowRate ? "#60a5fa" : "var(--text-3)";
           return (
             <div
               key={s.baseDate}
@@ -160,7 +161,7 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
                 </div>
               </div>
               <div style={{ display: "flex", gap: 4, flex: 1 }}>
-                {(["CRITICAL", "HIGH", "MEDIUM", "LOW"] as const).map((tier) => {
+                {(["CRITICAL", "HIGH", "MEDIUM"] as const).map((tier) => {
                   const t = s.byTier[tier] ?? { hit: 0, miss: 0, future: 0 };
                   const td = t.hit + t.miss;
                   if (td === 0 && t.future === 0) return null;
@@ -187,6 +188,15 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
               <div style={{ textAlign: "right", minWidth: 56 }}>
                 {isFutureOnly ? (
                   <span style={{ color: "var(--text-3)", fontSize: 11 }}>pending</span>
+                ) : !canShowRate ? (
+                  <>
+                    <div style={{ fontSize: 11, fontWeight: 700, color }}>
+                      {s.hits}/{decided}
+                    </div>
+                    <div style={{ fontSize: 9, color: "var(--text-3)" }}>
+                      count (n&lt;{MIN_RATE_SAMPLE})
+                    </div>
+                  </>
                 ) : (
                   <>
                     <div style={{ fontSize: 16, fontWeight: 700, color }}>
@@ -204,8 +214,10 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
       </div>
 
       <p style={{ fontSize: 10, color: "var(--text-3)", marginTop: 8, lineHeight: 1.45 }}>
-        <b>Hit</b> = predicted cell มี FIRMS hotspot ภายในช่วงที่ทำนาย ±1 วัน ·{" "}
-        <b>Miss</b> = ไม่มี · <b>Pending</b> = window ยังไม่ปิด.<br/>
+        <b>Hit</b> = cell เดียวกันมี FIRMS hotspot ในช่วง base_date+1…+3 ·{" "}
+        <b>Miss</b> = ไม่มี · <b>Pending</b> = window ยังไม่ปิดครบ.
+        แสดงเปอร์เซ็นต์เมื่อมีผลตัดสินอย่างน้อย {MIN_RATE_SAMPLE} รายการ และไม่รวม
+        Background เพราะส่วนนี้วัดเฉพาะ alert queue ไม่ใช่ metric ของทุก cell.<br/>
         คำนวณจาก append-mode GeoJSON ตอน <code style={{ background: "var(--surface-2)", padding: "0 3px", borderRadius: 2 }}>risk_map.py</code> รันแต่ละครั้ง
       </p>
     </div>

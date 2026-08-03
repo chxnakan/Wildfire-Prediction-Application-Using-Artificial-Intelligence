@@ -1,161 +1,180 @@
-# Production deploy — Railway
+# Production deployment — Railway
 
-Single Docker image, two services in one Railway project, one shared volume.
+The supported topology is **one Railway web service**, one PostgreSQL service,
+and one persistent volume:
 
-```
-                         ┌──────────────────────────────────┐
-                         │   Railway Project: fire-date     │
-                         │                                  │
-   GitHub ── push ──►   ─┤  ┌──────────┐    ┌──────────┐    │
-                         │  │   web    │    │   cron   │    │
-                         │  │ uvicorn  │    │ pipeline │    │
-                         │  │ :PORT    │    │ daily 6Z │    │
-                         │  └────┬─────┘    └────┬─────┘    │
-                         │       │ /srv          │ /srv     │
-                         │       └─────┬─────────┘          │
-                         │             ▼                    │
-                         │     ┌───────────────┐            │
-                         │     │ Volume "srv"  │            │
-                         │     │ /srv/data     │            │
-                         │     │ /srv/outputs  │            │
-                         │     └───────────────┘            │
-                         └──────────────────────────────────┘
+```text
+GitHub push
+    │
+    ▼
+Docker build (Node 22 SPA build → Python 3.13 runtime)
+    │
+    ▼
+FastAPI web service
+  ├─ React SPA + API
+  ├─ FIRMS sync / prediction refresh
+  ├─ retraining quality-gate check
+  └─ GISTDA polling
+    │
+    ├──────── PostgreSQL (audit data + advisory locks)
+    └──────── /srv volume (data + promoted model artifacts)
 ```
 
-The `web` service serves `/api/...` + `/geojson` + the built React SPA at `/`.
-The `cron` service runs `fetch_firms.py && train.py` daily, writing to the
-same `/srv` volume so the next API request reads the freshly-trained model.
+Do **not** create the optional `railway.cron.json` service for the normal
+deployment. Railway volumes attach to one service; a second service would not
+see the web service's `/srv` volume and its trained artifact would not reach the
+serving process. The in-process APScheduler jobs already provide guarded
+automation.
 
-## What's in the box
+## Files used
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Multi-stage: Node 20 builds the SPA → Python 3.11 runs FastAPI + serves the SPA. |
-| `railway.json` | Web-service config: builder=DOCKERFILE, healthcheck=`/health`. |
-| `railway.cron.json` | Cron-service config: same image, runs the pipeline at 06:00 UTC. |
-| `web/` | Vite + React + TypeScript dashboard (replaces `frontend/`). |
-| `src/api.py` | FastAPI app — now honors `OUTPUT_DIR`, mounts the SPA at `/`. |
-| `src/fetch_firms.py`, `src/train.py`, `src/risk_map.py` | Existing pipeline; runs in the cron service. |
+| `Dockerfile` | Builds the SPA and production Python runtime |
+| `railway.json` | Canonical Railway build/health configuration |
+| `railway.toml` | Mirrors the canonical web-service settings and documents variables |
+| `scripts/start.sh` | Seeds a new volume, then starts Uvicorn |
+| `src/scheduler.py` | Sync, predict, retrain-check, and GISTDA schedules |
 
-The legacy `frontend/` directory is left untouched for local dev fallback —
-delete it once Railway is the source of truth.
+## One-time Railway setup
 
-## First-time setup
+1. Create a project from this GitHub repository.
+2. Add PostgreSQL. Railway injects `DATABASE_URL`.
+3. Create a volume and attach it to the **web service** at `/srv`.
+4. Keep one web replica unless PostgreSQL is configured. With PostgreSQL,
+   advisory locks prevent duplicate poll/train work across replicas.
+5. Set:
 
-1. **Push the repo to GitHub** (Railway deploys from a GitHub-connected repo).
-
-2. **Create a Railway project + the web service:**
-   - New Project → Deploy from GitHub Repo → pick the repo.
-   - Railway will read `railway.json` automatically (DOCKERFILE builder, /health check).
-   - Set environment variables on this service:
-     ```
-     FIRMS_API_KEY = <your NASA FIRMS map key>
-     ```
-     All other path env vars (`OUTPUT_DIR`, `DATA_DIR`, `WEB_DIST_DIR`, …)
-     are baked into the Dockerfile defaults.
-
-3. **Create a Volume:**
-   - Project → Volumes → New Volume → name it `srv`, size 1–5 GB.
-   - Attach to the web service at mount path `/srv`.
-   - The Dockerfile pre-creates `/srv/data/{raw,firms,weather}` and `/srv/outputs`
-     so the volume comes up with the right structure on first mount.
-
-4. **Create the cron service** (same repo, same image, different command):
-   - Project → New Service → Deploy from GitHub → pick the **same repo**.
-   - In the service settings, set the config file path to `railway.cron.json`
-     (Settings → Service → Config Path).
-   - Attach the **same volume** `srv` at `/srv`.
-   - Copy `FIRMS_API_KEY` env var across.
-   - The cron service runs once at 06:00 UTC daily and exits.
-
-5. **Bootstrap the model** (the API needs an existing model to start):
-
-   Either trigger the cron service manually from the Railway UI for its first
-   run, OR train locally + commit `outputs/` and let the first deploy ship
-   with a model. Locally:
-   ```bash
-   cd src && python fetch_firms.py && python train.py
-   git add outputs/ && git commit -m "bootstrap: initial trained model"
-   git push
+   ```text
+   FIRMS_API_KEY=<NASA FIRMS map key>
+   ADMIN_TOKEN=<long random secret>
+   APP_ENV=production
    ```
-   The first deploy then has a usable model and the cron starts refreshing it
-   on the daily schedule.
 
-## Local dev parity
+6. Recommended runtime variables:
 
-Two ways to run locally with the same architecture:
+   ```text
+   SCHEDULER_ENABLED=true
+   SCHEDULER_SYNC_ENABLED=true
+   SCHEDULER_RETRAIN_ENABLED=true
+   SYNC_INTERVAL_MINUTES=10
+   RETRAIN_EVERY_DAYS=3
+   RETRAIN_CHECK_HOURS=6
+   TRAIN_ARGS=--quick
+   PREDICT_MAX_HISTORY_DAYS=180
 
-**A. Native (fast iteration on the SPA):**
-```bash
-# terminal 1 — backend
-cd src && uvicorn api:app --reload
+   GISTDA_ENABLED=true
+   GISTDA_POLL_SECONDS=300
+   GISTDA_RETENTION_DAYS=7
+   GISTDA_REQUEST_TIMEOUT_SECONDS=15
+   GISTDA_MAX_RETRIES=4
+   GISTDA_STALE_AFTER_SECONDS=900
+   ```
 
-# terminal 2 — Vite dev server with proxy → :8000
-cd web && npm install && npm run dev
-# open http://localhost:5173
+The two per-job switches default to `true`, so existing production deployments
+keep their current behaviour. They allow a GISTDA-only presentation process
+without coupling live observations to FIRMS sync or retraining; local demos
+should use `./run.sh --demo` so the safe combination is applied atomically.
+
+The Dockerfile supplies:
+
+```text
+OUTPUT_DIR=/srv/outputs
+DATA_DIR=/srv/data
+RAW_DIR=/srv/data/raw
+FIRMS_DIR=/srv/data/firms
+FIRMS_PATH=/srv/data/firms/firms_all.parquet
+WEATHER_DIR=/srv/data/weather
+WEB_DIST_DIR=/app/web/dist
 ```
 
-The Vite proxy forwards `/geojson`, `/api`, `/health`, `/predict*`,
-`/predictions*`, `/metrics`, `/metadata` to FastAPI on `:8000` — same paths
-the production single-origin setup uses, so no code branches.
+`railway.json` uses `/health` with a 300-second deployment health timeout.
+The endpoint intentionally returns HTTP 200 with `ready:false` when a fresh
+volume has not yet produced a model. This keeps the service alive while
+automation accumulates data; the dashboard must still disclose degraded state.
 
-**B. Docker (closer to prod):**
+## Bootstrap behavior
+
+The image includes the repository's current `data/` and `outputs/` as bootstrap
+content. `scripts/start.sh` copies them only when the corresponding `/srv`
+directory is empty. Later deploys do not overwrite the persistent artifact.
+
+For an empty deployment with no committed promoted model:
+
+- the API boots in degraded mode;
+- map/prediction endpoints remain unavailable or empty;
+- sync jobs collect FIRMS data;
+- training promotes a candidate only after its quality gates pass.
+
+For tomorrow's presentation, deploy an image that contains the already-tested
+promoted artifact or verify that `/srv/outputs` is populated before going live.
+
+## Pre-deploy validation
+
 ```bash
-docker build -t fire-date .
+cd web
+npm ci
+npm run typecheck
+npm test
+npm run build
+cd ..
+
+source .venv/bin/activate
+python -m compileall -q src scripts
+SCHEDULER_ENABLED=false python -m pytest
+
+git diff --check
+docker build -t firewatch-thailand .
 docker run --rm -p 8000:8000 \
-  -e FIRMS_API_KEY=$FIRMS_API_KEY \
-  -v $(pwd)/outputs:/srv/outputs \
-  -v $(pwd)/data:/srv/data \
-  fire-date
-# open http://localhost:8000
+  --env-file .env \
+  -e APP_ENV=production \
+  -e SCHEDULER_ENABLED=false \
+  firewatch-thailand
 ```
 
-## Env vars
-
-| Var | Default | Set where |
-|---|---|---|
-| `FIRMS_API_KEY` | — (required) | Both services in Railway |
-| `PORT` | 8000 | Railway sets automatically |
-| `OUTPUT_DIR` | `/srv/outputs` | Dockerfile (override per service if needed) |
-| `DATA_DIR`, `RAW_DIR`, `FIRMS_DIR`, `WEATHER_DIR`, `FIRMS_PATH` | `/srv/data/...` | Dockerfile |
-| `WEB_DIST_DIR` | `/app/web/dist` | Dockerfile (where the build stage drops the SPA) |
-| `VITE_API_BASE` | empty (same-origin) | Set on the web service if hosting the SPA on a different origin |
-| `MIN_HISTORICAL_FIRES_FOR_DISPLAY` etc. | see CLAUDE.md | Optional risk-map filters |
-
-## Operational notes
-
-- **Cost**: one Hobby plan ($5/mo) usually covers both services for moderate
-  traffic. Volume billed separately by GB.
-- **Cold starts**: the API loads the LightGBM model and feature parquet at
-  startup. With ~70 features and a few MB of features, startup is ~3–5 s.
-  Healthcheck timeout is 60 s in `railway.json` to absorb that.
-- **Cron failure**: `restartPolicyType: NEVER` on the cron service means a
-  failed run does NOT auto-retry — you'll see the failure in Railway logs at
-  the next firing. Investigate before relying on the next day's prediction.
-- **GeoJSON staleness**: `/health` exposes `geojson_age_days`. The SPA shows
-  a freshness badge derived from `base_date` separately. If `geojson_age_days
-  > 5`, the cron likely failed silently — check Railway logs.
-- **Volume contents survive redeploys** of the web image, so model retraining
-  doesn't have to happen on every deploy.
-
-## Updating the dashboard
-
-The SPA is built into the image at `docker build` time. Any change in `web/`
-needs a redeploy:
+Then verify:
 
 ```bash
-git push origin main   # Railway redeploys automatically
+curl -fsS http://localhost:8000/health
+curl -fsS http://localhost:8000/geojson >/dev/null
+curl -I http://localhost:8000/
 ```
 
-To preview before pushing:
+The dashboard should load, navigation should survive refresh on every hash
+route, and the browser console should show no blocked API/weather requests.
 
-```bash
-cd web && npm run build && npm run preview   # serves dist/ on :4173
-```
+## Operational checks
+
+Use these endpoints:
+
+| Endpoint | Check |
+|---|---|
+| `/health` | readiness, model load, data age, scheduler status |
+| `/api/analytics/hotspots` | GISTDA feed state and data availability |
+| `/live-hotspots` | cached live detections and freshness metadata |
+| `/geojson` | current snapshot, thresholds, metrics, provenance |
+
+Before a demo or incident review:
+
+1. Confirm `base_date`, `latest_data_time`, and `generated_at`.
+2. Confirm live-feed state is available/stale/unavailable, not merely `0`.
+3. Open one map cell and verify weather source is labelled.
+4. Open Predicted vs Actual and select a mature risk window.
+5. Confirm held-out metrics and snapshot-audit counts are clearly described as
+   different evidence.
+
+## Static hosting caveat
+
+`vercel.json` builds only the React SPA. It does not deploy FastAPI, model
+artifacts, database, or scheduler. If Vercel is used for the SPA, set
+`VITE_API_BASE` at **build time** to the HTTPS FastAPI origin and configure
+that API's CORS policy. Same-origin Railway hosting is the supported and
+simplest production path.
 
 ## Rollback
 
-Railway keeps prior deploys — pick a previous deployment in the dashboard and
-"Redeploy" to roll back the code. Volume contents (model artifacts) are NOT
-rolled back; if a bad model is in the volume, manually trigger the cron
-service's `train.py` step from a working commit.
+Railway can redeploy an earlier image, but the `/srv` volume is not rolled back
+with application code. A bad candidate should normally never replace the
+incumbent because promotion is quality-gated. If artifact rollback is needed,
+restore a known promoted bundle to `/srv/outputs`, restart the service, and
+verify `/health` plus `/geojson` before reopening access.
