@@ -105,7 +105,64 @@ def test_admin_rejects_wrong_token(client, monkeypatch):
     assert r.status_code == 403
 
 
+def test_manual_sync_uses_prediction_reload_callback_path(client, monkeypatch):
+    import api, security
+    monkeypatch.setattr(security, "IS_PRODUCTION", False)
+    monkeypatch.setattr(api, "ADMIN_TOKEN", "")
+
+    with mock.patch("threading.Thread") as thread:
+        response = client.post("/api/admin/sync")
+
+    assert response.status_code == 200
+    assert thread.call_args.kwargs["target"] is api.scheduler_module.sync_job
+    thread.return_value.start.assert_called_once_with()
+
+
 # ── notify: gated + no PII previews ──────────────────────────────────────────
+
+def test_notify_capability_is_preview_only_in_production(client, monkeypatch):
+    import api, security
+    monkeypatch.setattr(security, "IS_PRODUCTION", True)
+    monkeypatch.setattr(api, "ADMIN_TOKEN", "server-only-secret")
+
+    r = client.get("/api/notify/capabilities")
+
+    assert r.status_code == 200
+    assert r.json() == {
+        "mode": "stub",
+        "delivery_available": False,
+        "browser_queue_available": False,
+        "browser_log_available": False,
+        "persistence": "process_memory",
+    }
+    assert "secret" not in r.text.lower()
+
+
+def test_notify_capability_allows_only_open_dev_stub(client, monkeypatch):
+    import api, security
+    monkeypatch.setattr(security, "IS_PRODUCTION", False)
+    monkeypatch.setattr(api, "ADMIN_TOKEN", "")
+
+    body = client.get("/api/notify/capabilities").json()
+
+    assert body["delivery_available"] is False
+    assert body["browser_queue_available"] is True
+    assert body["browser_log_available"] is True
+    assert body["persistence"] == "process_memory"
+
+
+def test_notify_capability_disables_browser_when_dev_token_is_set(
+    client, monkeypatch,
+):
+    import api, security
+    monkeypatch.setattr(security, "IS_PRODUCTION", False)
+    monkeypatch.setattr(api, "ADMIN_TOKEN", "server-only-secret")
+
+    body = client.get("/api/notify/capabilities").json()
+
+    assert body["browser_queue_available"] is False
+    assert body["browser_log_available"] is False
+
 
 def test_notify_gated_in_prod(client, monkeypatch):
     import api, security
@@ -136,6 +193,20 @@ def test_predict_location_rejects_out_of_country(client):
     r = client.get("/predict/location", params={"lat": 48.85, "lon": 2.35})  # Paris
     assert r.status_code == 422
     assert r.json()["detail"]["error"] == "coordinates_out_of_bounds"
+
+
+def test_predict_location_rejects_foreign_point_inside_collection_bbox(client):
+    # Phnom Penh is inside FIRMS_BBOX (96..107 E, 4..22 N) but is not in the
+    # Thailand polygon.  The collection rectangle must never be presented as
+    # the national service boundary.
+    r = client.get(
+        "/predict/location", params={"lat": 11.5564, "lon": 104.9282}
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"] == {
+        "error": "coordinates_outside_thailand",
+        "detail": "lat/lon must fall within Thailand's land boundary.",
+    }
 
 
 # ── rate limiting (isolated bucket via unique X-Forwarded-For) ───────────────

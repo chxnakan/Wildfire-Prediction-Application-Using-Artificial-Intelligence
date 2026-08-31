@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  DEFAULT_TIER_FILTER,
   TIER_TO_URGENCY,
   urgencyToTier,
   isActionableUrgency,
@@ -21,19 +22,34 @@ describe("risk-tier semantics", () => {
     expect(urgencyToTier(undefined)).toBeNull();
   });
 
-  it("filters by tier, and 'all' matches everything", () => {
+  it("filters by tier, and 'all' matches every recognised risk tier", () => {
+    expect(matchesTierFilter("CRITICAL", "High")).toBe(true);
     expect(matchesTierFilter("HIGH", "High")).toBe(true);
     expect(matchesTierFilter("MEDIUM", "High")).toBe(false);
     expect(matchesTierFilter("MEDIUM", "Watch")).toBe(true);
     expect(matchesTierFilter("LOW", "Background")).toBe(true);
     expect(matchesTierFilter("LOW", "all")).toBe(true);
-    expect(matchesTierFilter(undefined, "all")).toBe(true);
+    expect(matchesTierFilter(undefined, "all")).toBe(false);
   });
 
-  it("counts HIGH and WATCH as actionable, not the unused CRITICAL tier", () => {
+  it("shows the complete retained tier set by default", () => {
+    expect(DEFAULT_TIER_FILTER).toBe("all");
+    expect(matchesTierFilter("CRITICAL", DEFAULT_TIER_FILTER)).toBe(true);
+    expect(matchesTierFilter("HIGH", DEFAULT_TIER_FILTER)).toBe(true);
+    expect(matchesTierFilter("MEDIUM", DEFAULT_TIER_FILTER)).toBe(true);
+    expect(matchesTierFilter("LOW", DEFAULT_TIER_FILTER)).toBe(true);
+
+    const plateau = Array.from({ length: 100 }, () => "LOW" as const);
+    expect(plateau.filter((tier) => matchesTierFilter(tier, DEFAULT_TIER_FILTER)))
+      .toHaveLength(100);
+    expect(plateau.filter((tier) => matchesTierFilter(tier, "Background")))
+      .toHaveLength(100);
+  });
+
+  it("counts every alert tier as actionable", () => {
     expect(isActionableUrgency("HIGH")).toBe(true);
     expect(isActionableUrgency("MEDIUM")).toBe(true);
-    expect(isActionableUrgency("CRITICAL")).toBe(false);
+    expect(isActionableUrgency("CRITICAL")).toBe(true);
     expect(isActionableUrgency("LOW")).toBe(false);
   });
 });

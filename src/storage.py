@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
@@ -91,6 +92,57 @@ def mkdirs_for(uri: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
+def _fsync_directory(path: str) -> None:
+    """Best-effort durability for an atomic rename on local filesystems."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:  # pragma: no cover - filesystem/platform dependent
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - filesystem/platform dependent
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_local_write(uri: str, writer) -> None:
+    """Write a local file completely, then replace its destination atomically.
+
+    The temporary file lives in the destination directory, which is required
+    for ``os.replace`` to remain a same-filesystem atomic operation.  Existing
+    permissions are preserved.  On any serialization/write failure, readers
+    continue to see the previous complete artifact and the temporary file is
+    removed.
+    """
+    path = _local_path(uri)
+    mkdirs_for(path)
+    parent = os.path.dirname(path) or "."
+    basename = os.path.basename(path)
+    extension = os.path.splitext(path)[1]
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{basename}.", suffix=f".tmp{extension}", dir=parent
+    )
+    os.close(fd)
+    try:
+        writer(temp_path)
+        if os.path.exists(path):
+            os.chmod(temp_path, os.stat(path).st_mode & 0o7777)
+        # pandas/json writers have closed the file before returning.  Reopen
+        # read-only to flush its contents to disk before publishing the name.
+        with open(temp_path, "rb") as f:
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+        _fsync_directory(parent)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 # ─────────────────────────────────────────────
 # Bytes / text / JSON
 # ─────────────────────────────────────────────
@@ -126,7 +178,18 @@ def read_json(uri: str) -> Any:
 
 
 def write_json(obj: Any, uri: str, *, indent: int | None = 2, default=None) -> None:
-    write_text(json.dumps(obj, indent=indent, default=default), uri)
+    if is_remote(uri):
+        # Object stores do not provide local rename semantics; retain the
+        # existing direct-write behaviour for remote URIs.
+        write_text(json.dumps(obj, indent=indent, default=default), uri)
+        return
+
+    def _write(path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=indent, default=default)
+            f.flush()
+
+    _atomic_local_write(uri, _write)
 
 
 # ─────────────────────────────────────────────
@@ -174,7 +237,13 @@ def read_table(uri: str, **kwargs) -> pd.DataFrame:
 
 
 def write_table(df: pd.DataFrame, uri: str, **kwargs) -> None:
-    """Write a CSV or Parquet table based on the URI extension."""
+    """Write a CSV or Parquet table based on the URI extension.
+
+    Local tables are promoted with a same-directory atomic replace.  This is
+    especially important for ``full_features.parquet``: API startup/reload can
+    now observe either the previous complete table or the new complete table,
+    never a partially-written Parquet footer.
+    """
     mkdirs_for(uri)
     if is_remote(uri):
         ext = os.path.splitext(uri)[1].lower()
@@ -183,7 +252,10 @@ def write_table(df: pd.DataFrame, uri: str, **kwargs) -> None:
         else:
             df.to_csv(uri, index=False, **kwargs)
         return
-    io_utils.write_table(df, _local_path(uri), **kwargs)
+    _atomic_local_write(
+        uri,
+        lambda temp_path: io_utils.write_table(df, temp_path, **kwargs),
+    )
 
 
 def resolve_existing(uri: str):

@@ -1,5 +1,6 @@
 import L from "leaflet";
 import type { FireFeature, UrgencyThresholds } from "../types";
+import { URGENCY_COLORS } from "../constants";
 import {
   heatmapColor,
   heatmapProbability,
@@ -16,6 +17,7 @@ interface Pt {
   lat: number;
   lon: number;
   value: number;
+  color: string;
 }
 
 interface RGB { r: number; g: number; b: number }
@@ -43,6 +45,14 @@ export function createHeatmapLayer(
       lat: f.geometry.coordinates[1],
       lon: f.geometry.coordinates[0],
       value: heatmapProbability(f.properties) ?? NaN,
+      // Persisted tiers are the source of truth for map colour. This matters
+      // for archived rows: current metadata thresholds must not be reapplied
+      // to a historical probability and silently change its tier colour.
+      color:
+        f.properties.urgency_level &&
+        f.properties.urgency_level in URGENCY_COLORS
+          ? URGENCY_COLORS[f.properties.urgency_level]
+          : heatmapColor(heatmapProbability(f.properties) ?? 0, thresholds),
     }))
     .filter((p) => isFinite(p.value));
   if (points.length === 0) return null;
@@ -71,14 +81,14 @@ export function createHeatmapLayer(
       const bufferLng = (radius / size.x) * lonSpan;
       const bufferLat = (radius / size.y) * latSpan;
 
-      const localPoints: { px: number; py: number; value: number }[] = [];
+      const localPoints: { px: number; py: number; value: number; color: string }[] = [];
       for (let i = 0; i < points.length; i++) {
         const p = points[i];
         if (p.lat < se.lat - bufferLat || p.lat > nw.lat + bufferLat) continue;
         if (p.lon < nw.lng - bufferLng || p.lon > se.lng + bufferLng) continue;
         const px = ((p.lon - nw.lng) / lonSpan) * size.x;
         const py = ((nw.lat - p.lat) / latSpan) * size.y;
-        localPoints.push({ px, py, value: p.value });
+        localPoints.push({ px, py, value: p.value, color: p.color });
       }
       if (localPoints.length === 0) return tile;
 
@@ -93,6 +103,7 @@ export function createHeatmapLayer(
           const y = (py + 0.5) * STRIDE;
 
           let nearestValue: number | null = null;
+          let nearestColor: string | null = null;
           let nearestDistSq = Infinity;
           let blobAlpha = 0;
 
@@ -105,6 +116,7 @@ export function createHeatmapLayer(
             if (d2 < nearestDistSq) {
               nearestDistSq = d2;
               nearestValue = lp.value;
+              nearestColor = lp.color;
             }
             const f = 1 - Math.sqrt(d2) / cutoff;
             const wAlpha = f * f;
@@ -116,7 +128,9 @@ export function createHeatmapLayer(
             data[idx + 3] = 0;
             continue;
           }
-          const color = hexToRgb(heatmapColor(nearestValue, thresholds));
+          const color = hexToRgb(
+            nearestColor ?? heatmapColor(nearestValue, thresholds),
+          );
           const riskIntensity = heatmapRiskIntensity(nearestValue, thresholds);
           data[idx] = color.r;
           data[idx + 1] = color.g;

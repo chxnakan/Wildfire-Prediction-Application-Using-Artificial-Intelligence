@@ -18,6 +18,11 @@ function isoCalendarDay(value: string): number | null {
   return Math.floor(ms / DAY_MS);
 }
 
+/** True only for a real Gregorian calendar date in YYYY-MM-DD form. */
+export function isIsoCalendarDate(value: string): boolean {
+  return isoCalendarDay(value) !== null;
+}
+
 function localTodayCalendarDay(now = new Date()): number {
   return Math.floor(
     Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / DAY_MS,

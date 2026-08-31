@@ -16,6 +16,30 @@ describe("live-fire refresh configuration", () => {
 });
 
 describe("fetchLiveFires", () => {
+  it("preserves the API page-limit disclosure instead of implying a total", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        features: [{ attributes: { latitude: 14, longitude: 100 } }],
+        metadata: {
+          count: 1,
+          returned_count: 1,
+          requested_limit: 3000,
+          truncated: true,
+        },
+      }),
+    } as Response));
+
+    const result = await fetchLiveFires();
+
+    expect(result.metadata).toMatchObject({
+      count: 1,
+      returnedCount: 1,
+      requestedLimit: 3000,
+      truncated: true,
+    });
+  });
+
   it("rejects an invalid payload so the app can retain its last good cache", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,

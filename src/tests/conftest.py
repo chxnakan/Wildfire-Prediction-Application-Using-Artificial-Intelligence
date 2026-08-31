@@ -25,9 +25,9 @@ import pytest  # noqa: E402
 @pytest.fixture(autouse=True)
 def _clean_memory_stores():
     """Isolate module-level in-memory state between tests: the DB stores AND
-    the scheduler's model-promoted callback registry (each TestClient lifespan
-    registers api's hot-reload callback; without clearing it they accumulate
-    and leak across TestClient instances)."""
+    the scheduler's model/prediction callback registries (each TestClient
+    lifespan registers API hot-reload callbacks; without clearing them they
+    accumulate and leak across TestClient instances)."""
     import db
     def _reset():
         db._MEM_LIVE.clear()
@@ -37,6 +37,8 @@ def _clean_memory_stores():
         try:
             import scheduler
             scheduler._on_model_promoted.clear()
+            scheduler._on_prediction_refreshed.clear()
+            scheduler._prediction_reload_pending = False
         except Exception:
             pass
     _reset()

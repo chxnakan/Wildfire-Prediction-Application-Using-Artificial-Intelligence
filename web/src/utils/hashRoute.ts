@@ -11,7 +11,6 @@ const VALID: AlertPageRoute[] = [
   "live",
   "reports",
   "compare",
-  "analytics",
 ];
 
 export function getRoute(): AlertPageRoute {

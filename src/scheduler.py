@@ -29,8 +29,10 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 import db
+from process_lock import process_lock_active
 
 log = logging.getLogger("scheduler")
 
@@ -49,10 +51,17 @@ TRAIN_LOCK = os.path.join(OUTPUT_DIR, ".train.lock")
 SYNC_INTERVAL_MINUTES = int(os.getenv("SYNC_INTERVAL_MINUTES", "10"))
 RETRAIN_EVERY_DAYS = float(os.getenv("RETRAIN_EVERY_DAYS", "3"))
 RETRAIN_CHECK_HOURS = int(os.getenv("RETRAIN_CHECK_HOURS", "6"))
-TRAIN_ARGS = os.getenv("TRAIN_ARGS", "--quick").split()
+# The regional archive causally densifies to tens of millions of rows when the
+# history is unbounded. Keep scheduled retrains on the same reviewed 400-day
+# window used by the promoted model; operators can still override TRAIN_ARGS.
+TRAIN_ARGS = os.getenv(
+    "TRAIN_ARGS", "--quick --max-history-days 400"
+).split()
 TRAIN_TIMEOUT_S = int(os.getenv("TRAIN_TIMEOUT_S", str(3 * 3600)))
 
 _scheduler = None
+_prediction_reload_pending = False
+_prediction_reload_lock = Lock()
 
 
 def _env_enabled(name: str, default: bool = True) -> bool:
@@ -66,8 +75,26 @@ def _env_enabled(name: str, default: bool = True) -> bool:
 # ─── jobs ─────────────────────────────────────────────────────────────────────
 
 def sync_job():
+    global _prediction_reload_pending
     from sync_worker import run_sync
-    run_sync()
+    summary = run_sync()
+    # predict-only keeps the promoted model but replaces the serving feature
+    # frame and GeoJSON. Refresh the API's in-memory snapshot only after that
+    # subprocess completed successfully; failed/no-op cycles keep the current
+    # atomic state untouched.
+    refreshed = summary.get("predictions_refreshed") is True
+    with _prediction_reload_lock:
+        if refreshed:
+            _prediction_reload_pending = True
+        attempted = _prediction_reload_pending
+        reload_succeeded = None
+        if attempted:
+            reload_succeeded = _fire_prediction_refreshed()
+            _prediction_reload_pending = not reload_succeeded
+        summary["serving_state_reload_attempted"] = attempted
+        summary["serving_state_reloaded"] = reload_succeeded
+        summary["serving_state_reload_pending"] = _prediction_reload_pending
+    return summary
 
 
 def gistda_poll_job():
@@ -125,10 +152,16 @@ def _read_promotion_from_meta() -> dict:
 # api.py registers its hot-reload here at startup, avoiding a circular
 # import (api imports scheduler; scheduler must not import api).
 _on_model_promoted: list = []
+_on_prediction_refreshed: list = []
 
 
 def register_model_promoted_callback(fn) -> None:
     _on_model_promoted.append(fn)
+
+
+def register_prediction_refreshed_callback(fn) -> None:
+    """Register a local-process reload after predict-only artifact refresh."""
+    _on_prediction_refreshed.append(fn)
 
 
 def _fire_model_promoted() -> None:
@@ -139,6 +172,24 @@ def _fire_model_promoted() -> None:
             log.exception("model-promoted callback failed")
 
 
+def _fire_prediction_refreshed() -> bool:
+    succeeded = True
+    for fn in list(_on_prediction_refreshed):
+        try:
+            result = fn()
+            if result is False:
+                succeeded = False
+                log.error(
+                    "prediction-refreshed callback could not reload serving state"
+                )
+        except Exception:
+            succeeded = False
+            # The refreshed files stay on disk, while reload_model_state's
+            # build-then-swap contract preserves the last good in-memory state.
+            log.exception("prediction-refreshed callback failed")
+    return succeeded
+
+
 def retrain_check_job():
     last = _last_train_time()
     if last is not None:
@@ -147,7 +198,9 @@ def retrain_check_job():
             log.info("Model is %.1f days old (< %s) — no retrain needed",
                      age.total_seconds() / 86400, RETRAIN_EVERY_DAYS)
             return
-    if os.path.exists(TRAIN_LOCK) or db.any_run_in_progress():
+    if process_lock_active(
+        TRAIN_LOCK, max_age_seconds=TRAIN_TIMEOUT_S
+    ) or db.any_run_in_progress():
         log.info("Training already in progress — skipping")
         return
     retrain_now(trigger="scheduled")
@@ -278,9 +331,13 @@ def shutdown():
 
 def status() -> dict:
     if _scheduler is None:
-        return {"running": False}
+        return {
+            "running": False,
+            "prediction_reload_pending": _prediction_reload_pending,
+        }
     return {
         "running": True,
+        "prediction_reload_pending": _prediction_reload_pending,
         "jobs": [
             {
                 "id": j.id,

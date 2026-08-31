@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchNotifyLog, postNotify } from "../api";
+import { fetchNotifyCapabilities, fetchNotifyLog, postNotify } from "../api";
 import { localIsoDate } from "../utils/dates";
 import { fmtTr, useLang } from "../utils/i18n";
 import { formatProbabilityPercent, readProbability } from "../utils/probability";
 import type {
   FireFeature,
+  NotifyCapabilities,
   NotifyChannel,
   NotifyLogRecord,
   NotifyPriority,
@@ -13,6 +14,7 @@ import type {
 
 interface Props {
   predictedAll: FireFeature[];
+  horizonDays: number;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -22,13 +24,14 @@ interface Props {
 //   1. Lands on /#notify → table defaults to actionable HIGH + WATCH cells
 //   2. Selects rows (single or multi) → right drawer opens with the cells
 //   3. Picks channel + template + recipients → preview renders
-//   4. Clicks "ส่งการแจ้งเตือน" → confirmation modal → POST /api/notify
-//   5. Log entry appears at the bottom, row gets ✅ status
+//   4. Production: reviews the preview only (no browser dispatch capability)
+//      Local open-dev stub: may POST a temporary queue record to /api/notify
+//   5. Development queue records appear in the in-memory stub log
 //
 // Notes
 //   • Backend is a stub — actual SMS/LINE/Email delivery would require
-//     per-channel provider integration. We acknowledge this honestly in
-//     the UI ("Stub mode: messages queued, not delivered").
+//     per-channel provider integration. Production browsers never receive or
+//     send ADMIN_TOKEN, so the capability endpoint keeps the UI preview-only.
 //   • All "active alerts" are derived live from the GeoJSON predictedAll
 //     prop, filtered to the LATEST base_date that has any rows.
 // ─────────────────────────────────────────────────────────────
@@ -69,7 +72,7 @@ interface AlertRow {
 }
 
 // Templates speak in the model's real terms: a calibrated probability of a
-// hotspot within the next 3-day risk window — NEVER an exact predicted date or
+// hotspot within the persisted model risk window — NEVER an exact predicted date or
 // "fire in N days". {prob} = calibrated probability %, {tier} = risk tier.
 const TEMPLATES = [
   {
@@ -77,20 +80,20 @@ const TEMPLATES = [
     label: "Critical (วิกฤต)",
     body:
       "🔥 [{tier}] พื้นที่ {province} ({lat},{lon}) มีความเสี่ยงมีจุดไฟสูง " +
-      "(ความน่าจะเป็น {prob} ภายใน 3 วันข้างหน้า) กรุณาเฝ้าระวังและตรวจสอบพื้นที่",
+      "(ความน่าจะเป็น {prob} ภายใน {horizon} วันข้างหน้า) กรุณาเฝ้าระวังและตรวจสอบพื้นที่",
   },
   {
     id: "high",
     label: "High Alert (เสี่ยงสูง)",
     body:
       "⚠️ [{tier}] ความเสี่ยงมีจุดไฟที่ {province} — ความน่าจะเป็น {prob} " +
-      "ภายใน 3 วันข้างหน้า โปรดติดตามสถานการณ์",
+      "ภายใน {horizon} วันข้างหน้า โปรดติดตามสถานการณ์",
   },
   {
     id: "summary",
     label: "Daily Summary (รายงานประจำวัน)",
     body:
-      "📊 รายงานประจำวัน (ความเสี่ยงภายใน 3 วันข้างหน้า): HIGH {critical_count} จุด, " +
+      "📊 รายงานประจำวัน (ความเสี่ยงภายใน {horizon} วันข้างหน้า): HIGH {critical_count} จุด, " +
       "WATCH {high_count} จุด, อัปเดต {date}",
   },
 ] as const;
@@ -110,7 +113,7 @@ const PRIORITIES: { id: NotifyPriority; label: string; color: string }[] = [
 
 function renderTemplate(
   body: string,
-  ctx: { row?: AlertRow; rows: AlertRow[]; today: string }
+  ctx: { row?: AlertRow; rows: AlertRow[]; today: string; horizonDays: number }
 ): string {
   const first = ctx.row ?? ctx.rows[0];
   // HIGH tier = urgency HIGH; WATCH tier = urgency MEDIUM (the WATCH alias).
@@ -125,6 +128,7 @@ function renderTemplate(
     .replace(/{lon}/g, first?.lon?.toFixed(3) ?? "—")
     .replace(/{prob}/g, probPct)
     .replace(/{tier}/g, tierLabel)
+    .replace(/{horizon}/g, String(ctx.horizonDays))
     .replace(/{critical_count}/g, String(highCount))
     .replace(/{high_count}/g, String(watchCount))
     .replace(/{date}/g, ctx.today);
@@ -167,7 +171,7 @@ function extractAlertRows(features: FireFeature[]): AlertRow[] {
 type SortKey = "urgency" | "fire30" | "province" | "prob";
 type UrgencyFilter = UrgencyLevel | "ALL" | "ACTIONABLE";
 
-export default function NotifyPage({ predictedAll }: Props) {
+export default function NotifyPage({ predictedAll, horizonDays }: Props) {
   const { t } = useLang();
   // Localized labels for templates/channels — overlaid onto the const arrays
   const tplLabel = (id: string) =>
@@ -205,6 +209,15 @@ export default function NotifyPage({ predictedAll }: Props) {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Public, non-secret capability contract. Fail closed: until this confirms
+  // an intentionally open local-dev stub, the screen remains preview-only.
+  const [notifyCapabilities, setNotifyCapabilities] =
+    useState<NotifyCapabilities | null>(null);
+  const [capabilityLoading, setCapabilityLoading] = useState(true);
+  const [capabilityError, setCapabilityError] = useState<string | null>(null);
+  const browserQueueAvailable =
+    notifyCapabilities?.browser_queue_available === true;
+
   // ── Log ──
   const [log, setLog] = useState<NotifyLogRecord[]>([]);
   const [logLoading, setLogLoading] = useState(false);
@@ -215,7 +228,9 @@ export default function NotifyPage({ predictedAll }: Props) {
   const [logFromDate, setLogFromDate] = useState("");
   const [logToDate, setLogToDate] = useState("");
 
-  // Fetch log on mount + after each send
+  // Fetch the temporary stub log only after the public capability contract
+  // says this browser may access it. Production never makes a doomed
+  // privileged request and never needs an admin secret in JavaScript.
   const reloadLog = async () => {
     setLogLoading(true);
     setLogError(null);
@@ -229,8 +244,41 @@ export default function NotifyPage({ predictedAll }: Props) {
     }
   };
   useEffect(() => {
-    reloadLog();
+    let active = true;
+    setCapabilityLoading(true);
+    fetchNotifyCapabilities()
+      .then((capabilities) => {
+        if (!active) return;
+        setNotifyCapabilities(capabilities);
+        setCapabilityError(null);
+      })
+      .catch((capabilityFailure: unknown) => {
+        if (!active) return;
+        setNotifyCapabilities(null);
+        setCapabilityError(
+          capabilityFailure instanceof Error
+            ? capabilityFailure.message
+            : String(capabilityFailure),
+        );
+      })
+      .finally(() => {
+        if (active) setCapabilityLoading(false);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
+
+  useEffect(() => {
+    if (!notifyCapabilities) return;
+    if (notifyCapabilities.browser_log_available) {
+      void reloadLog();
+    } else {
+      setLog([]);
+      setLogError(null);
+      setLogLoading(false);
+    }
+  }, [notifyCapabilities]);
 
   // Provinces dropdown options (sorted, unique)
   const provinces = useMemo(() => {
@@ -327,16 +375,31 @@ export default function NotifyPage({ predictedAll }: Props) {
   const tmpl = TEMPLATES.find((t) => t.id === templateId) ?? TEMPLATES[0];
   const previewMessage =
     selectedRows.length === 1
-      ? renderTemplate(tmpl.body, { row: selectedRows[0], rows: selectedRows, today })
-      : renderTemplate(tmpl.body, { rows: selectedRows.length ? selectedRows : allRows, today });
+      ? renderTemplate(tmpl.body, {
+          row: selectedRows[0],
+          rows: selectedRows,
+          today,
+          horizonDays,
+        })
+      : renderTemplate(tmpl.body, {
+          rows: selectedRows.length ? selectedRows : allRows,
+          today,
+          horizonDays,
+        });
 
   const canSend =
+    browserQueueAvailable &&
     !sending &&
     recipients.length > 0 &&
     previewMessage.length > 0 &&
     (selectedRows.length > 0 || templateId === "summary");
 
   const performSend = async () => {
+    if (!browserQueueAvailable) {
+      setError(t("notify.capability.preview_only"));
+      setConfirmOpen(false);
+      return;
+    }
     setSending(true);
     setError(null);
     try {
@@ -452,6 +515,29 @@ export default function NotifyPage({ predictedAll }: Props) {
           {t("notify.daily_summary")}
         </button>
       </header>
+
+      <div
+        className={`notify-capability-banner ${
+          browserQueueAvailable ? "dev-stub" : "preview-only"
+        }`}
+        role={capabilityError ? "alert" : "status"}
+      >
+        <span aria-hidden="true">
+          {capabilityLoading ? "⏳" : browserQueueAvailable ? "🧪" : "ℹ️"}
+        </span>
+        <span>
+          {capabilityLoading
+            ? t("notify.capability.loading")
+            : capabilityError
+              ? t("notify.capability.unavailable")
+              : browserQueueAvailable
+                ? t("notify.capability.dev_stub")
+                : t("notify.capability.preview_only")}
+          {capabilityError && (
+            <small className="notify-capability-detail">{capabilityError}</small>
+          )}
+        </span>
+      </div>
 
       {/* Counts strip */}
       <div className="alert-counts">
@@ -656,7 +742,7 @@ export default function NotifyPage({ predictedAll }: Props) {
         role={drawerOpen ? "dialog" : undefined}
         aria-modal={drawerOpen ? "true" : undefined}
         aria-hidden={!drawerOpen}
-        aria-label="Send alert"
+        aria-label={t("notify.drawer.title")}
       >
         <div className="send-drawer-header">
           <h2>{t("notify.drawer.title")}</h2>
@@ -787,7 +873,11 @@ export default function NotifyPage({ predictedAll }: Props) {
                 priority === "urgent" ? "#f97316" : undefined,
             }}
           >
-            {sending ? t("notify.drawer.send.sending") : t("notify.drawer.send.idle")}
+            {sending
+              ? t("notify.drawer.send.sending")
+              : browserQueueAvailable
+                ? t("notify.drawer.send.idle")
+                : t("notify.drawer.send.unavailable")}
           </button>
         </div>
       </div>
@@ -849,8 +939,9 @@ export default function NotifyPage({ predictedAll }: Props) {
             onClick={() => setLogExpanded(!logExpanded)}
           >
             <span>{logExpanded ? "▼" : "▶"}</span>
-            <h3>📜 Dispatch Log ({log.length})</h3>
+            <h3>📜 {t("notify.log.title")} ({log.length})</h3>
           </button>
+          {notifyCapabilities?.browser_log_available && (
           <div className="call-log-actions">
             <input
               type="date"
@@ -884,10 +975,21 @@ export default function NotifyPage({ predictedAll }: Props) {
               📥 CSV
             </button>
           </div>
+          )}
         </div>
         {logExpanded && (
           <div className="call-log-body">
-            {logError ? (
+            {capabilityLoading ? (
+              <div className="empty-state" style={{ padding: 20 }} role="status">
+                <div className="empty-title">{t("notify.capability.loading")}</div>
+              </div>
+            ) : !notifyCapabilities?.browser_log_available ? (
+              <div className="empty-state" style={{ padding: 20 }}>
+                <div className="empty-icon">📝</div>
+                <div className="empty-title">{t("notify.log.preview_only.title")}</div>
+                <div className="empty-hint">{t("notify.log.preview_only.hint")}</div>
+              </div>
+            ) : logError ? (
               <div className="error-banner" role="alert">⚠️ {logError}</div>
             ) : logLoading && log.length === 0 ? (
               <div className="empty-state" style={{ padding: 20 }} role="status">

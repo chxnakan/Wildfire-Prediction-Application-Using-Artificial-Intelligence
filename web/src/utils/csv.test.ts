@@ -40,4 +40,19 @@ describe("buildCellsCsv", () => {
 
     expect(buildCellsCsv([feature])).toContain(",0.10,BACKGROUND,");
   });
+
+  it("uses the persisted model horizon instead of hardcoding three days", () => {
+    expect(buildCellsCsv([FEATURE], 5)).toContain(
+      "2026-07-24,2026-07-25,2026-07-29",
+    );
+  });
+
+  it("falls back safely when horizon metadata is invalid", () => {
+    expect(buildCellsCsv([FEATURE], 0)).toContain(
+      "2026-07-24,2026-07-25,2026-07-27",
+    );
+    expect(buildCellsCsv([FEATURE], "not-a-number")).toContain(
+      "2026-07-24,2026-07-25,2026-07-27",
+    );
+  });
 });

@@ -1,4 +1,5 @@
 import {
+  Component,
   lazy,
   Suspense,
   useCallback,
@@ -7,6 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
+import type { ErrorInfo, ReactNode } from "react";
 import { fetchGeoJson } from "./api";
 import AlertSettings from "./components/AlertSettings";
 import AlertToasts from "./components/AlertToasts";
@@ -20,12 +22,20 @@ import ThemeToggle from "./components/ThemeToggle";
 import WelcomeBanner from "./components/WelcomeBanner";
 import { useFireAlerts, useFireSseStream } from "./utils/fireAlerts";
 import { useHashRoute } from "./utils/hashRoute";
-import { isActionableUrgency, matchesTierFilter } from "./utils/risk";
+import {
+  DEFAULT_TIER_FILTER,
+  isActionableUrgency,
+  matchesTierFilter,
+} from "./utils/risk";
 import {
   isVeryLowProbability,
   readProbability,
 } from "./utils/probability";
 import { usePersistedState } from "./utils/usePersistedState";
+import {
+  currentMetadataAppliesToSnapshot,
+  resolveSnapshotDateIndex,
+} from "./utils/snapshotProvenance";
 import type {
   AlertPageRoute,
   DaySelection,
@@ -34,7 +44,7 @@ import type {
   GistdaFeature,
   LiveFireMeta,
 } from "./types";
-import { exportCellsCsv } from "./utils/csv";
+import { exportCellsCsv, normaliseHorizonDays } from "./utils/csv";
 import { fetchLiveFires, LIVE_REFRESH_MS } from "./utils/gistda";
 import { isInThailandBbox } from "./constants";
 import LanguageToggle from "./components/LanguageToggle";
@@ -43,19 +53,60 @@ import { fmtTr, LanguageContext, makeT, useLang, type LangCtx as LangCtxValue, t
 // Keep the default map/dashboard eager for the fastest operator landing view.
 // Heavier secondary routes load only when their tab is opened.
 const ComparePage = lazy(() => import("./components/ComparePage"));
-const HotspotAnalyticsPage = lazy(() => import("./components/HotspotAnalyticsPage"));
 const NotifyPage = lazy(() => import("./components/NotifyPage"));
 const ReportsPage = lazy(() => import("./components/ReportsPage"));
 
 function RouteLoadingFallback() {
+  const { t } = useLang();
   return (
     <main
       role="status"
       aria-live="polite"
       style={{ padding: 40, color: "var(--text-3)" }}
     >
-      Loading page…
+      {t("route.loading")}
     </main>
+  );
+}
+
+class RouteErrorBoundary extends Component<
+  { children: ReactNode; title: string; message: string; reloadLabel: string },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Lazy route failed to load", error, info);
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <main className="route-load-error" role="alert">
+        <h2>{this.props.title}</h2>
+        <p>{this.props.message}</p>
+        <button type="button" onClick={() => window.location.reload()}>
+          {this.props.reloadLabel}
+        </button>
+      </main>
+    );
+  }
+}
+
+function LazyRoute({ children }: { children: ReactNode }) {
+  const { t } = useLang();
+  return (
+    <RouteErrorBoundary
+      title={t("route.error.title")}
+      message={t("route.error.message")}
+      reloadLabel={t("route.error.reload")}
+    >
+      <Suspense fallback={<RouteLoadingFallback />}>{children}</Suspense>
+    </RouteErrorBoundary>
   );
 }
 
@@ -70,10 +121,10 @@ const DEFAULT_OPTIONS: DisplayOptions = {
   // frontend default.
   showPredicted: true,
   showCellPins: true,
-  // Start in presentation/operator focus mode: the latest snapshot currently
-  // contains many genuine but visually unhelpful <0.01% cells. The sidebar
-  // states the hidden count and lets users restore them; CSV keeps all cells.
-  hideVeryLowRisk: true,
+  // Show the complete retained candidate set by default. Hiding <0.01% cells
+  // is an explicit operator focus control; enabling it by default made the
+  // headline "visible" count look like the model had scored fewer cells.
+  hideVeryLowRisk: false,
   heatRadius: 33,
 };
 
@@ -103,7 +154,9 @@ function AppInner() {
 
   const [selectedBaseDate, setSelectedBaseDate] = useState<string>("latest");
   const [selectedProvince, setSelectedProvince] = useState<string>("all");
-  const [selectedDay, setSelectedDay] = useState<DaySelection>("all");
+  const [selectedDay, setSelectedDay] = useState<DaySelection>(
+    DEFAULT_TIER_FILTER,
+  );
   const [options, setOptions] = useState<DisplayOptions>(DEFAULT_OPTIONS);
 
   // GISTDA live OBSERVED hotspots (not predictions) — served from OUR
@@ -148,9 +201,8 @@ function AppInner() {
   // Hash-based routing between Dashboard / Notify / Reports
   const [route, navigate] = useHashRoute();
   // Map visibility and feed availability are separate concerns. Hiding the
-  // cyan overlay must not make the dedicated Live/Analytics routes empty.
-  const liveFeedNeeded =
-    options.showLiveFires || route === "live" || route === "analytics";
+  // cyan overlay must not make the dedicated Live route empty.
+  const liveFeedNeeded = options.showLiveFires || route === "live";
   // Close mobile drawer whenever the route changes
   useEffect(() => { setSidebarOpen(false); }, [route]);
 
@@ -192,6 +244,9 @@ function AppInner() {
         error: null,
         isStale: result.metadata.isStale,
         lastSuccessAt: result.metadata.lastSuccessAt,
+        truncated: result.metadata.truncated,
+        requestedLimit: result.metadata.requestedLimit,
+        returnedCount: result.metadata.returnedCount,
       });
     } catch (err) {
       if (controller.signal.aborted) return;
@@ -273,14 +328,14 @@ function AppInner() {
     if (!geojson) return null;
     // Two-stage Thailand filter:
     //   1. Bbox — fast first pass, drops obvious foreign cells.
-    //   2. Province presence — for PREDICTED features only, also require a
-    //      non-empty `province` field. risk_map.py only sets that when
+    //   2. Province presence — require a non-empty `province` field. risk_map.py
+    //      sets it only when
     //      find_province() returns a Thai province for the cell (inside the
     //      77-province polygon). Bbox-alone leaks into S.Myanmar / N.Laos
     //      etc; province filter drops those.
-    //   Observed FIRMS features keep just the bbox check — they're real
-    //   detections and the user might still want to see cross-border ones
-    //   for context (the Live Fires page has its own TH-only toggle).
+    //   Observed FIRMS rows outside the Thailand polygon have no province.
+    //   A bbox alone includes large parts of neighbouring countries, so those
+    //   rows must not appear under a Thailand map/label.
     const rawFeatures = (geojson.features ?? []).filter((f) => {
       const coordinates = f?.geometry?.coordinates;
       if (!Array.isArray(coordinates) || coordinates.length < 2) return false;
@@ -292,14 +347,9 @@ function AppInner() {
     });
     const features = rawFeatures.filter((f) => {
       const prov = (f.properties.province ?? "").trim();
-      // Predicted cells: require province annotation (drops S.Myanmar/N.Laos leaks
-      // that fall inside the BBOX but outside Thailand's polygon).
-      if (f.properties.source === "predicted") return prov.length > 0;
-      // Observed FIRMS: bbox is sufficient — real hotspot coordinates are already
-      // inside Thailand. Province annotation is present on newer snapshots
-      // (risk_map.py ≥2026-05-26) but absent on older ones. Dropping province-less
-      // observations would blank out the Compare page and Live Fires observed layer.
-      return true;
+      // Both scored cells and observed FIRMS rows use the backend's Thai
+      // province annotation as the polygon-membership evidence.
+      return prov.length > 0;
     });
 
     const observed = features.filter((f) => f.properties.source === "observed");
@@ -307,10 +357,14 @@ function AppInner() {
       (f) => f.properties.source === "predicted"
     );
 
-    const allBaseDates = [
-      ...new Set(predictedAll.map((f) => f.properties.base_date).filter(Boolean) as string[]),
-    ].sort();
-    const latestBaseDate = allBaseDates[allBaseDates.length - 1] ?? "N/A";
+    // metadata.base_date remains the authoritative current snapshot even when
+    // the backend intentionally emits zero predicted rows (for example, an
+    // all-Background day with BACKGROUND_CONTEXT_LIMIT=0). Deriving "latest"
+    // from rows alone would silently fall back to yesterday's retained map.
+    const { allBaseDates, latestBaseDate } = resolveSnapshotDateIndex(
+      predictedAll.map((feature) => feature.properties.base_date),
+      geojson.metadata?.base_date,
+    );
 
     let activeBaseDate = selectedBaseDate;
     if (
@@ -345,8 +399,10 @@ function AppInner() {
       }
     }
 
-    // Risk-tier filter (High / Watch / Background) — replaces the former
-    // day-0..7 pseudo-date buckets. Never a date filter.
+    // Risk-tier filter. The default shows every retained absolute tier so the
+    // map remains useful as a complete overview. Background is still visually
+    // neutral and excluded from the heat layer, so context cannot masquerade
+    // as an operational alert.
     const dayFiltered = provinceFiltered.filter(
       (f) => matchesTierFilter(f.properties.urgency_level, selectedDay)
     );
@@ -360,9 +416,19 @@ function AppInner() {
     const hiddenVeryLowCount = dayFiltered.length - mapPredicted.length;
 
     // Status message — the focus filter changes only what the map draws.
-    // Export keeps the complete tier/province selection.
-    const daySelectorMessage = options.hideVeryLowRisk
-      ? fmtTr(t("sidebar.showing.very_low_hidden"), {
+    // Export keeps the complete retained-candidate tier/province selection.
+    const selectedTierLabel =
+      selectedDay === "Alerts" ? t("sidebar.tierfilter.alerts")
+      : selectedDay === "High" ? t("sidebar.tierfilter.high")
+      : selectedDay === "Watch" ? t("sidebar.tierfilter.watch")
+      : selectedDay === "Background" ? t("sidebar.tierfilter.background")
+      : t("sidebar.tierfilter.all_candidates");
+    const daySelectorMessage = selectedDay === "Alerts"
+      ? dayFiltered.length > 0
+        ? fmtTr(t("sidebar.showing.alerts"), { n: dayFiltered.length })
+        : t("sidebar.showing.no_alerts")
+      : options.hideVeryLowRisk
+        ? fmtTr(t("sidebar.showing.very_low_hidden"), {
           visible: mapPredicted.length,
           hidden: hiddenVeryLowCount,
         })
@@ -370,8 +436,12 @@ function AppInner() {
         ? fmtTr(t("sidebar.showing.all"), { n: provinceFiltered.length })
         : fmtTr(t("sidebar.showing.tier"), {
             n: dayFiltered.length,
-            tier: selectedDay,
+            tier: selectedTierLabel,
           });
+
+    const backgroundCount = provinceFiltered.filter(
+      (feature) => feature.properties.urgency_level === "LOW",
+    ).length;
 
     return {
       observed,
@@ -380,6 +450,7 @@ function AppInner() {
       selectedPredicted: dayFiltered,      // full selection for CSV export
       visiblePredicted: mapPredicted,      // map after optional focus filter
       hiddenVeryLowCount,
+      backgroundCount,
       allBaseDates,
       latestBaseDate,
       activeBaseDate,
@@ -404,15 +475,6 @@ function AppInner() {
     }
   }, [derived, selectedProvince]);
 
-  // If the active tier went empty in this snapshot, fall back to "all".
-  useEffect(() => {
-    if (!derived || selectedDay === "all") return;
-    const count = derived.snapshotPredicted.filter(
-      (f) => matchesTierFilter(f.properties.urgency_level, selectedDay)
-    ).length;
-    if (count === 0) setSelectedDay("all");
-  }, [derived, selectedDay]);
-
   const onExportCsv = () => {
     if (!derived || !derived.selectedPredicted.length) {
       alert("Nothing to export — current filter has no cells.");
@@ -422,22 +484,38 @@ function AppInner() {
       derived.selectedPredicted,
       derived.activeBaseDate,
       selectedProvince,
-      selectedDay
+      selectedDay,
+      geojson?.metadata?.horizon_days ??
+        geojson?.metadata?.validation_summary?.horizon_days,
     );
   };
 
   const onBaseDateChange = (v: string) => {
     setSelectedBaseDate(v);
-    // Reset day filter so the new snapshot's full prediction set is visible.
-    setSelectedDay("all");
+    // A new snapshot returns to the complete retained tier view. Every marker
+    // keeps its absolute trained threshold label; Background is visible as
+    // context but is excluded from the heat layer.
+    setSelectedDay(DEFAULT_TIER_FILTER);
   };
 
   const meta = geojson?.metadata ?? {};
+  const currentMetadataApplies = derived
+      ? currentMetadataAppliesToSnapshot(
+        derived.activeBaseDate,
+        meta.thresholds_apply_to_base_date ?? meta.base_date,
+      )
+    : false;
+  const snapshotThresholds = currentMetadataApplies
+    ? meta.urgency_thresholds ?? null
+    : null;
+  const snapshotMetrics = currentMetadataApplies
+    ? meta.metrics ?? null
+    : null;
 
   // Keep the application shell and data-independent routes available even
   // when the prediction snapshot is loading or unavailable. Previously an
   // early full-page return removed navigation entirely, so a /#live or
-  // /#analytics route could not show its independently fetched evidence.
+  // /#live route could not show its independently fetched evidence.
   const actionableAlertCount = derived
     ? derived.predictedAll.filter(
         (f) =>
@@ -457,7 +535,7 @@ function AppInner() {
     />
   );
   // The quick guide explains map layers, so keep it on the map route only.
-  // Showing the fixed banner over Reports/Compare/Analytics obscured their
+  // Showing the fixed banner over Reports/Compare obscured their
   // headline controls on a first visit.
   const welcomeBanner = route === "dashboard" ? <WelcomeBanner /> : null;
 
@@ -492,27 +570,6 @@ function AppInner() {
     );
   }
 
-  if (route === "analytics") {
-    return (
-      <>
-        <TopBar
-          route={route}
-          onNavigate={navigate}
-          actionableAlertCount={actionableAlertCount}
-          showSidebarToggle={false}
-        />
-        <Suspense fallback={<RouteLoadingFallback />}>
-          <HotspotAnalyticsPage
-            liveFires={liveFires}
-            liveFireMeta={liveFireMeta}
-          />
-        </Suspense>
-        {welcomeBanner}
-        {fireToasts}
-      </>
-    );
-  }
-
   if (error) {
     return (
       <>
@@ -530,7 +587,7 @@ function AppInner() {
           <p>
             The model snapshot could not be loaded, so prediction-dependent
             pages show no replacement or placeholder risk values. Live Fires
-            and Analytics remain available from the navigation above.
+            remains available from the navigation above.
           </p>
           <p style={{ color: "var(--text-3, #a0a3aa)", fontSize: 12 }}>
             {error}
@@ -605,9 +662,15 @@ function AppInner() {
           actionableAlertCount={actionableAlertCount}
           showSidebarToggle={false}
         />
-        <Suspense fallback={<RouteLoadingFallback />}>
-          <NotifyPage predictedAll={derived.predictedAll} />
-        </Suspense>
+        <LazyRoute>
+          <NotifyPage
+            predictedAll={derived.predictedAll}
+            horizonDays={normaliseHorizonDays(
+              geojson?.metadata?.horizon_days ??
+              geojson?.metadata?.validation_summary?.horizon_days,
+            )}
+          />
+        </LazyRoute>
         {welcomeBanner}
         {fireToasts}
       </>
@@ -623,13 +686,13 @@ function AppInner() {
           actionableAlertCount={actionableAlertCount}
           showSidebarToggle={false}
         />
-        <Suspense fallback={<RouteLoadingFallback />}>
+        <LazyRoute>
           <ComparePage
             allFeatures={derived.predictedAll}
             observedFeatures={derived.observed}
             metrics={meta.metrics ?? null}
           />
-        </Suspense>
+        </LazyRoute>
         {welcomeBanner}
         {fireToasts}
       </>
@@ -645,12 +708,12 @@ function AppInner() {
           actionableAlertCount={actionableAlertCount}
           showSidebarToggle={false}
         />
-        <Suspense fallback={<RouteLoadingFallback />}>
+        <LazyRoute>
           <ReportsPage
             metrics={meta.metrics ?? null}
             predictedAll={derived.predictedAll}
           />
-        </Suspense>
+        </LazyRoute>
         {welcomeBanner}
         {fireToasts}
       </>
@@ -702,8 +765,8 @@ function AppInner() {
             ? derived.daySelectorMessage
             : "Model risk layer is hidden; filters and CSV data are unchanged."
         }
-        thresholds={meta.urgency_thresholds ?? null}
-        metrics={meta.metrics ?? null}
+        thresholds={snapshotThresholds}
+        metrics={snapshotMetrics}
         metadata={meta}
         options={options}
         onOptionsChange={(o) => setOptions((prev) => ({ ...prev, ...o }))}
@@ -719,21 +782,49 @@ function AppInner() {
         predictedAll={derived.predictedAll}
         predictedVisible={derived.visiblePredicted}
         liveFires={liveFires}
-        thresholds={meta.urgency_thresholds ?? null}
+        thresholds={snapshotThresholds}
         options={options}
+        predictionEmptyState={
+          options.showPredicted && derived.visiblePredicted.length === 0
+            ? {
+                title: selectedDay === "Alerts"
+                  ? t("map.empty.alerts.title")
+                  : t("map.empty.filter.title"),
+                body: selectedDay === "Alerts"
+                  ? fmtTr(t(
+                      derived.backgroundCount > 0
+                        ? "map.empty.alerts.body"
+                        : "map.empty.alerts.body_no_context",
+                    ), {
+                      date: derived.activeBaseDate,
+                      count: derived.backgroundCount,
+                    })
+                  : t("map.empty.filter.body"),
+                actionLabel: derived.backgroundCount > 0
+                  ? t("map.empty.show_background")
+                  : undefined,
+                onAction: derived.backgroundCount > 0
+                  ? () => setSelectedDay("Background")
+                  : undefined,
+              }
+            : null
+        }
       />
 
       <Legend
-        showPredicted={options.showPredicted}
-        showCritical={
-          derived.snapshotPredicted.some(
-            (feature) => feature.properties.urgency_level === "CRITICAL",
-          ) ||
-          (
-            typeof meta.urgency_thresholds?.CRITICAL === "number" &&
-            meta.urgency_thresholds.CRITICAL <= 1
-          )
-        }
+        showPredicted={options.showPredicted && derived.visiblePredicted.length > 0}
+        showCritical={derived.visiblePredicted.some(
+          (feature) => feature.properties.urgency_level === "CRITICAL",
+        )}
+        showHigh={derived.visiblePredicted.some(
+          (feature) => feature.properties.urgency_level === "HIGH",
+        )}
+        showWatch={derived.visiblePredicted.some(
+          (feature) => feature.properties.urgency_level === "MEDIUM",
+        )}
+        showBackground={derived.visiblePredicted.some(
+          (feature) => feature.properties.urgency_level === "LOW",
+        )}
         showObserved={options.showObserved}
         showLiveFire={options.showLiveFires && liveFires.length > 0}
       />
@@ -745,8 +836,8 @@ function AppInner() {
         predicted={derived.snapshotPredicted}
         observed={derived.observed}
         liveFires={liveFires}
-        metrics={meta.metrics ?? null}
-        thresholds={meta.urgency_thresholds ?? null}
+        metrics={snapshotMetrics}
+        thresholds={snapshotThresholds}
         metadata={meta}
         selectedProvince={selectedProvince}
         selectedDay={selectedDay}
@@ -756,7 +847,7 @@ function AppInner() {
         open={alertSettingsOpen}
         onClose={() => setAlertSettingsOpen(false)}
         predicted={derived.snapshotPredicted}
-        metrics={meta.metrics ?? null}
+        metrics={snapshotMetrics}
       />
 
       {welcomeBanner}
@@ -831,11 +922,17 @@ function TopBar({
 function Legend({
   showPredicted,
   showCritical,
+  showHigh,
+  showWatch,
+  showBackground,
   showObserved,
   showLiveFire,
 }: {
   showPredicted: boolean;
   showCritical: boolean;
+  showHigh: boolean;
+  showWatch: boolean;
+  showBackground: boolean;
   showObserved: boolean;
   showLiveFire: boolean;
 }) {
@@ -855,18 +952,24 @@ function Legend({
                 <span>{t("legend.critical")}</span>
               </div>
             )}
-            <div className="legend-item">
-              <div className="legend-color high" />
-              <span>{t("legend.high")}</span>
-            </div>
-            <div className="legend-item">
-              <div className="legend-color medium" />
-              <span>{t("legend.watch")}</span>
-            </div>
-            <div className="legend-item">
-              <div className="legend-color low" />
-              <span>{t("legend.background")}</span>
-            </div>
+            {showHigh && (
+              <div className="legend-item">
+                <div className="legend-color high" />
+                <span>{t("legend.high")}</span>
+              </div>
+            )}
+            {showWatch && (
+              <div className="legend-item">
+                <div className="legend-color medium" />
+                <span>{t("legend.watch")}</span>
+              </div>
+            )}
+            {showBackground && (
+              <div className="legend-item">
+                <div className="legend-color low" />
+                <span>{t("legend.background")}</span>
+              </div>
+            )}
           </>
         )}
         {showObserved && (

@@ -224,6 +224,7 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
   }, [predictedAll]);
 
   const sciStats = metrics?.scientific_stats;
+  const recallLimitedByDrift = metrics?.prevalence_drift?.drift_flag === true;
   const deploymentThreshold =
     typeof metrics?.deployment_threshold === "number" &&
     Number.isFinite(metrics.deployment_threshold)
@@ -309,7 +310,7 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
     }
     if (monthly.length) {
       sections.push({
-        name: "Rolling Monthly AUC (model stability)",
+        name: "Rolling Monthly AUC (in-sample descriptive diagnostic)",
         rows: [
           ["month", "auc", "positive_rate", "n_rows"],
           ...monthly.map((m) => [m.month, m.auc, m.positive_rate, m.n]),
@@ -327,7 +328,7 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
     }
     if (provinces.length) {
       sections.push({
-        name: "Provincial Breakdown (current snapshot)",
+        name: "Provincial Breakdown (latest retained map candidates)",
         rows: [
           ["province", "critical", "high", "medium", "low", "total"],
           ...provinces.map((p) => [p.prov, p.CRITICAL, p.HIGH, p.MEDIUM, p.LOW, p.total]),
@@ -408,7 +409,9 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
         <div>
           <h1>{t("page.reports.title", "📊 Reports · Scientific Analysis")}</h1>
           <p className="notify-page-subtitle">
-            {t("page.reports.subtitle", "Held-out test set performance + bootstrap confidence intervals + statistical tests")}
+            {t(sciStats
+              ? "page.reports.subtitle"
+              : "page.reports.subtitle.core")}
           </p>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
@@ -460,11 +463,14 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
             <tbody>
               <tr>
                 <td>{t("section.summary.row.recall")}</td>
-                <td className="mono right"><b style={{ color: "#22c55e" }}>{(sciStats.classification_stats.sensitivity * 100).toFixed(0)}%</b></td>
+                <td className="mono right"><b style={{ color: recallLimitedByDrift ? "#60a5fa" : "#22c55e" }}>{(sciStats.classification_stats.sensitivity * 100).toFixed(0)}%</b></td>
                 <td>
                   {fmtTr(t("section.summary.meaning.recall"), {
                     count: (sciStats.classification_stats.sensitivity * 100).toFixed(0),
                   })}
+                  {" "}{t(recallLimitedByDrift
+                    ? "section.summary.meaning.recall.watch_drift"
+                    : "section.summary.meaning.recall.watch")}
                 </td>
               </tr>
               <tr>
@@ -806,9 +812,12 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
       {sciStats ? (
         <StatisticsSection stats={sciStats} />
       ) : (
-        <section className="report-section">
-          <p style={{ color: "var(--text-3)" }}>
-            {fmtTr(t("section.no_scistats"), { cmd: ".venv/bin/python scripts/scientific_stats.py" })}
+        <section className="report-section" role="status">
+          <h2 style={{ fontSize: 14, marginBottom: 6 }}>
+            {t("section.no_scistats.title")}
+          </h2>
+          <p style={{ color: "var(--text-3)", lineHeight: 1.55 }}>
+            {t("section.no_scistats.hint")}
           </p>
         </section>
       )}
@@ -908,7 +917,7 @@ export default function ReportsPage({ metrics, predictedAll }: Props) {
 
       <footer className="report-footer">
         <p style={{ fontSize: 11, color: "var(--text-3)" }}>
-          ดูข้อมูลดิบ:{" "}
+          {t("reports.raw_data")}: {" "}
           <code style={{ background: "var(--surface-2)", padding: "1px 4px", borderRadius: 3 }}>outputs/metadata/rolling_eval.json</code>{" · "}
           <code style={{ background: "var(--surface-2)", padding: "1px 4px", borderRadius: 3 }}>outputs/metadata/dataset_info.json</code>
         </p>

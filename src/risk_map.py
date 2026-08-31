@@ -7,8 +7,8 @@
 #   • predicted:  model output on real features for the latest base date
 #   • historical_fire_count_30d: literal sum of FIRMS detections in this
 #                                grid cell over the 30 days ending at base_date
-#   • urgency_level: derived via thresholds calibrated on real validation
-#                    predictions (dataset_info.json["urgency_thresholds"])
+#   • urgency_level: derived via absolute probability thresholds selected on
+#                    the calibration split and persisted with the model
 # =========================================================
 
 import os
@@ -23,9 +23,6 @@ from features import (
     FEATURES_CORE,
     FEATURES_WEATHER,
     MAX_PREDICTION_DAYS,
-    DEFAULT_URGENCY_THRESHOLDS,
-    calibrate_urgency_thresholds,
-    urgency_from_thresholds,
 )
 from storage import exists, read_json, read_pickle, read_table, write_json
 from urban_areas import THAI_URBAN_AREAS, classify_urban
@@ -62,7 +59,7 @@ if not os.path.isabs(_FIRMS_PATH):
     _FIRMS_PATH = os.path.join(BASE_DIR, _FIRMS_PATH)
 
 
-def _latest_data_time() -> Optional[str]:
+def _latest_data_time(through_date: Optional[str] = None) -> Optional[str]:
     """Max FIRMS acquisition timestamp as a UTC ISO string — the real moment
     the freshest hotspot was observed, finer than the daily base_date. FIRMS
     acq times are UTC; a naive timestamp is localized to UTC so the frontend
@@ -71,7 +68,11 @@ def _latest_data_time() -> Optional[str]:
         if not os.path.exists(_FIRMS_PATH):
             return None
         col = pd.read_parquet(_FIRMS_PATH, columns=["acq_datetime"])["acq_datetime"]
-        latest = pd.to_datetime(col, errors="coerce").max()
+        parsed = pd.to_datetime(col, errors="coerce", utc=True)
+        if through_date:
+            end_exclusive = pd.Timestamp(through_date, tz="UTC") + pd.Timedelta(days=1)
+            parsed = parsed[parsed < end_exclusive]
+        latest = parsed.max()
         if pd.isna(latest):
             return None
         ts = pd.Timestamp(latest)
@@ -85,10 +86,11 @@ os.makedirs(RISKMAP_DIR, exist_ok=True)
 
 HISTORY_WINDOW_DAYS = 30
 
-# Short-window filter: cells must have ≥ N fires in the last HISTORY_WINDOW_DAYS
-# days. Catches "recently active" cells. Default 3 (was 1 — at 1 the dashboard
-# showed ~975 Thailand cells, vs GISTDA's ~74 hotspots/day; bumping to 3
-# brings the displayed scale closer to ground truth).
+# Short-window evidence: cells with ≥ N fires in the last HISTORY_WINDOW_DAYS
+# qualify as map candidates. The short-window, long-window and annual-rate
+# checks are alternatives: a cell is removed only when it fails every enabled
+# history check. This matters for newly active cells, which cannot yet have a
+# long climatology.
 MIN_HISTORICAL_FIRES_FOR_DISPLAY = int(os.getenv("MIN_HISTORICAL_FIRES_FOR_DISPLAY", "3"))
 
 # Long-window filter: cells must have ≥ N fires in the last
@@ -111,13 +113,19 @@ MIN_LONG_HISTORICAL_FIRES = int(os.getenv("MIN_LONG_HISTORICAL_FIRES", "3"))
 # Set to 0 to disable.
 MIN_FIRE_DAYS_PER_YEAR = float(os.getenv("MIN_FIRE_DAYS_PER_YEAR", "3.0"))
 
-# Per-day cap: regression model outputs concentrate predictions in 2-3 day
-# bucket (model bunching), so without a cap the dashboard would show ~500
-# cells "all firing on day 2" — wildly above GISTDA's observed ~74/day.
-# We rank cells within each predicted day by historical_fire_count_30d
-# (cells already actively burning are most likely to keep burning) and keep
-# only the top MAX_CELLS_PER_DAY. Default 100 ≈ GISTDA scale + headroom.
-# Set to 0 to disable.
+# Operational alerts are never capped: silently dropping a HIGH/WATCH cell is
+# more dangerous than returning a large alert set. Retain up to 100 Background
+# cells as clearly-labelled context by default, using model score + observed
+# history and never coordinates. This preserves the useful all-tier map while
+# preventing an unresolved calibration plateau from becoming a fake southern
+# cluster. Deployments can set 0 for alert-only or a larger reviewed limit.
+BACKGROUND_CONTEXT_LIMIT = int(os.getenv(
+    "BACKGROUND_CONTEXT_LIMIT",
+    os.getenv("MAX_CELLS_PER_DAY", "100"),
+))
+
+# Retained only for configuration/backward compatibility. It no longer caps
+# operational alerts or forces Background markers into the current snapshot.
 MAX_CELLS_PER_DAY = int(os.getenv("MAX_CELLS_PER_DAY", "100"))
 
 # Urban-exclusion filter: drop predictions that fall inside (or near) major
@@ -170,11 +178,22 @@ def _resolve_features(meta: dict, df: pd.DataFrame) -> list:
     return [c for c in (*FEATURES_CORE, *FEATURES_WEATHER) if c in df.columns]
 
 
-def _resolve_thresholds(meta: dict) -> dict:
-    t = meta.get("urgency_thresholds")
-    if isinstance(t, dict) and {"CRITICAL", "HIGH", "MEDIUM", "LOW"} <= set(t):
-        return {k: float(v) for k, v in t.items()}
-    return dict(DEFAULT_URGENCY_THRESHOLDS)
+def _probability_thresholds_source(tier_meta: dict) -> str:
+    """Human-readable provenance for persisted probability cutoffs.
+
+    Precision/recall here are calibration-split selection statistics, not
+    held-out test performance. Keep that distinction explicit wherever this
+    string is surfaced in the API/GeoJSON UI.
+    """
+    precision = tier_meta.get("calib_precision_at_high")
+    recall = tier_meta.get("calib_recall_at_high")
+    watch_target = tier_meta.get("calib_recall_target_medium")
+    return (
+        "absolute calibrated probability; cutoffs selected on calibration split "
+        f"(HIGH: calibration F1-optimal, calibration precision={precision}, "
+        f"calibration recall={recall}; WATCH/MEDIUM: calibration recall "
+        f"target≥{watch_target})"
+    )
 
 
 # =========================================================
@@ -334,6 +353,150 @@ def historical_fire_rate(df: pd.DataFrame) -> pd.DataFrame:
 # PREDICTED LAYER
 # =========================================================
 
+def _assign_urgency_tiers(
+    base: pd.DataFrame,
+    meta: dict,
+) -> tuple[pd.DataFrame, dict, str]:
+    """Assign absolute tiers before any display selection.
+
+    WATCH is canonical; MEDIUM remains the persisted GeoJSON compatibility
+    spelling. Legacy artifacts without probability thresholds fail closed to
+    LOW; their separate ``ranking_tier`` remains explicitly relative.
+
+    CRITICAL is deliberately not inferred from model metadata yet. The shared
+    API contract exposes High / Watch / Background only, so accepting an
+    extra GeoJSON-only cutoff would let the two prediction surfaces disagree.
+    The >1 sentinel is retained for legacy frontend/schema compatibility.
+    """
+    base = base.copy()
+    probs = base["probability"].to_numpy(dtype=float)
+    tier_meta = meta.get("probability_tier_thresholds") or {}
+    import inference as _inf
+    cutoffs = _inf.tier_cutoffs_from_meta(tier_meta)
+    if cutoffs is not None:
+        thr_high, thr_watch = cutoffs
+        base["urgency_level"] = np.select(
+            [probs >= thr_high, probs >= thr_watch],
+            ["HIGH", "MEDIUM"],
+            default="LOW",
+        )
+        thresholds = {
+            "CRITICAL": 1.01,
+            "HIGH": thr_high,
+            "MEDIUM": thr_watch,
+            "WATCH": thr_watch,
+            "LOW": 0.0,
+        }
+        source = _probability_thresholds_source(tier_meta)
+    else:
+        # No reviewed calibrated-probability contract means there is no honest
+        # basis for an absolute alert. In particular, never convert a top 10%
+        # quota or the legacy pseudo-days bucket into HIGH/WATCH.
+        disabled_cutoff = 1.01
+        base["urgency_level"] = "LOW"
+        thresholds = {
+            "CRITICAL": 1.01,
+            "HIGH": disabled_cutoff,
+            "MEDIUM": disabled_cutoff,
+            "WATCH": disabled_cutoff,
+            "LOW": 0.0,
+        }
+        source = (
+            "no absolute calibrated probability tier cutoffs in the model "
+            "artifact; urgency_level fails closed to LOW. ranking_tier is a "
+            "separate relative resource-allocation ordering; retrain to enable "
+            "absolute High/Watch alerts"
+        )
+    return base, thresholds, source
+
+
+def _score_resolution_diagnostics(
+    ranked: pd.DataFrame,
+    ranking_signal_source: str,
+) -> dict:
+    """Describe calibration/ranking resolution without changing any score."""
+    n = len(ranked)
+    if n == 0:
+        return {
+            "candidate_cells": 0,
+            "unique_calibrated_scores": 0,
+            "unique_ranking_scores": 0,
+            "largest_joint_tie_size": 0,
+            "largest_joint_tie_fraction": 0.0,
+            "ranking_signal_source": ranking_signal_source,
+            "status": "no_candidates",
+        }
+    prob_unique = int(ranked["probability"].nunique(dropna=False))
+    signal_unique = int(ranked["_model_ranking_signal"].nunique(dropna=False))
+    joint_sizes = ranked.groupby(
+        ["probability", "_model_ranking_signal"],
+        dropna=False,
+    ).size()
+    largest = int(joint_sizes.max()) if len(joint_sizes) else 0
+    fraction = largest / n
+    return {
+        "candidate_cells": int(n),
+        "unique_calibrated_scores": prob_unique,
+        "unique_ranking_scores": signal_unique,
+        "largest_joint_tie_size": largest,
+        "largest_joint_tie_fraction": round(float(fraction), 6),
+        "ranking_signal_source": ranking_signal_source,
+        "status": "insufficient_resolution" if fraction >= 0.5 else "resolved",
+        "note": (
+            "Raw model score is ordering-only inside calibrated plateaus; "
+            "calibrated probability remains authoritative for all risk tiers."
+        ),
+    }
+
+
+def _select_operational_and_context(
+    ranked: pd.DataFrame,
+    background_limit: int,
+) -> tuple[pd.DataFrame, dict]:
+    """Keep every alert and optionally add tie-safe Background context."""
+    operational_mask = ranked["urgency_level"].isin(["CRITICAL", "HIGH", "MEDIUM"])
+    operational = ranked[operational_mask].copy()
+    background = ranked[~operational_mask].copy()
+    limit = max(int(background_limit), 0)
+    boundary_tie_omitted = 0
+
+    if limit <= 0:
+        context = background.iloc[0:0].copy()
+    elif len(background) <= limit:
+        context = background.copy()
+    else:
+        context = background.head(limit).copy()
+        boundary_rank = context["rank"].iloc[-1]
+        total_at_boundary = int((background["rank"] == boundary_rank).sum())
+        included_at_boundary = int((context["rank"] == boundary_rank).sum())
+        if included_at_boundary < total_at_boundary:
+            # Never let serialization coordinates decide which members of an
+            # otherwise identical risk/evidence group enter the map.
+            boundary_tie_omitted = total_at_boundary
+            context = context[context["rank"] != boundary_rank].copy()
+
+    selected = pd.concat([operational, context], ignore_index=True)
+    if len(selected):
+        selected = selected.sort_values(
+            ["rank", "lat_grid", "lon_grid"],
+            ascending=[True, True, True],
+            kind="stable",
+        ).reset_index(drop=True)
+    policy = {
+        "scope": "all_operational_plus_optional_background_context",
+        "operational_alerts_before_selection": int(len(operational)),
+        "operational_alerts_retained": int(len(operational)),
+        "operational_alerts_suppressed": 0,
+        "background_candidates_before_selection": int(len(background)),
+        "background_context_enabled": bool(limit > 0),
+        "background_context_limit": int(limit),
+        "background_context_retained": int(len(context)),
+        "background_suppressed": int(len(background) - len(context)),
+        "boundary_tie_omitted": int(boundary_tie_omitted),
+        "ties_split": False,
+    }
+    return selected, policy
+
 def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
     base = df[df["date"] == base_date].copy()
 
@@ -356,6 +519,14 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
     # never report a different probability for the same cell.
     import inference
     base["probability"] = inference.calibrated_probability(model, X)
+    (
+        base["_model_ranking_signal"],
+        ranking_signal_source,
+    ) = inference.model_ranking_signal(
+        model,
+        X,
+        calibrated=base["probability"].to_numpy(dtype=float),
+    )
 
     raw_pred = model.predict(X)   # monotone pseudo-days (compat / display bins)
     # Floor into integer bins. These bins are PROBABILITY-RANK buckets that
@@ -402,40 +573,58 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
     rate = historical_fire_rate(df)
     base = base.merge(rate, on=["lat_grid", "lon_grid"], how="left")
     base["fire_days_total"] = base["fire_days_total"].fillna(0).astype(int)
-    base["fire_days_per_year"] = base["fire_days_per_year"].fillna(0.0)
+    # Preserve an unknown annual rate. Treating insufficient history as zero
+    # would fabricate evidence and incorrectly reject otherwise valid cells.
 
-    # Apply ALL filters in sequence. Cells must pass each one to be displayed.
+    # History checks are independent evidence paths. The old sequential AND
+    # chain required a cell to pass every check, contradicting the documented
+    # policy (drop only cells that fail all three) and shrinking the current
+    # Thailand snapshot from thousands of scored cells to only 19 candidates.
     n_total = len(base)
+    history_masks = []
     if MIN_HISTORICAL_FIRES_FOR_DISPLAY > 0:
-        before = len(base)
-        base = base[base["historical_fire_count_30d"] >= MIN_HISTORICAL_FIRES_FOR_DISPLAY].copy()
-        print(
-            f"Short-window  filter: ≥{MIN_HISTORICAL_FIRES_FOR_DISPLAY} fire(s) in "
-            f"last {HISTORY_WINDOW_DAYS}d → {len(base):,} / {before:,} kept "
-            f"({len(base)*100/max(before,1):.1f}%)"
+        recent_mask = (
+            base["historical_fire_count_30d"]
+            >= MIN_HISTORICAL_FIRES_FOR_DISPLAY
         )
+        history_masks.append(recent_mask)
+        print(
+            f"Short-window  evidence: ≥{MIN_HISTORICAL_FIRES_FOR_DISPLAY} fire(s) in "
+            f"last {HISTORY_WINDOW_DAYS}d → {int(recent_mask.sum()):,} / {n_total:,} match"
+        )
+    else:
+        recent_mask = pd.Series(False, index=base.index)
     if MIN_LONG_HISTORICAL_FIRES > 0:
-        before = len(base)
-        base = base[base[long_col] >= MIN_LONG_HISTORICAL_FIRES].copy()
+        long_mask = base[long_col] >= MIN_LONG_HISTORICAL_FIRES
+        history_masks.append(long_mask)
         print(
-            f"Long-window   filter: ≥{MIN_LONG_HISTORICAL_FIRES} fire(s) in "
-            f"last {LONG_HISTORY_WINDOW_DAYS}d → {len(base):,} / {before:,} kept "
-            f"({len(base)*100/max(before,1):.1f}%)"
+            f"Long-window   evidence: ≥{MIN_LONG_HISTORICAL_FIRES} fire(s) in "
+            f"last {LONG_HISTORY_WINDOW_DAYS}d → {int(long_mask.sum()):,} / {n_total:,} match"
         )
+    else:
+        long_mask = pd.Series(False, index=base.index)
     if MIN_FIRE_DAYS_PER_YEAR > 0:
-        before = len(base)
         # Cells with NaN fire_days_per_year (very short data record) are
-        # kept — we only filter when we have enough data to estimate a rate.
-        mask = (
-            base["fire_days_per_year"].isna()
-            | (base["fire_days_per_year"] >= MIN_FIRE_DAYS_PER_YEAR)
-        )
-        base = base[mask].copy()
+        # unknown for this evidence path; another enabled check may retain it.
+        rate_mask = base["fire_days_per_year"] >= MIN_FIRE_DAYS_PER_YEAR
+        history_masks.append(rate_mask.fillna(False))
         print(
-            f"Fire-rate     filter: ≥{MIN_FIRE_DAYS_PER_YEAR} fire-days/year "
-            f"(full history) → {len(base):,} / {before:,} kept "
-            f"({len(base)*100/max(before,1):.1f}%)"
+            f"Fire-rate     evidence: ≥{MIN_FIRE_DAYS_PER_YEAR} fire-days/year "
+            f"(full history) → {int(rate_mask.fillna(False).sum()):,} / {n_total:,} match"
         )
+    else:
+        rate_mask = pd.Series(False, index=base.index)
+
+    if history_masks:
+        history_keep = history_masks[0].copy()
+        for evidence_mask in history_masks[1:]:
+            history_keep |= evidence_mask
+        base = base[history_keep].copy()
+    after_history = len(base)
+    print(
+        f"History union  : {after_history:,} / {n_total:,} kept "
+        f"({after_history*100/max(n_total,1):.1f}%; pass any enabled check)"
+    )
 
     # Urban-exclusion: drop cells that fall inside (or near) cities. Run AFTER
     # the cheaper count/rate filters so we do the haversine pass on the
@@ -459,6 +648,7 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
             f"cities (+{URBAN_BUFFER_KM} km buffer); {len(base):,} / {before:,} kept "
             f"({len(base)*100/max(before,1):.1f}%)"
         )
+    after_urban = len(base)
 
     # Country filter — drop cells outside Thailand's land border. Done last
     # so the polygon-containment check (most expensive of the three filters)
@@ -476,6 +666,7 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
             f"(neighbour countries); {len(base):,} / {before:,} kept "
             f"({len(base)*100/max(before,1):.1f}%)"
         )
+    after_country = len(base)
 
     # Per-cell province annotation — emitted into the GeoJSON properties so
     # the frontend can offer a provincial filter without doing point-in-
@@ -487,115 +678,137 @@ def build_predicted(df: pd.DataFrame, model, base_date, meta: dict):
         )
         base["province"] = provinces
 
-    # Display cap: within each probability bucket keep the top
-    # MAX_CELLS_PER_DAY ranked PRIMARILY by calibrated model probability
-    # (tie-break: recent activity). The previous ranking led with
-    # historical_fire_count_30d × 1000, which made the "model's" map mostly
-    # a recent-activity map. The number of suppressed cells is reported so
-    # the operator knows this is a display cap, not the model's full output.
-    n_suppressed_by_cap = 0
-    if MAX_CELLS_PER_DAY > 0 and len(base) > 0:
-        before = len(base)
-        base = base.assign(
-            _rank_score=base["probability"].fillna(0) * 1000
-            + base["historical_fire_count_30d"].fillna(0).clip(upper=999) / 1000.0
-        )
-        base = (
-            base.sort_values(["days_until_fire", "_rank_score"], ascending=[True, False])
-                .groupby("days_until_fire", group_keys=False)
-                .head(MAX_CELLS_PER_DAY)
-                .drop(columns="_rank_score")
-                .reset_index(drop=True)
-        )
-        n_suppressed_by_cap = before - len(base)
-        per_day_counts = base.groupby("days_until_fire").size().to_dict()
-        print(
-            f"Display cap   : kept top {MAX_CELLS_PER_DAY} by model probability per bucket; "
-            f"suppressed {n_suppressed_by_cap:,}; {len(base):,} / {before:,} kept "
-            f"(per-bucket: {per_day_counts})"
-        )
-    base.attrs["n_suppressed_by_cap"] = n_suppressed_by_cap
+    # Absolute tiers MUST be assigned across the complete post-scope candidate
+    # population before display selection. Operational HIGH/WATCH alerts are
+    # never capped; Background is optional context and defaults to disabled.
+    base, thresholds, thresholds_source = _assign_urgency_tiers(base, meta)
+    tier_counts_before = (
+        base["urgency_level"].value_counts().to_dict() if len(base) else {}
+    )
 
-    print(f"Total after history filters: {len(base):,} / {n_total:,} cells "
+    import inference as _inf
+    long_col = f"historical_fire_count_{LONG_HISTORY_WINDOW_DAYS}d"
+    evidence_cols = [
+        "historical_fire_count_30d",
+        long_col,
+        "fire_days_per_year",
+    ]
+    high_thr = float(thresholds.get("HIGH", 1.01)) if thresholds else None
+    ranked_all = _inf.assign_operational_ranking(
+        base,
+        high_threshold=high_thr,
+        watch_top_pct=10,
+        extended_watch_top_pct=20,
+        ranking_signal_col="_model_ranking_signal",
+        evidence_cols=evidence_cols,
+    )
+    score_diagnostics = _score_resolution_diagnostics(
+        ranked_all,
+        ranking_signal_source,
+    )
+    base, display_policy = _select_operational_and_context(
+        ranked_all,
+        BACKGROUND_CONTEXT_LIMIT,
+    )
+    background_context_omitted = int(display_policy["background_suppressed"])
+    before_display_cap = len(ranked_all)
+    tier_counts_emitted = (
+        base["urgency_level"].value_counts().to_dict() if len(base) else {}
+    )
+
+    print(
+        "Map selection  : "
+        f"retained all {display_policy['operational_alerts_retained']:,} "
+        "HIGH/WATCH alert(s); "
+        f"Background context {display_policy['background_context_retained']:,} / "
+        f"{display_policy['background_candidates_before_selection']:,} "
+        f"(limit={BACKGROUND_CONTEXT_LIMIT}, ties never split)"
+    )
+    selection_policy = {
+        "total_scored_cells": int(n_total),
+        "retained_map_candidate_cells": int(len(base)),
+        "selection_changes_probability": False,
+        "tier_counts_before_display": {
+            str(k): int(v) for k, v in tier_counts_before.items()
+        },
+        "emitted_by_tier": {
+            str(k): int(v) for k, v in tier_counts_emitted.items()
+        },
+        "filters": {
+            "recent_activity": {
+                "enabled": MIN_HISTORICAL_FIRES_FOR_DISPLAY > 0,
+                "window_days": HISTORY_WINDOW_DAYS,
+                "minimum_fire_count": MIN_HISTORICAL_FIRES_FOR_DISPLAY,
+                "matching_cells": int(recent_mask.sum()),
+                "retained_after_filter": int(recent_mask.sum()),
+            },
+            "long_activity": {
+                "enabled": MIN_LONG_HISTORICAL_FIRES > 0,
+                "window_days": LONG_HISTORY_WINDOW_DAYS,
+                "minimum_fire_count": MIN_LONG_HISTORICAL_FIRES,
+                "matching_cells": int(long_mask.sum()),
+                "retained_after_filter": int(long_mask.sum()),
+            },
+            "annual_fire_rate": {
+                "enabled": MIN_FIRE_DAYS_PER_YEAR > 0,
+                "minimum_fire_days_per_year": MIN_FIRE_DAYS_PER_YEAR,
+                "matching_cells": int(rate_mask.fillna(False).sum()),
+                "retained_after_filter": int(rate_mask.fillna(False).sum()),
+            },
+            "history_combination": {
+                "mode": "any_enabled",
+                "retained_after_filter": int(after_history),
+            },
+            "urban_exclusion": {
+                "enabled": bool(URBAN_FILTER_ENABLED),
+                "buffer_km": URBAN_BUFFER_KM,
+                "retained_after_filter": int(after_urban),
+            },
+            "thailand_boundary": {
+                "enabled": bool(COUNTRY_FILTER_ENABLED),
+                "retained_after_filter": int(after_country),
+            },
+            "display_cap": {
+                "deprecated_legacy_name": True,
+                "canonical_name": "background_context",
+                "enabled": BACKGROUND_CONTEXT_LIMIT > 0,
+                "scope": display_policy["scope"],
+                "maximum_background_cells": BACKGROUND_CONTEXT_LIMIT,
+                "candidates_before_cap": int(before_display_cap),
+                "suppressed": int(background_context_omitted),
+                "retained_after_filter": int(len(base)),
+                **display_policy,
+            },
+            "background_context": {
+                "enabled": BACKGROUND_CONTEXT_LIMIT > 0,
+                "maximum_background_cells": BACKGROUND_CONTEXT_LIMIT,
+                "candidates_before_selection": int(before_display_cap),
+                "background_context_omitted": int(background_context_omitted),
+                "retained_after_selection": int(len(base)),
+                **display_policy,
+            },
+        },
+        "note": (
+            "Every absolute HIGH/WATCH alert is emitted. Background markers "
+            "are optional context only and never forced to fill a quota. "
+            "Selection does not alter calibrated model probabilities."
+        ),
+    }
+
+    print(f"Total map candidates: {len(base):,} / {n_total:,} scored cells "
           f"({len(base)*100/max(n_total,1):.1f}%)")
 
-    # ── Tier assignment: ABSOLUTE calibrated-probability thresholds ──
-    # Cutoffs are selected on the training pipeline's calib split (never on
-    # test) and persisted in dataset_info.json["probability_tier_thresholds"]:
-    #   HIGH   ≥ deployment threshold (F1-optimal on calib)
-    #   MEDIUM ≥ threshold catching ≥85% of calib fires
-    #   LOW    = everything else
-    # Because the thresholds are absolute, a genuinely low-risk day shows NO
-    # HIGH cells — unlike the previous percentile pyramid, which forced the
-    # top 10% of any snapshot to be "HIGH" even when nothing was likely to
-    # burn ("high relative to today" masquerading as high absolute risk).
-    probs = base["probability"].to_numpy()
-
-    tier_meta = meta.get("probability_tier_thresholds") or {}
-    if {"HIGH", "MEDIUM"} <= set(tier_meta):
-        thr_high = float(tier_meta["HIGH"])
-        thr_med = float(tier_meta["MEDIUM"])
-
-        def _tier(p: float) -> str:
-            if p >= thr_high:
-                return "HIGH"
-            if p >= thr_med:
-                return "MEDIUM"
-            return "LOW"
-
-        base["urgency_level"] = [_tier(p) for p in probs]
-        thresholds = {
-            "CRITICAL": 1.01,  # unreachable sentinel — tier not used
-            "HIGH": thr_high,
-            "MEDIUM": thr_med,
-            "LOW": 0.0,
-        }
-        thresholds_source = (
-            "absolute calibrated probability, selected on calib split "
-            f"(HIGH: F1-opt, precision={tier_meta.get('calib_precision_at_high')}, "
-            f"recall={tier_meta.get('calib_recall_at_high')}; "
-            f"MEDIUM: recall≥{tier_meta.get('calib_recall_target_medium')})"
-        )
-    elif len(base) >= 10:
-        # Legacy artifact without persisted cutoffs — RELATIVE ranking only.
-        # Explicitly labelled: "HIGH" here means "top of today's snapshot",
-        # not high absolute risk. Retrain to get absolute thresholds.
-        low_med_cut = float(np.percentile(probs, 60))
-        med_hi_cut = float(np.percentile(probs, 90))
-        base["urgency_level"] = [
-            "HIGH" if p >= med_hi_cut else "MEDIUM" if p >= low_med_cut else "LOW"
-            for p in probs
-        ]
-        thresholds = {"CRITICAL": 1.01, "HIGH": med_hi_cut, "MEDIUM": low_med_cut, "LOW": 0.0}
-        thresholds_source = (
-            "PRIORITY RANKING (relative percentiles — legacy model artifact "
-            "has no calibrated tier cutoffs; retrain to enable absolute tiers)"
-        )
-    else:
-        thresholds = _resolve_thresholds(meta)
-        base["urgency_level"] = [
-            urgency_from_thresholds(int(d), thresholds)
-            for d in base["days_until_fire"]
-        ]
-        thresholds_source = "fixed-domain fallback (tiny snapshot)"
-
-    tier_counts = base["urgency_level"].value_counts().to_dict() if len(base) else {}
+    tier_counts = tier_counts_before
     print(f"Urgency thresholds [{thresholds_source}]: "
           f"HIGH≥{thresholds['HIGH']:.3f} · MEDIUM≥{thresholds['MEDIUM']:.3f} "
           f"· tiers: {tier_counts}")
-    # Relative operational ranking (Top-k) — SEPARATE from the absolute tiers
-    # above. Deterministic; HIGH absolute threshold overrides. Adds rank /
-    # percentile / ranking_tier WITHOUT touching probability or the row order
-    # (merged back by cell so downstream display-cap logic is unaffected).
-    import inference as _inf
-    high_thr = float(thresholds.get("HIGH", 1.01)) if thresholds else None
-    if len(base):
-        ranked = _inf.assign_operational_ranking(
-            base, high_threshold=high_thr, watch_top_pct=10,
-            extended_watch_top_pct=20,
-        )[["lat_grid", "lon_grid", "rank", "percentile", "ranking_tier"]]
-        base = base.merge(ranked, on=["lat_grid", "lon_grid"], how="left")
     base.attrs["thresholds_source"] = thresholds_source
+    base.attrs["background_context_omitted"] = background_context_omitted
+    # Deprecated internal alias retained for old callers while the published
+    # metadata migrates to the accurate background-context terminology.
+    base.attrs["n_suppressed_by_cap"] = background_context_omitted
+    base.attrs["selection_policy"] = selection_policy
+    base.attrs["score_diagnostics"] = score_diagnostics
 
     return base, base_date, thresholds
 
@@ -778,7 +991,11 @@ def _revalidate_predictions(
     return result
 
 
-def _ranking_policy_block(thresholds: dict, metrics: dict) -> dict:
+def _ranking_policy_block(
+    thresholds: dict,
+    metrics: dict,
+    runtime_diagnostics: Optional[dict] = None,
+) -> dict:
     """Ranking-policy metadata + held-out historical Top-k coverage (from the
     model's test metrics — recall captured by the top 5/10/20%)."""
     import inference as _inf
@@ -789,19 +1006,64 @@ def _ranking_policy_block(thresholds: dict, metrics: dict) -> dict:
         if v is not None:
             coverage[f"top_{pct}pct"] = v
     high_thr = float(thresholds.get("HIGH", 1.01)) if thresholds else None
-    return _inf.ranking_policy_metadata(
+    policy = _inf.ranking_policy_metadata(
         high_thr, watch_top_pct=10, extended_watch_top_pct=20,
         historical_coverage=coverage)
+    policy["population"] = "all_post_scope_candidates_before_map_selection"
+    policy["runtime_score_resolution"] = dict(runtime_diagnostics or {})
+    return policy
+
+
+def _scope_observed_rows(observed: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Return positive observed FIRMS rows in the dashboard's declared scope.
+
+    The source cache covers a rectangular regional bbox. When the map is in
+    Thailand-only mode, emitting every positive bbox row leaks neighbouring
+    countries into the Live layer while the UI labels it as Thailand. The
+    transboundary analytics endpoint remains the explicit regional surface.
+    """
+    if observed.empty or "fire_count" not in observed.columns:
+        positive = observed.iloc[0:0].copy()
+    else:
+        counts = pd.to_numeric(observed["fire_count"], errors="coerce").fillna(0)
+        positive = observed[counts > 0].copy()
+
+    input_count = len(positive)
+    if COUNTRY_FILTER_ENABLED and input_count:
+        in_thailand = is_in_thailand(
+            positive["lat_grid"].to_numpy(),
+            positive["lon_grid"].to_numpy(),
+        )
+        positive = positive[in_thailand].copy()
+
+    return positive, {
+        "scope": "Thailand" if COUNTRY_FILTER_ENABLED else "regional FIRMS bbox",
+        "country_filter_enabled": bool(COUNTRY_FILTER_ENABLED),
+        "positive_source_rows": int(input_count),
+        "emitted_rows": int(len(positive)),
+        "excluded_outside_scope": int(input_count - len(positive)),
+        "note": (
+            "Regional observations remain available through transboundary analytics."
+            if COUNTRY_FILTER_ENABLED
+            else "Country filtering is disabled; observed rows cover the configured bbox."
+        ),
+    }
 
 
 def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, thresholds: dict, metrics: dict, daily_df: Optional[pd.DataFrame] = None):
     base_date_str = base_date.strftime("%Y-%m-%d")
+    runtime_meta = _load_metadata() or {}
+    model_version_value = runtime_meta.get("trained_at")
+    model_version = (
+        str(model_version_value) if model_version_value is not None else None
+    )
     # The model's true horizon is imminent_days (default 3) — NOT the 7-day
     # pseudo-day display range. Every metadata surface reports this horizon and
     # the explicit risk window so API/GeoJSON/CSV/frontend agree.
-    horizon_days = int((_load_metadata() or {}).get("imminent_days", 3))
+    horizon_days = int(runtime_meta.get("imminent_days", 3))
     risk_window_start = (base_date + timedelta(days=1)).strftime("%Y-%m-%d")
     risk_window_end = (base_date + timedelta(days=horizon_days)).strftime("%Y-%m-%d")
+    observed_for_map, observed_scope = _scope_observed_rows(observed)
 
     geojson = {"type": "FeatureCollection", "features": []}
     if exists(GEOJSON_PATH):
@@ -820,7 +1082,15 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
     #     just bloat the file; the date picker only needs predictions.
     MAX_BASE_DATE_SNAPSHOTS = int(os.getenv("MAX_BASE_DATE_SNAPSHOTS", "7"))
     existing = geojson.get("features", [])
-    predicted_only = [f for f in existing if f["properties"].get("source") == "predicted"]
+    # A fail-closed completeness gate can move the trusted base date backward
+    # after discovering that newer sparse fetch dates were previously treated
+    # as zero-filled observations. Never retain those newer, now-untrusted
+    # snapshots beside the repaired metadata date.
+    predicted_only = [
+        f for f in existing
+        if f["properties"].get("source") == "predicted"
+        and str(f["properties"].get("base_date") or "") <= base_date_str
+    ]
     # Snapshots to keep: most recent N-1, excluding the one we're rewriting.
     base_dates = sorted(
         {f["properties"].get("base_date") for f in predicted_only if f["properties"].get("base_date")},
@@ -844,10 +1114,20 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
     # validation metrics without a separate fetch.
     geojson["metadata"] = {
         "base_date": base_date_str,
+        "model_version": model_version,
+        # Top-level thresholds/metrics describe only the current snapshot.
+        # Retained historical features keep the tier assigned when they were
+        # generated and carry their own model_version when available.
+        "thresholds_apply_to_base_date": base_date_str,
+        "snapshot_contract_note": (
+            "Top-level thresholds and metrics apply only to metadata.base_date; "
+            "retained snapshots may have a different or unknown model_version."
+        ),
         # True observation instant of the freshest FIRMS hotspot (UTC ISO) and
         # when this snapshot was generated — lets the UI show "data as of …"
         # with a real time, not just the daily base_date.
-        "latest_data_time": _latest_data_time(),
+        "latest_data_time": _latest_data_time(base_date_str),
+        "source_cache_latest_time": _latest_data_time(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "horizon_days": horizon_days,
         "risk_window_start": risk_window_start,
@@ -860,22 +1140,38 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
         ),
         "urgency_thresholds": thresholds,
         "thresholds_source": str(predicted.attrs.get("thresholds_source", "")) if hasattr(predicted, "attrs") else "",
-        "suppressed_by_display_cap": int(predicted.attrs.get("n_suppressed_by_cap", 0)) if hasattr(predicted, "attrs") else 0,
+        "background_context_omitted": int(predicted.attrs.get(
+            "background_context_omitted",
+            predicted.attrs.get("n_suppressed_by_cap", 0),
+        )) if hasattr(predicted, "attrs") else 0,
+        "suppressed_by_display_cap": int(predicted.attrs.get(
+            "background_context_omitted",
+            predicted.attrs.get("n_suppressed_by_cap", 0),
+        )) if hasattr(predicted, "attrs") else 0,
+        "suppressed_by_display_cap_note": (
+            "Deprecated legacy alias of background_context_omitted; operational "
+            "HIGH/WATCH alerts are never capped."
+        ),
+        "selection_policy": dict(predicted.attrs.get("selection_policy", {})) if hasattr(predicted, "attrs") else {},
+        "score_diagnostics": dict(predicted.attrs.get("score_diagnostics", {})) if hasattr(predicted, "attrs") else {},
+        "observed_scope": observed_scope,
         "metrics": metrics,
         # Relative Top-k operational ranking policy (separate from the absolute
         # calibrated tiers). Historical coverage = held-out captured-recall
         # estimates from the model's test metrics — NOT a same-day guarantee.
-        "ranking_policy": _ranking_policy_block(thresholds, metrics),
+        "ranking_policy": _ranking_policy_block(
+            thresholds,
+            metrics,
+            dict(predicted.attrs.get("score_diagnostics", {}))
+            if hasattr(predicted, "attrs") else {},
+        ),
         "history_window_days": HISTORY_WINDOW_DAYS,
         "long_history_window_days": LONG_HISTORY_WINDOW_DAYS,
     }
 
     # ---------- OBSERVED (latest densified FIRMS day) ----------
     observed_date_str = observed["date"].iloc[0].strftime("%Y-%m-%d") if len(observed) else base_date_str
-    for _, r in observed.iterrows():
-        if int(r.get("fire_count", 0)) <= 0:
-            # Densified rows include cells with zero fires; only emit real detections.
-            continue
+    for _, r in observed_for_map.iterrows():
         geojson["features"].append({
             "type": "Feature",
             "geometry": {
@@ -914,6 +1210,7 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
             "properties": {
                 "base_date": base_date_str,
                 "source": "predicted",
+                "model_version": model_version,
                 # Probability-rank display bucket (0 = highest band). NOT an
                 # exact-date forecast — the binary model can't resolve days.
                 "days_until_fire": int(r["days_until_fire"]),
@@ -933,16 +1230,24 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
                 "historical_fire_count_30d": int(r["historical_fire_count_30d"]),
                 "historical_fire_count_long": int(r[long_col]),
                 "fire_days_total": int(r["fire_days_total"]),
-                "fire_days_per_year": float(r["fire_days_per_year"]),
+                "fire_days_per_year": (
+                    float(r["fire_days_per_year"])
+                    if pd.notna(r.get("fire_days_per_year")) else None
+                ),
                 "nearest_urban_area": str(r["nearest_urban_area"]),
                 "nearest_urban_distance_km": float(r["nearest_urban_distance_km"]),
                 "province": str(r.get("province", "") or ""),
-                # Hansen tree cover passed through so the dashboard can
-                # categorise cells by land-cover bucket without re-doing
-                # the per-cell lookup. Defaults to 0 if the cache wasn't
-                # populated during training.
-                "tree_cover_pct_2000": float(r.get("tree_cover_pct_2000", 0) or 0),
-                "tree_loss_pct_recent": float(r.get("tree_loss_pct_recent", 0) or 0),
+                # Hansen values are optional evidence. Missing coverage must
+                # stay null: coercing it to zero would falsely classify an
+                # unknown cell as open/no-loss land in the dashboard.
+                "tree_cover_pct_2000": (
+                    float(r["tree_cover_pct_2000"])
+                    if pd.notna(r.get("tree_cover_pct_2000")) else None
+                ),
+                "tree_loss_pct_recent": (
+                    float(r["tree_loss_pct_recent"])
+                    if pd.notna(r.get("tree_loss_pct_recent")) else None
+                ),
                 "lat": float(r["lat_grid"]),
                 "lon": float(r["lon_grid"]),
             },
@@ -972,11 +1277,28 @@ def append_geojson(observed: pd.DataFrame, predicted: pd.DataFrame, base_date, t
     write_json(
         {
             "base_date": base_date_str,
+            "model_version": model_version,
             "observed_date": observed_date_str,
             "horizon_days": horizon_days,
             "risk_window_start": risk_window_start,
             "risk_window_end": risk_window_end,
+            "thresholds_apply_to_base_date": base_date_str,
             "urgency_thresholds": thresholds,
+            "thresholds_source": str(predicted.attrs.get("thresholds_source", "")) if hasattr(predicted, "attrs") else "",
+            "background_context_omitted": int(predicted.attrs.get(
+                "background_context_omitted",
+                predicted.attrs.get("n_suppressed_by_cap", 0),
+            )) if hasattr(predicted, "attrs") else 0,
+            "suppressed_by_display_cap": int(predicted.attrs.get(
+                "background_context_omitted",
+                predicted.attrs.get("n_suppressed_by_cap", 0),
+            )) if hasattr(predicted, "attrs") else 0,
+            "suppressed_by_display_cap_note": (
+                "Deprecated legacy alias of background_context_omitted; "
+                "operational HIGH/WATCH alerts are never capped."
+            ),
+            "selection_policy": dict(predicted.attrs.get("selection_policy", {})) if hasattr(predicted, "attrs") else {},
+            "observed_scope": observed_scope,
             "metrics": metrics,
         },
         LATEST_PATH,

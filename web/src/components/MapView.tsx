@@ -23,6 +23,7 @@ import {
   readProbability,
 } from "../utils/probability";
 import { thaiFireSeasonForDate } from "../utils/seasonality";
+import { isActionableUrgency } from "../utils/risk";
 import {
   AnchoredCircle,
   clampPxForFrac,
@@ -75,6 +76,12 @@ interface MapViewProps {
   liveFires: GistdaFeature[];
   thresholds: UrgencyThresholds | null;
   options: DisplayOptions;
+  predictionEmptyState: {
+    title: string;
+    body: string;
+    actionLabel?: string;
+    onAction?: () => void;
+  } | null;
 }
 
 // Render order: heatmap below, then observed / predicted / live-fire dots on
@@ -174,12 +181,18 @@ export default function MapView(props: MapViewProps) {
     clearLayers(layersRef.current, map);
 
     if (props.options.showObserved) {
-      layersRef.current.observed = buildObservedLayer(map, props.observed);
+      layersRef.current.observed = buildObservedLayer(map, props.observed, t);
     }
 
     if (props.options.showPredicted) {
+      // Background rows are contextual candidates, not alerts. Even when an
+      // operator opts in to their pins, never give them an alert-like heat
+      // halo; the heat layer is reserved for cells crossing HIGH/WATCH.
+      const heatmapFeatures = props.predictedVisible.filter((feature) =>
+        isActionableUrgency(feature.properties.urgency_level),
+      );
       layersRef.current.heatmap = createHeatmapLayer(
-        props.predictedVisible,
+        heatmapFeatures,
         props.thresholds,
         props.options.heatRadius
       );
@@ -189,7 +202,7 @@ export default function MapView(props: MapViewProps) {
     }
 
     if (props.options.showLiveFires && props.liveFires.length > 0) {
-      layersRef.current.livefire = buildLiveFireLayer(map, props.liveFires, gridM);
+      layersRef.current.livefire = buildLiveFireLayer(map, props.liveFires, gridM, t);
     }
 
     addLayers(layersRef.current, map);
@@ -207,7 +220,23 @@ export default function MapView(props: MapViewProps) {
     t,
   ]);
 
-  return <div id="map" ref={containerRef} />;
+  return (
+    <>
+      <div id="map" ref={containerRef} />
+      {props.predictionEmptyState && (
+        <div className="map-prediction-empty" role="status" aria-live="polite">
+          <strong>{props.predictionEmptyState.title}</strong>
+          <span>{props.predictionEmptyState.body}</span>
+          {props.predictionEmptyState.actionLabel &&
+            props.predictionEmptyState.onAction && (
+              <button type="button" onClick={props.predictionEmptyState.onAction}>
+                {props.predictionEmptyState.actionLabel}
+              </button>
+            )}
+        </div>
+      )}
+    </>
+  );
 }
 
 // ───────────────────── helpers ─────────────────────
@@ -242,7 +271,11 @@ function reclampAllMarkers(layers: Record<LayerKey, L.Layer | null>, map: L.Map)
   }
 }
 
-function buildObservedLayer(map: L.Map, features: FireFeature[]): L.Layer {
+function buildObservedLayer(
+  map: L.Map,
+  features: FireFeature[],
+  t: Translator,
+): L.Layer {
   // Cluster mode removed from the UI — observed markers are always individual
   // dots now, matching the simplified frontend/index.html layout.
   const layer = L.layerGroup();
@@ -270,10 +303,10 @@ function buildObservedLayer(map: L.Map, features: FireFeature[]): L.Layer {
     marker._anchorLat = lat;
     marker.bindPopup(
       `<div class="popup">
-         <b style="color:#ff5722;">🛰 Historical FIRMS hotspot</b><br>
-         <small>Date: ${esc(p.date ?? "—")}</small><br>
-         <small>FIRMS detections: ${esc(p.fire_count ?? "—")}</small><br>
-         <small>Location: ${lat.toFixed(3)}°, ${lon.toFixed(3)}°</small>
+         <b style="color:#ff5722;">${esc(t("map.observed.title"))}</b><br>
+         <small>${esc(t("map.observed.date"))}: ${esc(p.date ?? "—")}</small><br>
+         <small>${esc(t("map.observed.detections"))}: ${esc(p.fire_count ?? "—")}</small><br>
+         <small>${esc(t("map.observed.location"))}: ${lat.toFixed(3)}°, ${lon.toFixed(3)}°</small>
        </div>`
     );
     (layer as unknown as { addLayer: (m: L.Layer) => void }).addLayer(marker);
@@ -510,7 +543,12 @@ function buildPredictedLayer(map: L.Map, features: FireFeature[], gridM: number,
 
 // Live GISTDA VIIRS hotspots — distinct cyan dots so they don't visually
 // merge with the urgency-coloured prediction layer.
-function buildLiveFireLayer(map: L.Map, features: GistdaFeature[], gridM: number): L.Layer {
+function buildLiveFireLayer(
+  map: L.Map,
+  features: GistdaFeature[],
+  gridM: number,
+  t: Translator,
+): L.Layer {
   const layer = L.layerGroup();
   const renderer = L.canvas({ padding: 0.5 });
   const frac = 0.22;
@@ -564,13 +602,13 @@ function buildLiveFireLayer(map: L.Map, features: GistdaFeature[], gridM: number
 
     marker.bindPopup(
       `<div class="popup">
-         <b style="color:${LIVE_FIRE_COLOR};">🛰 Live Hotspot · GISTDA ${esc(sat)}</b><br>
+         <b style="color:${LIVE_FIRE_COLOR};">${esc(fmtTr(t("map.live.title"), { satellite: sat }))}</b><br>
          <div class="popup-block">
            <b>${esc(detectedText)}</b><br>
            <small>${esc(location)}</small>
          </div>
-         <small>Land use: ${esc(lu)}</small><br>
-         <small>Confidence: ${esc(conf)}</small><br>
+         <small>${esc(t("map.live.land_use"))}: ${esc(lu)}</small><br>
+         <small>${esc(t("map.live.confidence"))}: ${esc(conf)}</small><br>
          <small>${lat.toFixed(3)}°N, ${lon.toFixed(3)}°E</small>
        </div>`
     );

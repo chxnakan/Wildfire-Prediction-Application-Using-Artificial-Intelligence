@@ -229,6 +229,9 @@ export interface RankingPolicy {
   watch_top_pct?: number;
   extended_watch_top_pct?: number;
   absolute_high_threshold?: number;
+  rank_method?: string;
+  tie_breaking?: string[];
+  relative_tier_labels?: Record<string, string>;
   note?: string;
   historical_coverage_note?: string;
   historical_coverage?: {
@@ -242,7 +245,19 @@ export interface GeoJsonMetadata {
   // base_date is the daily prediction origin; latest_data_time is the real
   // UTC instant of the freshest FIRMS hotspot (finer than the day); both
   // written by risk_map.py. generated_at = when the snapshot was built.
+  base_date?: string;
+  /** Version identifier of the model that produced metadata.base_date. */
+  model_version?: string | null;
+  /** Explicit date scope for the top-level thresholds and metrics. */
+  thresholds_apply_to_base_date?: string;
+  /** Human-readable warning that retained snapshots can use older models. */
+  snapshot_contract_note?: string;
+  horizon_days?: number;
+  risk_window_start?: string;
+  risk_window_end?: string;
   latest_data_time?: string;
+  /** Newest raw cache timestamp, which may be later than the trusted snapshot. */
+  source_cache_latest_time?: string;
   generated_at?: string;
   urgency_thresholds?: UrgencyThresholds;
   // Human-readable provenance of urgency_thresholds, written by risk_map.py:
@@ -250,8 +265,28 @@ export interface GeoJsonMetadata {
   //   "PRIORITY RANKING (relative percentiles …)" → relative rank, not risk
   //   otherwise → legacy days-based cutoffs
   thresholds_source?: string;
+  /** Background candidates omitted from the contextual map layer. */
+  background_context_omitted?: number;
+  /** @deprecated Alias of background_context_omitted. */
+  suppressed_by_display_cap?: number;
+  suppressed_by_display_cap_note?: string;
   metrics?: ValidationMetrics;
   ranking_policy?: RankingPolicy;
+  selection_policy?: {
+    total_scored_cells?: number;
+    retained_map_candidate_cells?: number;
+    selection_changes_probability?: boolean;
+    filters?: Record<string, Record<string, unknown>>;
+    note?: string;
+  };
+  observed_scope?: {
+    scope?: string;
+    country_filter_enabled?: boolean;
+    positive_source_rows?: number;
+    emitted_rows?: number;
+    excluded_outside_scope?: number;
+    note?: string;
+  };
   validation_summary?: {
     evaluation?: string;
     match_rule?: string;
@@ -264,6 +299,8 @@ export interface GeoJsonMetadata {
 export interface PredictionProperties {
   source: "predicted" | "observed";
   base_date?: string;
+  /** Model version persisted with this snapshot row, when known. */
+  model_version?: string | null;
   /** @deprecated Compatibility-only pseudo-date; not a per-cell forecast. */
   predicted_fire_date?: string;
   /** @deprecated Compatibility-only pseudo-day value; not model output time. */
@@ -275,12 +312,25 @@ export interface PredictionProperties {
   // frontend falls back to inverting raw_prediction.
   probability?: number;
   urgency_level?: UrgencyLevel;
+  /** Relative resource-allocation band; never an absolute alert tier. */
+  ranking_tier?:
+    | "RELATIVE_TOP_10"
+    | "RELATIVE_TOP_20"
+    | "UNRANKED"
+    // Legacy values remain readable but are labelled as relative by the UI.
+    | "WATCH"
+    | "EXTENDED_WATCH"
+    | "LOW"
+    | "HIGH";
+  /** 1-based competition rank: equal scores share the same rank. */
+  rank?: number;
+  percentile?: number;
   confidence?: number;
   province?: string;
   historical_fire_count_30d?: number;
   fire_days_per_year?: number;
-  tree_cover_pct_2000?: number;
-  tree_loss_pct_recent?: number;
+  tree_cover_pct_2000?: number | null;
+  tree_loss_pct_recent?: number | null;
   nearest_urban_area?: string;
   nearest_urban_distance_km?: number;
   // observed
@@ -310,6 +360,16 @@ export interface FireGeoJson {
 
 export type NotifyChannel = "sms" | "line" | "email" | "all";
 export type NotifyPriority = "normal" | "urgent" | "emergency";
+
+export interface NotifyCapabilities {
+  mode: "stub";
+  /** Always false until an audited external provider is implemented. */
+  delivery_available: false;
+  /** The public SPA can only write to the deliberately open local-dev stub. */
+  browser_queue_available: boolean;
+  browser_log_available: boolean;
+  persistence: "process_memory";
+}
 
 export interface NotifyRequest {
   channel: NotifyChannel;
@@ -343,11 +403,24 @@ export interface NotifyLogRecord {
   status: "queued" | "sent" | "failed";
 }
 
-export type AlertPageRoute = "dashboard" | "notify" | "live" | "reports" | "compare" | "analytics";
+export type AlertPageRoute =
+  | "dashboard"
+  | "notify"
+  | "live"
+  | "reports"
+  | "compare";
 
 // Risk-tier filter for the operator screen. Replaced the former day-0..7
 // pseudo-date buckets — the binary model has no per-day resolution.
-export type DaySelection = "all" | "High" | "Watch" | "Background";
+// The default operator view shows every retained absolute tier. Background
+// stays visually neutral and is excluded from the heat layer, while the
+// Alerts filter remains available for CRITICAL/HIGH + MEDIUM/WATCH only.
+export type DaySelection =
+  | "Alerts"
+  | "High"
+  | "Watch"
+  | "Background"
+  | "all";
 
 export interface DisplayOptions {
   showObserved: boolean;
@@ -370,6 +443,10 @@ export interface LiveFireMeta {
   isStale?: boolean;
   /** Last time the SERVER successfully pulled from GISTDA (ISO string). */
   lastSuccessAt?: string | null;
+  /** True when the API returned only the requested page, not the full feed. */
+  truncated?: boolean;
+  requestedLimit?: number;
+  returnedCount?: number;
 }
 
 // GISTDA hotspot attributes as served by OUR backend (/live-hotspots) in the

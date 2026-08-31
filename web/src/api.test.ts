@@ -4,6 +4,7 @@ import {
   fetchGeoJson,
   fetchHealth,
   fetchHotspotAnalytics,
+  fetchNotifyCapabilities,
   fetchNotifyLog,
   fetchRollingEval,
 } from "./api";
@@ -147,6 +148,26 @@ describe("fetchHealth", () => {
     expect(await fetchHealth()).toBe("stale");
   });
 
+  it("does not call stale source data live just because GeoJSON was rewritten", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+      status: "ok",
+      ready: true,
+      geojson_age_days: 0.01,
+      data_stale_days: 12,
+    })));
+    expect(await fetchHealth()).toBe("stale");
+  });
+
+  it("treats a materially future-dated source artifact as degraded", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+      status: "ok",
+      ready: true,
+      geojson_age_days: 0.01,
+      data_stale_days: -3,
+    })));
+    expect(await fetchHealth()).toBe("stale");
+  });
+
   it("reports live only for a ready API with a fresh snapshot", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
       status: "ok",
@@ -186,6 +207,10 @@ describe("fetchHotspotAnalytics", () => {
     historical_burned_mrai: [
       { year: "2567", year_ce: 2024, burned_mrai: 1.25 },
     ],
+    historical_burned_mrai_metadata: {
+      available: true,
+      source: "versioned test fixture",
+    },
   };
 
   it("loads the analytics endpoint through the shared API client", async () => {
@@ -204,6 +229,7 @@ describe("fetchHotspotAnalytics", () => {
       as_of: "2026-07-24",
       transboundary: "not-an-array",
       historical_burned_mrai: [],
+      historical_burned_mrai_metadata: { available: false },
     })));
 
     await expect(fetchHotspotAnalytics()).rejects.toThrow(
@@ -213,6 +239,36 @@ describe("fetchHotspotAnalytics", () => {
 });
 
 describe("secondary API response validation", () => {
+  it("loads the non-secret notification capability contract", async () => {
+    const payload = {
+      mode: "stub",
+      delivery_available: false,
+      browser_queue_available: false,
+      browser_log_available: false,
+      persistence: "process_memory",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(fetchNotifyCapabilities()).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/notify/capabilities",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+  });
+
+  it("fails closed when the notification capability response is malformed", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
+      mode: "provider",
+      delivery_available: true,
+      browser_queue_available: true,
+    })));
+
+    await expect(fetchNotifyCapabilities()).rejects.toThrow(
+      "invalid response schema",
+    );
+  });
+
   it("rejects malformed rolling-evaluation rows before a chart can crash", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({
       summary: null,

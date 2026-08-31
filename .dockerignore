@@ -23,12 +23,35 @@ __pycache__
 web/node_modules
 web/dist
 
-# data/ + outputs/ ARE included — the entrypoint script (start.sh) seeds
-# the Railway volume from these on first boot, otherwise the web service
-# can't start before the daily cron has had a chance to run. Once the
-# volume has fresh contents, the in-image copies are ignored.
-# Exclude the training-history dir to keep image weight down.
-outputs/models/history
+# Seed only the version-controlled bootstrap artifacts. Local FIRMS/weather
+# caches, rejected models, reports and figures are intentionally excluded so a
+# local Docker build has the same inputs as a clean GitHub/Railway checkout.
+# scripts/start.sh copies these files to an empty /srv volume on first boot.
+data/**
+!data/raw/
+!data/raw/.gitkeep
+!data/firms/
+!data/firms/.gitkeep
+!data/weather/
+!data/weather/.gitkeep
+!data/boundaries/
+!data/boundaries/thailand.geojson
+!data/static/
+!data/static/tree_cover_per_cell.parquet
+
+outputs/**
+!outputs/models/
+!outputs/models/.gitkeep
+!outputs/models/lgbm_fire_date_model.pkl
+!outputs/features/
+!outputs/features/.gitkeep
+!outputs/features/full_features.parquet
+!outputs/metadata/
+!outputs/metadata/.gitkeep
+!outputs/metadata/dataset_info.json
+!outputs/riskmap/
+!outputs/riskmap/.gitkeep
+!outputs/riskmap/fire_dates_all.geojson
 # A stray local environment has previously been created under src/outputs.
 # It is never an application input and can add ~1 GB to a build context.
 src/outputs

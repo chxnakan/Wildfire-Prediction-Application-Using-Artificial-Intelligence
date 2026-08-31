@@ -10,8 +10,11 @@ import type { UrgencyThresholds } from "../types";
 import { readProbability } from "./probability";
 
 export type RiskTier = "High" | "Watch" | "Background";
-export type TierFilter = "all" | RiskTier;
+export type TierFilter = "Alerts" | "all" | RiskTier;
 export type TierMode = "absolute" | "relative" | "days";
+
+/** Complete retained snapshot: alerts plus clearly-labelled context. */
+export const DEFAULT_TIER_FILTER: TierFilter = "all";
 
 // User-facing tier → persisted GeoJSON urgency_level.
 export const TIER_TO_URGENCY: Record<RiskTier, string> = {
@@ -23,6 +26,7 @@ export const TIER_TO_URGENCY: Record<RiskTier, string> = {
 // Persisted urgency_level → user-facing tier (inverse of the above).
 export function urgencyToTier(urgency: string | null | undefined): RiskTier | null {
   switch (urgency) {
+    case "CRITICAL":
     case "HIGH": return "High";
     case "MEDIUM": return "Watch";
     case "LOW": return "Background";
@@ -35,15 +39,23 @@ export function matchesTierFilter(
   urgency: string | null | undefined,
   filter: TierFilter,
 ): boolean {
-  if (filter === "all") return true;
+  const known =
+    urgency === "CRITICAL" || urgency === "HIGH" || urgency === "MEDIUM" ||
+    urgency === "LOW";
+  if (filter === "all") return known;
+  if (filter === "Alerts") return isActionableUrgency(urgency);
+  // CRITICAL is part of the precision-oriented High operator view. The current
+  // model normally disables it, but legacy/current artifacts can still carry
+  // the tier and must never disappear from the alert filter.
+  if (filter === "High") return urgency === "CRITICAL" || urgency === "HIGH";
   return urgency === TIER_TO_URGENCY[filter];
 }
 
-/** HIGH and MEDIUM/WATCH are the deployed operator alert tiers. */
+/** CRITICAL/HIGH and MEDIUM/WATCH are operator alert tiers. */
 export function isActionableUrgency(
   urgency: string | null | undefined,
 ): boolean {
-  return urgency === "HIGH" || urgency === "MEDIUM";
+  return urgency === "CRITICAL" || urgency === "HIGH" || urgency === "MEDIUM";
 }
 
 /**

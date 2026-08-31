@@ -25,6 +25,7 @@ import pandas as pd
 
 import db
 from fetch_firms import OUT_FILE, update_firms
+from process_lock import process_lock_active
 from storage import read_table, resolve_existing
 
 log = logging.getLogger("sync_worker")
@@ -42,6 +43,7 @@ if not os.path.isabs(_OUTPUT_DIR):
 TRAIN_LOCK = os.path.join(_OUTPUT_DIR, ".train.lock")
 
 FETCH_DAYS = int(os.getenv("SYNC_FETCH_DAYS", "1"))
+MAX_BACKFILL_DAYS = min(10, max(1, int(os.getenv("SYNC_MAX_BACKFILL_DAYS", "10"))))
 PREDICT_MAX_HISTORY_DAYS = int(os.getenv("PREDICT_MAX_HISTORY_DAYS", "180"))
 PREDICT_TIMEOUT_S = int(os.getenv("PREDICT_TIMEOUT_S", "1800"))
 
@@ -54,6 +56,35 @@ def _cache_row_count() -> int:
         return len(read_table(path))
     except Exception:
         return 0
+
+
+def _fetch_days_for_cycle() -> int:
+    """Backfill downtime gaps while keeping normal sync requests small.
+
+    This application recovers at most a 10-day span per sync cycle; the FIRMS
+    fetcher splits it into upstream-compliant requests of no more than 5 days.
+    Looking only one day back after an eight-day outage leaves seven calendar
+    days permanently absent, which densification then misreads as measured
+    zero-fire days. Compute the span from the cache high-water mark *before*
+    updating it. A healthy service still requests only ``SYNC_FETCH_DAYS``.
+    """
+    requested = max(1, min(int(FETCH_DAYS), MAX_BACKFILL_DAYS))
+    path = resolve_existing(OUT_FILE)
+    if not path:
+        return MAX_BACKFILL_DAYS
+    try:
+        frame = read_table(path, columns=["acq_datetime"])
+        latest = pd.to_datetime(
+            frame["acq_datetime"], errors="coerce", utc=True
+        ).max()
+        if pd.isna(latest):
+            return MAX_BACKFILL_DAYS
+        today = pd.Timestamp.now("UTC").normalize()
+        gap_days = max(int((today - pd.Timestamp(latest).normalize()).days), 0)
+        return min(MAX_BACKFILL_DAYS, max(requested, gap_days + 1))
+    except Exception:
+        log.warning("Could not inspect FIRMS high-water mark — using %d-day fetch", requested)
+        return requested
 
 
 def _mirror_new_rows_to_db() -> int:
@@ -78,7 +109,9 @@ def _mirror_new_rows_to_db() -> int:
 def _refresh_predictions() -> bool:
     """Rebuild features + risk map in a subprocess (memory isolation — the
     feature build can spike RAM and we don't want that inside the API proc)."""
-    if os.path.exists(TRAIN_LOCK):
+    if process_lock_active(
+        TRAIN_LOCK, max_age_seconds=PREDICT_TIMEOUT_S
+    ):
         log.info("Training in progress — skipping prediction refresh this cycle")
         return False
     cmd = [
@@ -197,7 +230,9 @@ def run_sync() -> dict:
                "input_version": None, "predictions_refreshed": False}
     try:
         before = _cache_row_count()
-        update_firms(days=FETCH_DAYS)
+        fetch_days = _fetch_days_for_cycle()
+        summary["fetch_days"] = fetch_days
+        update_firms(days=fetch_days)
         after = _cache_row_count()
         new_rows = max(after - before, 0)
         summary["new_rows"] = new_rows

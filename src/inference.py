@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 # User-facing tier labels. High = deployment/alert threshold, Watch = the
-# ≥85%-recall watch cutoff, Background = below both.
+# persisted calibration-time recall-target cutoff, Background = below both.
 RISK_TIER_HIGH = "High"
 RISK_TIER_WATCH = "Watch"
 RISK_TIER_BACKGROUND = "Background"
@@ -60,11 +60,14 @@ def tier_cutoffs_from_meta(
     """
     if not tier_thresholds:
         return None
-    if "HIGH" not in tier_thresholds or "MEDIUM" not in tier_thresholds:
+    # WATCH is the canonical operator-facing name. MEDIUM is retained as a
+    # compatibility alias for older bundles/GeoJSON snapshots.
+    watch_key = "WATCH" if "WATCH" in tier_thresholds else "MEDIUM"
+    if "HIGH" not in tier_thresholds or watch_key not in tier_thresholds:
         return None
     try:
         high = float(tier_thresholds["HIGH"])
-        watch = float(tier_thresholds["MEDIUM"])
+        watch = float(tier_thresholds[watch_key])
     except (TypeError, ValueError):
         return None
     if not (0.0 <= watch <= high <= 1.0):
@@ -102,6 +105,43 @@ def calibrated_probability(model: Any, X: pd.DataFrame) -> np.ndarray:
     return np.clip(prob, 0.0, 1.0)
 
 
+def model_ranking_signal(
+    model: Any,
+    X: pd.DataFrame,
+    calibrated: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, str]:
+    """Return an ordering-only signal without changing user-facing risk.
+
+    Monotone calibrators such as isotonic regression can legitimately map a
+    wide range of raw classifier scores onto one calibrated-probability
+    plateau.  The calibrated value remains the *only* probability used for
+    tiers, confidence, and display, but it cannot order cells inside that
+    plateau.  When available, the ensemble's pre-calibration probability is a
+    scientifically valid secondary ordering signal because monotone
+    calibration preserves its direction.
+
+    Legacy models without ``_raw_proba`` safely fall back to the calibrated
+    probability.  Malformed/non-finite raw output also falls back rather than
+    contaminating selection.  Callers must not expose this signal as a
+    probability or compare it with alert thresholds.
+    """
+    fallback = (
+        np.asarray(calibrated, dtype=float).reshape(-1)
+        if calibrated is not None
+        else calibrated_probability(model, X).reshape(-1)
+    )
+    raw_fn = getattr(model, "_raw_proba", None)
+    if not callable(raw_fn):
+        return fallback.copy(), "calibrated_probability_fallback"
+    try:
+        raw = np.asarray(raw_fn(X), dtype=float).reshape(-1)
+    except Exception:
+        return fallback.copy(), "calibrated_probability_fallback"
+    if raw.shape != fallback.shape or not np.isfinite(raw).all():
+        return fallback.copy(), "calibrated_probability_fallback"
+    return raw, "precalibration_model_score"
+
+
 def score_cells(
     model: Any,
     cells: pd.DataFrame,
@@ -128,7 +168,7 @@ def score_cells(
     return out
 
 
-RANKING_POLICY_VERSION = "1.0"
+RANKING_POLICY_VERSION = "2.0"
 
 
 def assign_operational_ranking(
@@ -137,6 +177,8 @@ def assign_operational_ranking(
     watch_top_pct: float = 10.0,
     extended_watch_top_pct: float = 20.0,
     probability_col: str = "probability",
+    ranking_signal_col: Optional[str] = None,
+    evidence_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """Relative resource-allocation ranking — SEPARATE from the absolute
     calibrated-probability tiers.
@@ -146,40 +188,74 @@ def assign_operational_ranking(
     Top-k ranking still points crews at the highest-priority cells WITHOUT
     changing any probability or claiming a fire is certain.
 
-    Deterministic: cells are ordered by probability DESC, then lat_grid ASC,
-    then lon_grid ASC (stable mergesort) so tied probabilities always break the
-    same way and the WATCH/EXTENDED_WATCH counts are reproducible. Returns a NEW
-    frame with ``rank`` (1-based), ``percentile`` (fraction from the top), and
+    Deterministic and tie-aware: cells are ordered lexicographically by
+    calibrated probability, an optional pre-calibration ranking signal, then
+    measurable historical evidence. Coordinates are used only for stable
+    output order after all risk/evidence keys tie. A priority band is never
+    split through an unresolved tie group, so latitude cannot manufacture a
+    WATCH area. Returns a NEW frame with competition ``rank`` (1-based),
+    conservative ``percentile`` (the end of the tie group), and
     ``ranking_tier``:
 
-      HIGH           — probability ≥ the absolute HIGH threshold (OVERRIDES the
-                       relative tiers; a genuinely high-confidence alert)
-      WATCH          — within the top ``watch_top_pct`` % by rank
-      EXTENDED_WATCH — within the top ``extended_watch_top_pct`` %
-      LOW            — everything else
+      ABSOLUTE_HIGH  — probability ≥ the absolute HIGH threshold (OVERRIDES the
+                       relative labels; the absolute tier remains authoritative)
+      RELATIVE_TOP_10 — wholly within ``watch_top_pct`` by competition rank
+      RELATIVE_TOP_20 — wholly within ``extended_watch_top_pct``
+      UNRANKED        — everything else or an unresolved boundary tie
 
     The ``probability`` column is never modified.
     """
     n = len(df)
+    evidence_cols = list(evidence_cols or [])
+    risk_keys = [probability_col]
+    if (
+        ranking_signal_col
+        and ranking_signal_col in df.columns
+        and ranking_signal_col not in risk_keys
+    ):
+        risk_keys.append(ranking_signal_col)
+    risk_keys.extend(
+        col for col in evidence_cols
+        if col in df.columns and col not in risk_keys
+    )
+    stable_keys = [
+        col for col in ("lat_grid", "lon_grid")
+        if col in df.columns and col not in risk_keys
+    ]
     out = df.sort_values(
-        by=[probability_col, "lat_grid", "lon_grid"],
-        ascending=[False, True, True], kind="mergesort",
+        by=[*risk_keys, *stable_keys],
+        ascending=[False] * len(risk_keys) + [True] * len(stable_keys),
+        kind="mergesort",
+        na_position="last",
     ).reset_index(drop=True)
     if n == 0:
         out["rank"] = []
         out["percentile"] = []
         out["ranking_tier"] = []
         return out
-    ranks = np.arange(1, n + 1)
+
+    # pandas groupby(..., dropna=False) treats equal missing-evidence rows as
+    # one honest tie group. ``cumcount`` is safe because the lexicographic sort
+    # above makes each group contiguous.
+    grouped = out.groupby(risk_keys, sort=False, dropna=False)
+    within_group = grouped.cumcount().to_numpy()
+    group_size = grouped[probability_col].transform("size").to_numpy()
+    group_start = np.arange(n) - within_group
+    group_end = group_start + group_size  # exclusive, also 1-based worst rank
+    ranks = group_start + 1
     out["rank"] = ranks
-    out["percentile"] = np.round(ranks / n, 6)
+    out["percentile"] = np.round(group_end / n, 6)
+    out["_ranking_tie_size"] = group_size
+    out["_ranking_group_end"] = group_end
+
     watch_cut = max(1, int(round(n * watch_top_pct / 100.0)))
     ext_cut = max(watch_cut, int(round(n * extended_watch_top_pct / 100.0)))
     prob = out[probability_col].to_numpy(dtype=float)
-    tiers = np.where(ranks <= watch_cut, "WATCH",
-                     np.where(ranks <= ext_cut, "EXTENDED_WATCH", "LOW"))
+    # Conservative boundary rule: a tied group must fit wholly inside a band.
+    tiers = np.where(group_end <= watch_cut, "RELATIVE_TOP_10",
+                     np.where(group_end <= ext_cut, "RELATIVE_TOP_20", "UNRANKED"))
     if high_threshold is not None:
-        tiers = np.where(prob >= float(high_threshold), "HIGH", tiers)
+        tiers = np.where(prob >= float(high_threshold), "ABSOLUTE_HIGH", tiers)
     out["ranking_tier"] = tiers
     return out
 
@@ -198,10 +274,16 @@ def ranking_policy_metadata(
         "watch_top_pct": watch_top_pct,
         "extended_watch_top_pct": extended_watch_top_pct,
         "absolute_high_threshold": high_threshold,
-        "tie_breaking": ["probability_desc", "lat_grid_asc", "lon_grid_asc"],
-        "note": "Relative priority ranking for resource allocation — NOT an "
+        "tie_breaking": [
+            "calibrated_probability_desc",
+            "precalibration_model_score_desc_within_probability_plateau",
+            "observed_history_desc",
+            "coordinates_for_stable_output_only",
+        ],
+        "ties_split_across_priority_bands": False,
+        "note": "Relative priority ordering for resource allocation — NOT an "
                 "absolute calibrated-probability alert and not a guarantee a "
-                "fire will occur. HIGH (absolute threshold) overrides Top-k.",
+                "fire will occur. Relative labels never reuse High/Watch tier names.",
         "historical_coverage_note": (
             "held-out HISTORICAL captured-recall estimates; not a guarantee for "
             "any single day"),

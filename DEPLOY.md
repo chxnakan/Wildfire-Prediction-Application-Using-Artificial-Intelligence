@@ -7,7 +7,7 @@ and one persistent volume:
 GitHub push
     │
     ▼
-Docker build (Node 22 SPA build → Python 3.13 runtime)
+Docker build (Node 22 SPA build → Python 3.12 runtime)
     │
     ▼
 FastAPI web service
@@ -51,7 +51,18 @@ automation.
    APP_ENV=production
    ```
 
-6. Recommended runtime variables:
+6. Confirm the source checkout materialises Git LFS. The serving feature
+   parquet is an LFS object, not a normal Git blob. The Docker build now stops
+   with an explicit error if it receives the small LFS pointer instead of the
+   real Parquet file.
+
+`ADMIN_TOKEN` is for trusted server-to-server/operator tooling only. Never put
+it in `VITE_*`, browser storage, or frontend code: every visitor could read it.
+The public capability endpoint therefore reports the production Alerts page as
+preview-only. The repository has no SMS, LINE, or email provider; the local
+development queue is an in-memory stub and is not delivery.
+
+7. Recommended runtime variables:
 
    ```text
    SCHEDULER_ENABLED=true
@@ -60,7 +71,7 @@ automation.
    SYNC_INTERVAL_MINUTES=10
    RETRAIN_EVERY_DAYS=3
    RETRAIN_CHECK_HOURS=6
-   TRAIN_ARGS=--quick
+   TRAIN_ARGS=--quick --max-history-days 400
    PREDICT_MAX_HISTORY_DAYS=180
 
    GISTDA_ENABLED=true
@@ -72,13 +83,25 @@ automation.
    ```
 
 The two per-job switches default to `true`, so existing production deployments
-keep their current behaviour. They allow a GISTDA-only presentation process
-without coupling live observations to FIRMS sync or retraining; local demos
-should use `./run.sh --demo` so the safe combination is applied atomically.
+with a populated `/srv/data` volume keep their current behaviour. On a brand
+new Railway volume, initially set `SCHEDULER_SYNC_ENABLED=false` and
+`SCHEDULER_RETRAIN_ENABLED=false` until a sufficiently long FIRMS history has
+been restored to `/srv/data/firms`. A clean GitHub checkout contains directory
+scaffolding but not the ignored local FIRMS/weather caches; allowing the first
+one-day sync to rebuild features would discard the useful history in the
+bootstrap feature artifact. GISTDA polling may remain enabled because it is an
+independent observation layer and is not a model feature.
+
+After the FIRMS cache is restored and checked, enable sync first, verify one
+prediction refresh, and only then enable scheduled retraining. The switches
+also allow a GISTDA-only presentation process without coupling live
+observations to FIRMS sync or retraining; local demos should use
+`./run.sh --demo` so the safe combination is applied atomically.
 
 The Dockerfile supplies:
 
 ```text
+APP_ENV=production
 OUTPUT_DIR=/srv/outputs
 DATA_DIR=/srv/data
 RAW_DIR=/srv/data/raw
@@ -88,30 +111,44 @@ WEATHER_DIR=/srv/data/weather
 WEB_DIST_DIR=/app/web/dist
 ```
 
-`railway.json` uses `/health` with a 300-second deployment health timeout.
-The endpoint intentionally returns HTTP 200 with `ready:false` when a fresh
-volume has not yet produced a model. This keeps the service alive while
-automation accumulates data; the dashboard must still disclose degraded state.
+`railway.json` uses the strict `/health/ready` endpoint with a 300-second
+deployment health timeout, so Railway does not route prediction traffic until
+the served model and data bundle pass readiness checks. The diagnostic
+`/health` endpoint still returns HTTP 200 with `ready:false` for an observable
+but degraded process. The production Docker health check also uses
+`/health/ready` because this image has no separate orchestrator readiness
+probe.
 
 ## Bootstrap behavior
 
-The image includes the repository's current `data/` and `outputs/` as bootstrap
-content. `scripts/start.sh` copies them only when the corresponding `/srv`
-directory is empty. Later deploys do not overwrite the persistent artifact.
+The image includes only the repository's version-controlled bootstrap files:
+the promoted model, LFS-backed feature parquet, dataset metadata, risk GeoJSON,
+Thailand boundary, tree-cover aggregate, and empty cache directories. Local
+raw FIRMS/weather caches and generated reports are excluded from the Docker
+context so local and Railway builds use the same inputs. `scripts/start.sh`
+seeds the four promoted outputs as one artifact set when none of them exists.
+A volume containing only logs or state markers therefore bootstraps correctly;
+a complete promoted set is preserved. If only part of that set exists, startup
+fails explicitly rather than mixing model, features, metadata, and GeoJSON from
+different versions. Boundary and tree-cover reference files can be filled
+independently because they are not a promoted model bundle.
 
-For an empty deployment with no committed promoted model:
-
-- the API boots in degraded mode;
-- map/prediction endpoints remain unavailable or empty;
-- sync jobs collect FIRMS data;
-- training promotes a candidate only after its quality gates pass.
-
-For tomorrow's presentation, deploy an image that contains the already-tested
-promoted artifact or verify that `/srv/outputs` is populated before going live.
+The supported production image must contain a complete, validated bootstrap
+bundle; the Docker build fails if it is missing, malformed, or still an LFS
+pointer. On an empty `/srv` volume, that complete set is seeded before Uvicorn
+starts. Before tomorrow's presentation, also verify that an existing volume
+contains all four promoted files and that `/health/ready` returns HTTP 200.
 
 ## Pre-deploy validation
 
 ```bash
+git lfs install
+git lfs pull --include=outputs/features/full_features.parquet
+git lfs fsck
+
+# Must report Parquet data, not "ASCII text" (an LFS pointer).
+file outputs/features/full_features.parquet
+
 cd web
 npm ci
 npm run typecheck
@@ -136,6 +173,7 @@ Then verify:
 
 ```bash
 curl -fsS http://localhost:8000/health
+curl -fsS http://localhost:8000/health/ready
 curl -fsS http://localhost:8000/geojson >/dev/null
 curl -I http://localhost:8000/
 ```
@@ -149,7 +187,8 @@ Use these endpoints:
 
 | Endpoint | Check |
 |---|---|
-| `/health` | readiness, model load, data age, scheduler status |
+| `/health` | liveness plus diagnostic model, data-age, and scheduler state |
+| `/health/ready` | strict HTTP 200/503 gate for prediction traffic |
 | `/api/analytics/hotspots` | GISTDA feed state and data availability |
 | `/live-hotspots` | cached live detections and freshness metadata |
 | `/geojson` | current snapshot, thresholds, metrics, provenance |
@@ -162,6 +201,8 @@ Before a demo or incident review:
 4. Open Predicted vs Actual and select a mature risk window.
 5. Confirm held-out metrics and snapshot-audit counts are clearly described as
    different evidence.
+6. Open Alerts and confirm it says **preview only** in production. Do not claim
+   that a prepared message was sent; no delivery provider is implemented.
 
 ## Static hosting caveat
 
@@ -177,4 +218,4 @@ Railway can redeploy an earlier image, but the `/srv` volume is not rolled back
 with application code. A bad candidate should normally never replace the
 incumbent because promotion is quality-gated. If artifact rollback is needed,
 restore a known promoted bundle to `/srv/outputs`, restart the service, and
-verify `/health` plus `/geojson` before reopening access.
+verify `/health/ready` plus `/geojson` before reopening access.

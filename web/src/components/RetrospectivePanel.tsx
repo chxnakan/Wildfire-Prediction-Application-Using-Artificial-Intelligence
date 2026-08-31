@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import type { FireFeature } from "../types";
+import { fmtTr, useLang } from "../utils/i18n";
 import { isActionableUrgency } from "../utils/risk";
 
 interface Props {
@@ -74,6 +75,7 @@ const TIER_COLORS: Record<string, string> = {
 };
 
 export default function RetrospectivePanel({ allFeatures }: Props) {
+  const { t } = useLang();
   const stats = useMemo(() => aggregate(allFeatures), [allFeatures]);
 
   // Overall summary across actionable decided rows (excluding future).
@@ -91,10 +93,9 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
   if (stats.length === 0) {
     return (
       <div className="section">
-        <h3>🎯 Actionable Alert Outcomes</h3>
+        <h3>🎯 {t("retrospective.title")}</h3>
         <p style={{ fontSize: 11, color: "var(--text-3)" }}>
-          ยังไม่มี HIGH/WATCH snapshot ที่มี validation status ข้อมูลใหม่จะถูก
-          ประเมินเมื่อช่วง base_date+1 ถึง base_date+3 ปิดครบแล้ว
+          {t("retrospective.empty")}
         </p>
       </div>
     );
@@ -102,9 +103,9 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
 
   return (
     <div className="section">
-      <h3>🎯 Actionable Alert Outcomes</h3>
+      <h3>🎯 {t("retrospective.title")}</h3>
       <p style={{ fontSize: 11, color: "var(--text-3)", marginBottom: 8 }}>
-        HIGH/WATCH ในอดีตเทียบกับ FIRMS แบบ same-cell ในช่วง 3 วัน
+        {t("retrospective.subtitle")}
       </p>
 
       {/* Overall summary */}
@@ -118,16 +119,20 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
         }}
       >
         <div style={{ fontSize: 10, fontWeight: 600, color: "var(--text-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-          Overall track record
+          {t("retrospective.overall")}
         </div>
         <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 4 }}>
           <span style={{ fontSize: 24, fontWeight: 700, color: overall.decided >= MIN_RATE_SAMPLE ? "#60a5fa" : "var(--text-3)" }}>
             {overall.decided >= MIN_RATE_SAMPLE
               ? `${(overall.rate * 100).toFixed(1)}%`
-              : "sample small"}
+              : t("retrospective.small_sample")}
           </span>
           <span style={{ fontSize: 11, color: "var(--text-2)" }}>
-            {overall.hit} hits / {overall.decided} decided alerts ({overall.future} pending)
+            {fmtTr(t("retrospective.summary"), {
+              hits: overall.hit,
+              decided: overall.decided,
+              pending: overall.future,
+            })}
           </span>
         </div>
       </div>
@@ -157,18 +162,27 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
               <div style={{ minWidth: 78 }}>
                 <div style={{ fontWeight: 600, color: "var(--text)" }}>{s.baseDate}</div>
                 <div style={{ fontSize: 10, color: "var(--text-3)", marginTop: 2 }}>
-                  {s.total} cells
+                  {fmtTr(t("retrospective.cells"), { count: s.total })}
                 </div>
               </div>
               <div style={{ display: "flex", gap: 4, flex: 1 }}>
                 {(["CRITICAL", "HIGH", "MEDIUM"] as const).map((tier) => {
-                  const t = s.byTier[tier] ?? { hit: 0, miss: 0, future: 0 };
-                  const td = t.hit + t.miss;
-                  if (td === 0 && t.future === 0) return null;
+                  const tierStats = s.byTier[tier] ?? {
+                    hit: 0,
+                    miss: 0,
+                    future: 0,
+                  };
+                  const td = tierStats.hit + tierStats.miss;
+                  if (td === 0 && tierStats.future === 0) return null;
                   return (
                     <div
                       key={tier}
-                      title={`${tier}: hit=${t.hit}, miss=${t.miss}, future=${t.future}`}
+                      title={fmtTr(t("retrospective.tier_tooltip"), {
+                        tier: tier === "MEDIUM" ? "WATCH" : tier,
+                        hit: tierStats.hit,
+                        miss: tierStats.miss,
+                        future: tierStats.future,
+                      })}
                       style={{
                         padding: "2px 6px",
                         borderRadius: 3,
@@ -180,21 +194,21 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
                         whiteSpace: "nowrap",
                       }}
                     >
-                      {tier.charAt(0)} {td > 0 ? `${t.hit}/${td}` : `+${t.future}`}
+                      {tier === "MEDIUM" ? "W" : tier.charAt(0)} {td > 0 ? `${tierStats.hit}/${td}` : `+${tierStats.future}`}
                     </div>
                   );
                 })}
               </div>
               <div style={{ textAlign: "right", minWidth: 56 }}>
                 {isFutureOnly ? (
-                  <span style={{ color: "var(--text-3)", fontSize: 11 }}>pending</span>
+                  <span style={{ color: "var(--text-3)", fontSize: 11 }}>{t("retrospective.pending")}</span>
                 ) : !canShowRate ? (
                   <>
                     <div style={{ fontSize: 11, fontWeight: 700, color }}>
                       {s.hits}/{decided}
                     </div>
                     <div style={{ fontSize: 9, color: "var(--text-3)" }}>
-                      count (n&lt;{MIN_RATE_SAMPLE})
+                      {fmtTr(t("retrospective.count_small"), { min: MIN_RATE_SAMPLE })}
                     </div>
                   </>
                 ) : (
@@ -203,7 +217,7 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
                       {(s.hitRate * 100).toFixed(0)}%
                     </div>
                     <div style={{ fontSize: 9, color: "var(--text-3)" }}>
-                      hit rate
+                      {t("retrospective.hit_rate")}
                     </div>
                   </>
                 )}
@@ -214,11 +228,7 @@ export default function RetrospectivePanel({ allFeatures }: Props) {
       </div>
 
       <p style={{ fontSize: 10, color: "var(--text-3)", marginTop: 8, lineHeight: 1.45 }}>
-        <b>Hit</b> = cell เดียวกันมี FIRMS hotspot ในช่วง base_date+1…+3 ·{" "}
-        <b>Miss</b> = ไม่มี · <b>Pending</b> = window ยังไม่ปิดครบ.
-        แสดงเปอร์เซ็นต์เมื่อมีผลตัดสินอย่างน้อย {MIN_RATE_SAMPLE} รายการ และไม่รวม
-        Background เพราะส่วนนี้วัดเฉพาะ alert queue ไม่ใช่ metric ของทุก cell.<br/>
-        คำนวณจาก append-mode GeoJSON ตอน <code style={{ background: "var(--surface-2)", padding: "0 3px", borderRadius: 2 }}>risk_map.py</code> รันแต่ละครั้ง
+        {fmtTr(t("retrospective.methodology"), { min: MIN_RATE_SAMPLE })}
       </p>
     </div>
   );

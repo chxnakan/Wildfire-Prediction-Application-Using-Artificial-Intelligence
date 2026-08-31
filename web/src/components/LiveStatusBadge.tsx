@@ -6,8 +6,9 @@ import { useLang } from "../utils/i18n";
 // 4-second timeout — if the backend doesn't respond we degrade to "offline"
 // gracefully. Pulse animation only on "live" so a frozen page doesn't lie.
 //
-// "stale" appears when the API is not ready or the served GeoJSON is >5 days
-// old (`ready` / `geojson_age_days` from the current /health schema).
+// "stale" appears when the API is not ready, the served GeoJSON is old, or
+// its latest source-data date is old (`ready`, `geojson_age_days`, and
+// `data_stale_days` from the current /health schema).
 
 const POLL_INTERVAL_MS = 60_000;
 

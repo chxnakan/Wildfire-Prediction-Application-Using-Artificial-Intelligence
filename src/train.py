@@ -37,14 +37,18 @@ import argparse
 import gc
 import logging
 import os
+import shutil
+import tempfile
 import time
 import warnings
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
@@ -117,6 +121,7 @@ PARAM_GRID: Dict[str, List[Any]] = {
 # Negative class includes rows with no fire in the full 7-day horizon (label=-1)
 # *and* rows with fire only on day 4-7.
 IMMINENT_DAYS = 3
+PURGE_DAYS = 7
 NEG_TO_POS_RATIO = 4   # undersample negatives to ~4× positives for training speed
 
 
@@ -142,6 +147,318 @@ def _paths() -> dict:
         "feature_dir": os.path.join(output_dir, "features"),
         "meta_dir": os.path.join(output_dir, "metadata"),
     }
+
+
+def _weather_quality_report(
+    daily: pd.DataFrame,
+    weather_columns: List[str],
+    min_coverage: float,
+    max_staleness_days: int,
+    min_tail_coverage: float = 0.80,
+    tail_days: int = 7,
+) -> dict:
+    """Audit weather as a group, including spatial coverage at the tail.
+
+    Checking only the first weather column over the full history allowed a
+    month-old cache to pass the coverage gate. The resulting model was then
+    scored with zero-filled temperature/rain/wind/ET0 at the latest date.
+    Likewise, checking only the maximum observed date lets a single fetched
+    cell make an otherwise-missing country-wide tail look fresh. A weather
+    contract is safe only when every required measurement has adequate global
+    coverage *and* adequate per-day spatial coverage throughout the latest
+    trusted tail, including the exact scoring date.
+    """
+    if not 0.0 <= float(min_coverage) <= 1.0:
+        raise ValueError("min_coverage must be between 0 and 1")
+    if not 0.0 <= float(min_tail_coverage) <= 1.0:
+        raise ValueError("min_tail_coverage must be between 0 and 1")
+    if int(tail_days) < 1:
+        raise ValueError("tail_days must be at least 1")
+
+    tail_days = int(tail_days)
+    present = [c for c in weather_columns if c in daily.columns]
+    report = {
+        "required_columns": list(weather_columns),
+        "present_columns": present,
+        "minimum_coverage": float(min_coverage),
+        "minimum_tail_spatial_coverage": float(min_tail_coverage),
+        "tail_days": tail_days,
+        "maximum_staleness_days": int(max_staleness_days),
+        "column_coverage": {},
+        "column_latest_date": {},
+        "column_staleness_days": {},
+        "column_latest_date_coverage": {},
+        "column_tail_min_daily_coverage": {},
+        "enabled_for_training": False,
+    }
+    if set(present) != set(weather_columns) or daily.empty:
+        report["reason"] = "one or more required weather columns are unavailable"
+        return report
+
+    dates = pd.to_datetime(daily["date"], errors="coerce").dt.normalize()
+    dataset_end = dates.max()
+    tail_start = dataset_end - pd.Timedelta(days=tail_days - 1)
+    tail_mask = dates.between(tail_start, dataset_end)
+    latest_mask = dates == dataset_end
+    report["tail_start_date"] = (
+        str(pd.Timestamp(tail_start).date()) if pd.notna(tail_start) else None
+    )
+    report["tail_end_date"] = (
+        str(pd.Timestamp(dataset_end).date()) if pd.notna(dataset_end) else None
+    )
+    stale_values: List[int] = []
+    coverage_values: List[float] = []
+    latest_coverage_values: List[float] = []
+    tail_min_coverage_values: List[float] = []
+    for col in weather_columns:
+        observed = daily[col].notna()
+        coverage = float(observed.mean())
+        latest = dates[observed].max() if observed.any() else pd.NaT
+        staleness = (
+            int((dataset_end - latest).days)
+            if pd.notna(dataset_end) and pd.notna(latest)
+            else 10**9
+        )
+        report["column_coverage"][col] = round(coverage, 6)
+        report["column_latest_date"][col] = (
+            str(pd.Timestamp(latest).date()) if pd.notna(latest) else None
+        )
+        report["column_staleness_days"][col] = staleness
+
+        latest_total = int(latest_mask.sum())
+        latest_coverage = (
+            float(observed[latest_mask].mean()) if latest_total else 0.0
+        )
+        tail_daily_coverage = (
+            pd.DataFrame({"date": dates[tail_mask], "observed": observed[tail_mask]})
+            .groupby("date", sort=True)["observed"]
+            .mean()
+        )
+        # Requiring the minimum daily value prevents a mostly-complete week
+        # from hiding one unmeasured scoring day.
+        tail_min_coverage = (
+            float(tail_daily_coverage.min())
+            if not tail_daily_coverage.empty
+            else 0.0
+        )
+        report["column_latest_date_coverage"][col] = round(
+            latest_coverage, 6
+        )
+        report["column_tail_min_daily_coverage"][col] = round(
+            tail_min_coverage, 6
+        )
+        coverage_values.append(coverage)
+        stale_values.append(staleness)
+        latest_coverage_values.append(latest_coverage)
+        tail_min_coverage_values.append(tail_min_coverage)
+
+    report["dataset_latest_date"] = (
+        str(pd.Timestamp(dataset_end).date()) if pd.notna(dataset_end) else None
+    )
+    coverage_ok = min(coverage_values) >= min_coverage
+    freshness_ok = max(stale_values) <= max_staleness_days
+    tail_coverage_ok = (
+        min(latest_coverage_values) >= min_tail_coverage
+        and min(tail_min_coverage_values) >= min_tail_coverage
+    )
+    report["enabled_for_training"] = bool(
+        coverage_ok and freshness_ok and tail_coverage_ok
+    )
+    if not coverage_ok:
+        report["reason"] = "at least one weather column is below minimum coverage"
+    elif not freshness_ok:
+        report["reason"] = "weather cache is stale relative to the prediction tail"
+    elif not tail_coverage_ok:
+        report["reason"] = (
+            "weather spatial coverage is below minimum on the trusted tail"
+        )
+    else:
+        report["reason"] = "coverage, freshness, and tail spatial gates passed"
+    return report
+
+
+def _trim_to_trusted_history(
+    daily: pd.DataFrame,
+    safe_through: Any,
+    max_history_days: int,
+) -> Tuple[pd.DataFrame, int, int]:
+    """Trim an untrusted tail before anchoring the optional history window.
+
+    If the history cutoff is calculated from an isolated recent fetch first,
+    that untrusted date can evict the complete historical run we need for
+    causal rolling features. This helper makes the ordering explicit and
+    testable: safe-through first, history window second.
+
+    Returns ``(trusted_frame, continuity_rows_removed, history_rows_removed)``.
+    """
+    if daily.empty:
+        return daily.copy(), 0, 0
+    safe = pd.Timestamp(safe_through).normalize()
+    dates = pd.to_datetime(daily["date"], errors="coerce").dt.normalize()
+    trusted = daily[dates <= safe].copy()
+    continuity_removed = int(len(daily) - len(trusted))
+    history_removed = 0
+    if int(max_history_days) > 0 and not trusted.empty:
+        trusted_dates = pd.to_datetime(
+            trusted["date"], errors="coerce"
+        ).dt.normalize()
+        trusted_end = trusted_dates.max()
+        cutoff = trusted_end - pd.Timedelta(days=int(max_history_days))
+        before = len(trusted)
+        trusted = trusted[trusted_dates >= cutoff].copy()
+        history_removed = int(before - len(trusted))
+    return trusted, continuity_removed, history_removed
+
+
+@contextmanager
+def _preserve_artifact_on_failure(path: str):
+    """Restore ``path`` atomically if an enclosed publication step fails.
+
+    Predict-only must publish the feature frame before ``risk_map`` can read
+    it. A same-directory hard-link keeps the previous immutable inode cheaply
+    while the new frame is atomically installed. If map generation fails, one
+    ``os.replace`` restores the previous frame. Filesystems without hard-link
+    support fall back to a byte-for-byte local copy.
+    """
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    had_previous = os.path.isfile(path)
+    backup_path: Optional[str] = None
+    if had_previous:
+        fd, backup_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".rollback",
+            dir=parent,
+        )
+        os.close(fd)
+        os.unlink(backup_path)
+        try:
+            os.link(path, backup_path)
+        except OSError:
+            shutil.copy2(path, backup_path)
+
+    try:
+        yield
+    except Exception:
+        if had_previous and backup_path is not None:
+            os.replace(backup_path, path)
+            backup_path = None
+        elif not had_previous:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if backup_path is not None:
+            try:
+                os.unlink(backup_path)
+            except FileNotFoundError:
+                pass
+
+
+def _firms_continuity_report(
+    daily: pd.DataFrame,
+    required_consecutive_days: int,
+) -> dict:
+    """Find the latest trustworthy FIRMS tail before densified zero filling.
+
+    A regional bbox normally contains at least one VIIRS detection per day.
+    When a fetcher is offline, sparse acquisition dates followed by densified
+    zeros are indistinguishable from measured no-fire days unless we audit the
+    source-positive calendar. We conservatively require a consecutive run and
+    return the latest run end; callers trim any isolated dates after it.
+
+    This is a fail-closed coverage proxy, not a claim that every satellite
+    overpass was complete. Persistent fetch-run coverage should replace it
+    once all deployments use the database audit log.
+    """
+    required = max(int(required_consecutive_days), 1)
+    if daily.empty or "date" not in daily or "fire_count" not in daily:
+        return {
+            "required_consecutive_days": required,
+            "safe_through": None,
+            "status": "unavailable",
+            "reason": "daily frame/date/fire_count unavailable",
+        }
+    dates = pd.to_datetime(daily["date"], errors="coerce").dt.normalize()
+    positive_dates = sorted(
+        pd.Timestamp(value)
+        for value in dates[pd.to_numeric(
+            daily["fire_count"], errors="coerce"
+        ).fillna(0) > 0].dropna().unique()
+    )
+    run: List[pd.Timestamp] = []
+    eligible_ends: List[pd.Timestamp] = []
+    for current in positive_dates:
+        if run and current == run[-1] + pd.Timedelta(days=1):
+            run.append(current)
+        else:
+            run = [current]
+        if len(run) >= required:
+            eligible_ends.append(current)
+    safe = max(eligible_ends) if eligible_ends else None
+    dataset_end = dates.max()
+    discarded_dates = (
+        int(dates[dates > safe].nunique()) if safe is not None else int(dates.nunique())
+    )
+    return {
+        "required_consecutive_days": required,
+        "safe_through": str(safe.date()) if safe is not None else None,
+        "dataset_latest_date": (
+            str(pd.Timestamp(dataset_end).date()) if pd.notna(dataset_end) else None
+        ),
+        "discarded_tail_dates": discarded_dates,
+        "status": "complete" if safe is not None and discarded_dates == 0 else "trimmed",
+        "reason": (
+            "latest source-positive dates are consecutive"
+            if safe is not None and discarded_dates == 0
+            else "isolated source dates after the latest consecutive run were excluded"
+            if safe is not None
+            else "no sufficiently long consecutive source-positive run"
+        ),
+    }
+
+
+def _validate_predict_only_feature_contract(
+    feats: pd.DataFrame,
+    model_path: str,
+) -> None:
+    """Fail before publishing a feature frame the deployed model cannot score.
+
+    ``predict-only`` refreshes data for an existing model, so the feature list
+    embedded in that model bundle is authoritative. A data-quality gate may
+    legitimately remove an optional feature group (for example stale ERA5
+    weather), but publishing that narrower frame would make both risk-map
+    generation and API reload fail. Keep the previous complete frame in place
+    and let the sync worker retry after the source data is repaired instead.
+
+    Legacy bare-model artifacts have no embedded contract; those retain the
+    historical best-effort behaviour.
+    """
+    _model, deployed_meta = load_model_bundle(model_path)
+    required = list((deployed_meta or {}).get("features") or [])
+    if not required:
+        return
+
+    missing = [feature for feature in required if feature not in feats.columns]
+    if missing:
+        preview = ", ".join(missing[:8])
+        suffix = "" if len(missing) <= 8 else ", ..."
+        raise RuntimeError(
+            "predict-only feature contract mismatch: "
+            f"{len(missing)} deployed feature(s) are unavailable "
+            f"({preview}{suffix}). The previous feature frame and risk-map "
+            "snapshot were preserved; refresh the missing real data source "
+            "before retrying."
+        )
+
+
+def _generate_risk_map() -> None:
+    """Generate the serving snapshot and propagate any publication failure."""
+    from risk_map import run as generate_risk_map
+
+    generate_risk_map()
 
 
 # ─────────────────────────────────────────────
@@ -611,10 +928,109 @@ def _promote_bundle(bundle: dict, model_dir: str, promoted_path: str) -> None:
     import shutil
     os.makedirs(model_dir, exist_ok=True)
     candidate_path = os.path.join(model_dir, ".candidate.pkl.tmp")
-    write_pickle(bundle, candidate_path)
-    if os.path.isfile(promoted_path):
-        shutil.copy2(promoted_path, os.path.join(model_dir, "previous.pkl"))
-    os.replace(candidate_path, promoted_path)
+    previous_candidate_path = os.path.join(
+        model_dir, ".previous.candidate.pkl.tmp"
+    )
+    try:
+        write_pickle(bundle, candidate_path)
+        if os.path.isfile(promoted_path):
+            # Never copy *into* an existing previous.pkl.  Publication keeps a
+            # hard-link rollback snapshot of that file; an in-place copy would
+            # mutate the shared inode and silently destroy the backup.  Stage
+            # beside it, then swap the directory entry atomically instead.
+            shutil.copy2(promoted_path, previous_candidate_path)
+            os.replace(
+                previous_candidate_path,
+                os.path.join(model_dir, "previous.pkl"),
+            )
+        os.replace(candidate_path, promoted_path)
+    finally:
+        # A serializer error must not leave a partial file that a later run
+        # could mistake for its own candidate.
+        try:
+            os.unlink(candidate_path)
+        except FileNotFoundError:
+            pass
+        try:
+            os.unlink(previous_candidate_path)
+        except FileNotFoundError:
+            pass
+
+
+def _new_candidate_feature_path(feature_path: str) -> str:
+    """Reserve a unique hidden Parquet path beside the serving artifact.
+
+    Keeping the suffix is important because the storage layer dispatches the
+    writer from the extension.  The file is removed before returning so the
+    atomic table writer can create it normally.
+    """
+    parent = os.path.dirname(feature_path) or "."
+    os.makedirs(parent, exist_ok=True)
+    basename = os.path.basename(feature_path)
+    extension = os.path.splitext(feature_path)[1] or ".parquet"
+    fd, path = tempfile.mkstemp(
+        prefix=f".{basename}.candidate.", suffix=extension, dir=parent
+    )
+    os.close(fd)
+    os.unlink(path)
+    return path
+
+
+@contextmanager
+def _candidate_feature_artifact(feature_path: str):
+    """Yield a same-directory staging path and always remove it on exit."""
+    candidate_path = _new_candidate_feature_path(feature_path)
+    try:
+        yield candidate_path
+    finally:
+        try:
+            os.unlink(candidate_path)
+        except FileNotFoundError:
+            pass
+
+
+def _publish_promoted_candidate(
+    bundle: dict,
+    metadata: dict,
+    *,
+    candidate_feature_path: str,
+    feature_path: str,
+    model_dir: str,
+    promoted_path: str,
+    metadata_path: str,
+    refresh_risk_map: bool,
+) -> None:
+    """Publish one serving model/feature/metadata generation transactionally.
+
+    The candidate feature frame is staged throughout training, so a rejected
+    or failed run cannot alter the incumbent serving frame.  Promotion installs
+    the frame before the model (the risk-map reader needs both), while rollback
+    guards retain all incumbent artifacts until GeoJSON generation succeeds.
+    There is no cross-file atomic rename primitive, but readers either keep the
+    old in-memory generation or, after this function returns, see a complete
+    new generation; any exception restores every on-disk serving artifact.
+    """
+    if not os.path.isfile(candidate_feature_path):
+        raise FileNotFoundError(
+            f"Candidate feature artifact is missing: {candidate_feature_path}"
+        )
+
+    previous_path = os.path.join(model_dir, "previous.pkl")
+    with (
+        _preserve_artifact_on_failure(promoted_path),
+        _preserve_artifact_on_failure(previous_path),
+        _preserve_artifact_on_failure(feature_path),
+        _preserve_artifact_on_failure(metadata_path),
+    ):
+        # Same-directory replace: risk_map can never observe a partial Parquet
+        # file. The rollback link above remains live until map publication.
+        os.replace(candidate_feature_path, feature_path)
+        _promote_bundle(bundle, model_dir, promoted_path)
+        write_json(metadata, metadata_path, indent=2, default=str)
+        if refresh_risk_map:
+            # Publication failure is fatal. Suppressing it would leave a stale
+            # GeoJSON beside a newly promoted model generation.
+            _generate_risk_map()
 
 
 def expected_calibration_error(
@@ -642,6 +1058,121 @@ def expected_calibration_error(
         bin_true = float(y_true[m].mean())
         ece += (n / len(proba)) * abs(bin_pred - bin_true)
     return float(ece)
+
+
+def _calibrator_predict(calibrator: Any, raw_proba: np.ndarray) -> np.ndarray:
+    """Apply either a classifier-style or regressor-style calibrator."""
+    raw = np.asarray(raw_proba, dtype=float).reshape(-1)
+    if hasattr(calibrator, "predict_proba"):
+        pred = calibrator.predict_proba(raw.reshape(-1, 1))[:, 1]
+    else:
+        pred = calibrator.predict(raw)
+    return np.clip(np.asarray(pred, dtype=float), 0.0, 1.0)
+
+
+def _new_calibrator(method: str) -> Any:
+    if method == "isotonic":
+        return IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+    return LogisticRegression(C=1.0, solver="lbfgs", max_iter=200)
+
+
+def _fit_probability_calibrator(
+    raw_proba: np.ndarray,
+    y_true: np.ndarray,
+    dates: pd.Series,
+    method: Optional[str] = None,
+) -> Tuple[Any, dict]:
+    """Select and fit calibration without touching the final test partition.
+
+    ``auto`` compares Platt and isotonic calibration on the chronological tail
+    of the calibration partition, with a purge between fit/evaluation dates.
+    It then refits the selected method on the full calibration partition.
+    This replaces the hard-coded Platt choice, which the repository's own
+    calibration audit found materially worse. If the calibration block is too
+    small or single-class, the conservative Platt fallback is used.
+    """
+    raw = np.asarray(raw_proba, dtype=float).reshape(-1)
+    y = np.asarray(y_true, dtype=np.int8).reshape(-1)
+    ds = pd.to_datetime(pd.Series(dates).reset_index(drop=True)).dt.normalize()
+    if not (len(raw) == len(y) == len(ds)):
+        raise ValueError("calibration probabilities, labels, and dates must align")
+    if len(np.unique(y)) < 2:
+        raise ValueError("calibration requires both positive and negative labels")
+
+    requested = (method or os.getenv("CALIBRATION_METHOD", "auto")).strip().lower()
+    if requested not in {"auto", "platt", "isotonic"}:
+        log.warning("CALIBRATION_METHOD=%r unsupported — using auto", requested)
+        requested = "auto"
+
+    selected = requested
+    diagnostics: dict = {
+        "requested": requested,
+        "selected_on": "calib_only",
+        "candidates": {},
+    }
+    unique_dates = np.array(sorted(ds.unique()))
+    min_eval_dates = 7
+    eval_dates_n = max(min_eval_dates, int(round(len(unique_dates) * 0.25)))
+    can_compare = requested == "auto" and len(unique_dates) >= 2 * min_eval_dates + PURGE_DAYS
+
+    if can_compare:
+        eval_start = pd.Timestamp(unique_dates[-eval_dates_n])
+        fit_end = eval_start - pd.Timedelta(days=PURGE_DAYS + 1)
+        fit_mask = (ds <= fit_end).to_numpy()
+        eval_mask = (ds >= eval_start).to_numpy()
+        can_compare = (
+            fit_mask.sum() > 0
+            and eval_mask.sum() > 0
+            and len(np.unique(y[fit_mask])) == 2
+            and len(np.unique(y[eval_mask])) == 2
+        )
+
+    if can_compare:
+        for candidate_name in ("platt", "isotonic"):
+            candidate = _new_calibrator(candidate_name)
+            x_fit = raw[fit_mask]
+            if candidate_name == "platt":
+                candidate.fit(x_fit.reshape(-1, 1), y[fit_mask])
+            else:
+                candidate.fit(x_fit, y[fit_mask])
+            pred = _calibrator_predict(candidate, raw[eval_mask])
+            diagnostics["candidates"][candidate_name] = {
+                "brier": float(brier_score_loss(y[eval_mask], pred)),
+                "ece": expected_calibration_error(y[eval_mask], pred),
+                "roc_auc": float(roc_auc_score(y[eval_mask], pred)),
+            }
+        platt = diagnostics["candidates"]["platt"]
+        isotonic = diagnostics["candidates"]["isotonic"]
+        # Isotonic may introduce probability ties. Accept its calibration gain
+        # only when it does not materially damage held-out calibration ranking.
+        isotonic_safe = isotonic["roc_auc"] >= platt["roc_auc"] - 0.002
+        selected = (
+            "isotonic"
+            if isotonic_safe and (isotonic["brier"], isotonic["ece"])
+            < (platt["brier"], platt["ece"])
+            else "platt"
+        )
+        diagnostics.update({
+            "fit_date_end": str(fit_end.date()),
+            "evaluation_date_start": str(eval_start.date()),
+            "evaluation_dates": int(eval_dates_n),
+            "purge_days": PURGE_DAYS,
+        })
+    elif requested == "auto":
+        selected = "platt"
+        diagnostics["fallback_reason"] = (
+            "insufficient independent dates/classes for chronological "
+            "calibrator comparison"
+        )
+
+    calibrator = _new_calibrator(selected)
+    if selected == "platt":
+        calibrator.fit(raw.reshape(-1, 1), y)
+    else:
+        calibrator.fit(raw, y)
+    diagnostics["selected"] = selected
+    diagnostics["refit_on_full_calib"] = True
+    return calibrator, diagnostics
 
 
 def reliability_bins(
@@ -1180,7 +1711,7 @@ def _render_training_report(
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
-def main(
+def _main_impl(
     n_iter: int = 30,
     n_splits: int = 5,
     val_fraction: float = 0.15,
@@ -1192,8 +1723,9 @@ def main(
     random_state: int = 42,
     predict_only: bool = False,
     max_history_days: int = 0,
-    n_ensemble: int = 10,
+    n_ensemble: int = 5,
     early_stopping_rounds: int = 50,
+    _candidate_feature_path: Optional[str] = None,
 ) -> dict:
     t_total_start = time.time()
     load_dotenv()
@@ -1222,20 +1754,67 @@ def main(
     )
 
     max_history_days_applied = 0
+
+    # Daily aggregates used to train the classifier represent complete days.
+    # Scoring an in-progress UTC day (for example data only through 07:01Z)
+    # creates a silent train/serve distribution shift and can make current-day
+    # fire/FRP features look artificially quiet. Default to the latest complete
+    # UTC observation day. A future explicitly validated partial-day nowcast
+    # can opt in with INCLUDE_PARTIAL_CURRENT_DAY=true.
+    include_partial_day = os.getenv(
+        "INCLUDE_PARTIAL_CURRENT_DAY", "false"
+    ).lower() in ("1", "true", "yes")
+    today_utc = pd.Timestamp.now("UTC").normalize().date()
+    if not include_partial_day:
+        complete_cutoff = today_utc - pd.Timedelta(days=1)
+        daily_dates = pd.to_datetime(daily["date"]).dt.date
+        partial_rows = int((daily_dates > complete_cutoff).sum())
+        if partial_rows:
+            daily = daily[daily_dates <= complete_cutoff].copy()
+            log.info(
+                "Complete-day gate: excluded %d in-progress row(s) after %s",
+                partial_rows,
+                complete_cutoff,
+            )
+        if daily.empty:
+            raise RuntimeError(
+                "No complete observation day is available for model scoring"
+            )
+
+    # The deployed feature contract contains causal windows up to 90 days.
+    # Accepting a newly backfilled 7-10 day island after a long outage would
+    # still encode the missing gap as measured zeros. Require a full maximum
+    # lookback window before advancing the trusted prediction tail.
+    continuity_days = int(os.getenv("FIRMS_CONTIGUOUS_DAYS_REQUIRED", "90"))
+    firms_continuity = _firms_continuity_report(daily, continuity_days)
+    safe_through = firms_continuity.get("safe_through")
+    if not safe_through:
+        raise RuntimeError(
+            "FIRMS continuity gate failed: " + str(firms_continuity.get("reason"))
+        )
+    safe_date = pd.Timestamp(safe_through).date()
+    daily, continuity_rows_removed, history_rows_removed = (
+        _trim_to_trusted_history(daily, safe_date, max_history_days)
+    )
+    if continuity_rows_removed:
+        log.warning(
+            "FIRMS continuity gate trimmed %d row(s); safe through %s. "
+            "Sparse later fetch dates are unknown coverage, not zero-fire days.",
+            continuity_rows_removed,
+            safe_date,
+        )
     if max_history_days > 0:
-        dmax = pd.to_datetime(daily["date"]).max()
-        cutoff = dmax - pd.Timedelta(days=max_history_days)
-        before_rows = len(daily)
-        daily = daily[pd.to_datetime(daily["date"]) >= cutoff].copy()
-        max_history_days_applied = max_history_days
+        max_history_days_applied = int(max_history_days)
         log.info(
-            "History window: last %d calendar days, rows %d → %d",
-            max_history_days, before_rows, len(daily),
+            "History window after trusted-tail gate: last %d calendar days, "
+            "removed %d row(s), rows remaining %d",
+            max_history_days,
+            history_rows_removed,
+            len(daily),
         )
 
     latest_observed = pd.to_datetime(daily["date"]).max()
     latest_date = pd.Timestamp(latest_observed).normalize().date()
-    today_utc = pd.Timestamp.now("UTC").normalize().date()
     stale_days = (today_utc - latest_date).days
     STALE_WARN_DAYS = int(os.getenv("STALE_WARN_DAYS", "5"))
     if stale_days > STALE_WARN_DAYS:
@@ -1243,42 +1822,95 @@ def main(
 
     WEATHER_COLS = ["temp_max", "temp_min", "precip_sum", "wind_max", "et0"]
     MIN_WEATHER_COVERAGE = float(os.getenv("MIN_WEATHER_COVERAGE", "0.20"))
-    weather_cols_present = [c for c in WEATHER_COLS if c in daily.columns]
-    if weather_cols_present:
-        coverage = daily[weather_cols_present[0]].notna().mean()
-        if coverage < MIN_WEATHER_COVERAGE:
-            log.warning("Weather coverage %.1f%% < threshold — dropping weather cols", coverage * 100)
+    MAX_WEATHER_STALENESS_DAYS = int(
+        os.getenv("MAX_WEATHER_STALENESS_DAYS", "0")
+    )
+    MIN_WEATHER_TAIL_COVERAGE = float(
+        os.getenv("MIN_WEATHER_TAIL_COVERAGE", "0.80")
+    )
+    WEATHER_COVERAGE_TAIL_DAYS = int(
+        os.getenv("WEATHER_COVERAGE_TAIL_DAYS", "7")
+    )
+    weather_quality = _weather_quality_report(
+        daily,
+        WEATHER_COLS,
+        min_coverage=MIN_WEATHER_COVERAGE,
+        max_staleness_days=MAX_WEATHER_STALENESS_DAYS,
+        min_tail_coverage=MIN_WEATHER_TAIL_COVERAGE,
+        tail_days=WEATHER_COVERAGE_TAIL_DAYS,
+    )
+    if not weather_quality["enabled_for_training"]:
+        weather_cols_present = [c for c in WEATHER_COLS if c in daily.columns]
+        if weather_cols_present:
+            log.warning(
+                "Weather quality gate failed (%s) — dropping all weather columns; "
+                "coverage=%s tail_min_daily=%s latest_date_coverage=%s "
+                "staleness_days=%s",
+                weather_quality["reason"],
+                weather_quality["column_coverage"],
+                weather_quality["column_tail_min_daily_coverage"],
+                weather_quality["column_latest_date_coverage"],
+                weather_quality["column_staleness_days"],
+            )
             daily = daily.drop(columns=weather_cols_present)
+    else:
+        log.info(
+            "Weather quality gate passed: coverage=%s tail_min_daily=%s "
+            "latest_date_coverage=%s staleness_days=%s",
+            weather_quality["column_coverage"],
+            weather_quality["column_tail_min_daily_coverage"],
+            weather_quality["column_latest_date_coverage"],
+            weather_quality["column_staleness_days"],
+        )
 
     log.info("==== STEP 2: feature engineering ====")
     feats = build_features(daily, horizon=MAX_PREDICTION_DAYS, grid_size=grid_size)
 
     feature_path = os.path.join(p["feature_dir"], "full_features.parquet")
-    feats_sorted = feats.sort_values("date", kind="stable")
-    write_table(
-        feats_sorted, feature_path,
-        row_group_size=200_000, compression="zstd", compression_level=10,
-    )
-    log.info("Saved feature dataset → %s", feature_path)
-
+    model_path = os.path.join(p["model_dir"], "lgbm_fire_date_model.pkl")
     if predict_only:
-        model_path = os.path.join(p["model_dir"], "lgbm_fire_date_model.pkl")
         if not os.path.isfile(model_path):
             raise RuntimeError("predict-only requires an existing trained model")
-        log.info("==== predict-only: skipped tuning ====")
-        # CRITICAL: free 5-6 GB of feature-engineering memory BEFORE calling
-        # risk_map.run(). Otherwise we stack risk_map's ~3.5 GB load on top
-        # of the still-resident feats/daily frames and OOM on a 22 GB laptop.
-        log.info("Releasing feature-engineering memory before risk_map…")
-        del feats, feats_sorted, daily
-        gc.collect()
-        if not skip_risk_map:
-            try:
-                from risk_map import run as generate_risk_map
-                generate_risk_map()
-            except Exception as exc:
-                log.warning("risk_map.run() failed: %s", exc)
+        # Validate before the atomic write so a stale/missing optional source
+        # cannot replace the last model-compatible serving frame.
+        _validate_predict_only_feature_contract(feats, model_path)
+
+    if predict_only:
+        # Feature publication and GeoJSON generation form one logical refresh.
+        # Keep a cheap rollback link to the prior feature artifact until the
+        # downstream risk-map publication succeeds.
+        with _preserve_artifact_on_failure(feature_path):
+            feats_sorted = feats.sort_values("date", kind="stable")
+            write_table(
+                feats_sorted, feature_path,
+                row_group_size=200_000, compression="zstd", compression_level=10,
+            )
+            log.info("Saved candidate feature dataset → %s", feature_path)
+            log.info("==== predict-only: skipped tuning ====")
+            # CRITICAL: free 5-6 GB of feature-engineering memory BEFORE calling
+            # risk_map.run(). Otherwise we stack risk_map's ~3.5 GB load on top
+            # of the still-resident feats/daily frames and OOM on a 22 GB laptop.
+            log.info("Releasing feature-engineering memory before risk_map…")
+            del feats, feats_sorted, daily
+            gc.collect()
+            if not skip_risk_map:
+                # A missing/failed GeoJSON is a failed prediction refresh. Let
+                # the subprocess exit non-zero, restore the prior feature
+                # frame, and retry on the next sync cycle.
+                _generate_risk_map()
         return {"mode": "predict_only", "feature_path": feature_path}
+
+    if not _candidate_feature_path:
+        raise RuntimeError("full training requires a candidate feature path")
+    feats_sorted = feats.sort_values("date", kind="stable")
+    write_table(
+        feats_sorted, _candidate_feature_path,
+        row_group_size=200_000, compression="zstd", compression_level=10,
+    )
+    log.info(
+        "Staged candidate feature dataset (incumbent untouched) → %s",
+        _candidate_feature_path,
+    )
 
     log.info("==== STEP 3: build binary label + censor unobservable tail ====")
     # Memory plan: drop unused columns, cast to float32 BEFORE the split so
@@ -1345,7 +1977,6 @@ def main(
     #   val   — early-stopping eval + (with train) final ensemble fit data
     #   calib — probability calibration + threshold selection (natural prev.)
     #   test  — touched exactly once, at the end, at natural prevalence
-    PURGE_DAYS = 7
     # Optional dedicated PROMOTION/champion block between calib and test
     # (CHAMPION_FRACTION > 0 ⇒ 5-way split). Promotion gates then compare on
     # champion, keeping the FINAL test untouched by model selection. Default 0
@@ -1405,7 +2036,7 @@ def main(
         )
 
     # ── Class-imbalance handling (IMBALANCE_MODE, audited item 2) ────────────
-    # The legacy default (D) STACKS three corrections — 4:1 undersampling ×
+    # The legacy mode (D) STACKS three corrections — 4:1 undersampling ×
     # inverse-class-frequency sample weights × scale_pos_weight≈4 — an
     # effective ~120× positive up-weighting at 3% natural prevalence that
     # inflates raw probabilities and leans entirely on Platt to repair them.
@@ -1413,11 +2044,11 @@ def main(
     #   A: natural prevalence, NO class weighting            (memory-heavy)
     #   B: natural prevalence + scale_pos_weight only        (memory-heavy)
     #   C: 4:1 undersampling + analytic prior correction, no extra weighting
-    #   D: legacy stacked behavior (default, backward-compatible)
-    imbalance_mode = os.getenv("IMBALANCE_MODE", "D").upper()
+    #   D: legacy stacked behavior (retained only for reproducibility)
+    imbalance_mode = os.getenv("IMBALANCE_MODE", "C").upper()
     if imbalance_mode not in ("A", "B", "C", "D"):
-        log.warning("IMBALANCE_MODE=%r invalid — using D", imbalance_mode)
-        imbalance_mode = "D"
+        log.warning("IMBALANCE_MODE=%r invalid — using C", imbalance_mode)
+        imbalance_mode = "C"
     natural_pos = int(train_df["_y_bin"].sum())
     natural_neg = int(len(train_df) - natural_pos)
 
@@ -1539,24 +2170,28 @@ def main(
     t_refit_elapsed = time.time() - t_refit_start
     log.info("⏱️  Ensemble refit time: %.1f seconds (%d models)", t_refit_elapsed, n_ensemble)
 
-    # ── STEP 6b: Platt calibration on the CALIB partition ────────────────
+    # ── STEP 6b: calibration on the CALIB partition ─────────────────────
     # The ensemble's raw probabilities are not calibrated — "0.7" might mean
     # 45% in practice. Calibration data must satisfy two properties the old
     # code violated: (1) the model never trained on it (the old code refit
     # on train+val and then calibrated on val — in-sample predictions), and
     # (2) it has NATURAL prevalence (the old val was undersampled 4:1, so
     # the sigmoid learned an inflated base rate).
-    log.info("==== STEP 6b: probability calibration (Platt scaling on calib) ====")
+    log.info("==== STEP 6b: probability calibration (calib-only selection) ====")
     calib_raw_proba = best_model._raw_proba(X_calib)
     calib_ece_before = expected_calibration_error(y_calib_bin, calib_raw_proba)
-    calibrator = LogisticRegression(C=1.0, solver="lbfgs", max_iter=200)
-    calibrator.fit(calib_raw_proba.reshape(-1, 1), y_calib_bin)
+    calibrator, calibration_selection = _fit_probability_calibrator(
+        calib_raw_proba,
+        y_calib_bin,
+        calib_df["date"],
+    )
     best_model.calibrator = calibrator
     calib_proba = best_model.predict_proba(X_calib)
     calib_ece_after = expected_calibration_error(y_calib_bin, calib_proba)
     log.info(
-        "Calibration: ECE on calib %.4f → %.4f (lower is better; both at natural prevalence)",
-        calib_ece_before, calib_ece_after,
+        "Calibration (%s): ECE on calib %.4f → %.4f "
+        "(lower is better; both at natural prevalence)",
+        calibration_selection["selected"], calib_ece_before, calib_ece_after,
     )
 
     # ── STEP 6c: deployment threshold + tier cutoffs from CALIB only ─────
@@ -1744,7 +2379,8 @@ def main(
         "ece_calib_after_calibration": round(calib_ece_after, 4),
         # Flag persisted so the dashboard's "Calibrated" badge lights up
         # (frontend treats any truthy calibration_method as calibrated).
-        "calibration_method": "platt_sigmoid",
+        "calibration_method": calibration_selection["selected"],
+        "calibration_selection": calibration_selection,
         "reliability_bins": reliability,
         "baselines": baselines,
         **pak_metrics,
@@ -1926,6 +2562,9 @@ def main(
         "features": feature_cols,
         "feature_count": len(feature_cols),
         "weather_features_used": [c for c in feature_cols if c.startswith(("temp_", "precip_", "wind_", "et0_"))],
+        "weather_data_quality": weather_quality,
+        "firms_data_continuity": firms_continuity,
+        "partial_current_day_included": bool(include_partial_day),
         # ── Evaluation-protocol audit trail ──────────────────────────────
         "evaluation_protocol": {
             "split_method": "date_grouped_chronological",
@@ -1940,10 +2579,12 @@ def main(
             "undersample_beta": round(float(undersample_beta), 6),
             "prior_correction_note": (
                 "mode C raw-probability prior correction: "
-                "p_natural = beta*p / (beta*p + (1 - p)); Platt calibration on "
-                "the natural-prevalence calib split also absorbs this shift"),
+                "p_natural = beta*p / (beta*p + (1 - p)); probability "
+                "calibration on the natural-prevalence calib split also "
+                "absorbs this shift"),
             "multisat_weighting": bool(multi_sat_train is not None),
             "calibration_fitted_on": "calib (natural prevalence, disjoint from fit data)",
+            "calibration_selection": calibration_selection,
             "threshold_selected_on": "calib",
             "test_evaluations": 1,
         },
@@ -2112,15 +2753,49 @@ def main(
     meta_path = os.path.join(p["meta_dir"], "dataset_info.json")
 
     if promoted:
-        _promote_bundle(bundle, p["model_dir"], model_path)
-        log.info("Promoted model bundle → %s (incumbent kept at previous.pkl)", model_path)
-        # Display metadata AFTER the bundle swap — the bundle is the
-        # authoritative pair; this JSON is for the frontend/docs.
-        write_json(metadata, meta_path, indent=2, default=str)
+        if not skip_risk_map:
+            log.info("==== STEP 10: refresh risk map ====")
+            # Free the largest training objects before risk_map loads its own
+            # ~3.5 GB parquet. `del locals()[name]` is a Python no-op (locals()
+            # returns a copy), so delete each name explicitly then force a GC
+            # cycle. This reliably reclaims 4–6 GB on a 22 GB laptop.
+            del X_train, X_val, X_calib, X_test
+            del y_train_bin, y_val_bin, y_calib_bin, y_test_bin
+            del val_df, calib_df, test_df
+            del train_df_us
+            del sample_weight_train, search, estimator
+            gc.collect()
+
+        # Publish features, bundle and display metadata as one guarded serving
+        # generation. risk_map failure propagates and restores the incumbent
+        # trio instead of silently leaving an incompatible or stale snapshot.
+        _publish_promoted_candidate(
+            bundle,
+            metadata,
+            candidate_feature_path=_candidate_feature_path,
+            feature_path=feature_path,
+            model_dir=p["model_dir"],
+            promoted_path=model_path,
+            metadata_path=meta_path,
+            refresh_risk_map=not skip_risk_map,
+        )
+        log.info(
+            "Promoted model + feature generation → %s, %s "
+            "(incumbent model kept at previous.pkl)",
+            model_path,
+            feature_path,
+        )
         log.info("Saved metadata → %s", meta_path)
-        history_path = os.path.join(p["model_dir"], "history",
-                                    f"{timestamp}_lightgbm.pkl")
-        write_pickle(bundle, history_path)
+
+        # History is an audit copy, not a serving dependency. A history-write
+        # failure must not undo an already complete serving publication.
+        history_path = os.path.join(
+            p["model_dir"], "history", f"{timestamp}_lightgbm.pkl"
+        )
+        try:
+            write_pickle(bundle, history_path)
+        except Exception as exc:
+            log.warning("Could not save model history copy %s: %s", history_path, exc)
     else:
         rejected_dir = os.path.join(p["model_dir"], "rejected")
         os.makedirs(rejected_dir, exist_ok=True)
@@ -2130,28 +2805,56 @@ def main(
                     "The trusted model and its metadata are unchanged.",
                     rejected_path)
 
-    if not skip_risk_map and promoted:
-        log.info("==== STEP 10: refresh risk map ====")
-        # Free the largest training objects before risk_map loads its own
-        # ~3.5 GB parquet. `del locals()[name]` is a Python no-op (locals()
-        # returns a copy), so we delete each name explicitly then force a GC
-        # cycle. This reliably reclaims 4–6 GB on a 22 GB laptop.
-        del X_train, X_val, X_calib, X_test
-        del y_train_bin, y_val_bin, y_calib_bin, y_test_bin
-        del val_df, calib_df, test_df
-        del train_df_us
-        del sample_weight_train, search, estimator
-        gc.collect()
-        try:
-            from risk_map import run as generate_risk_map
-            generate_risk_map()
-        except Exception as exc:
-            log.warning("risk_map.run() failed: %s", exc)
-    elif not promoted:
+    if not promoted:
         log.info("Risk map NOT refreshed — last snapshot from the trusted "
                  "model keeps serving.")
 
     return metadata
+
+
+def main(
+    n_iter: int = 30,
+    n_splits: int = 5,
+    val_fraction: float = 0.15,
+    calib_fraction: float = 0.10,
+    test_fraction: float = 0.15,
+    grid_size: float = 0.1,
+    min_confidence: int = 0,
+    skip_risk_map: bool = False,
+    random_state: int = 42,
+    predict_only: bool = False,
+    max_history_days: int = 0,
+    n_ensemble: int = 5,
+    early_stopping_rounds: int = 50,
+) -> dict:
+    """Run training with deterministic cleanup of staged feature artifacts."""
+    kwargs = {
+        "n_iter": n_iter,
+        "n_splits": n_splits,
+        "val_fraction": val_fraction,
+        "calib_fraction": calib_fraction,
+        "test_fraction": test_fraction,
+        "grid_size": grid_size,
+        "min_confidence": min_confidence,
+        "skip_risk_map": skip_risk_map,
+        "random_state": random_state,
+        "predict_only": predict_only,
+        "max_history_days": max_history_days,
+        "n_ensemble": n_ensemble,
+        "early_stopping_rounds": early_stopping_rounds,
+    }
+    if predict_only:
+        return _main_impl(**kwargs)
+
+    # Resolve after loading .env so a configured OUTPUT_DIR also owns its
+    # same-filesystem staging file. The context removes rejected candidates
+    # and any artifact left by an exception at any later training step.
+    load_dotenv()
+    feature_path = os.path.join(_paths()["feature_dir"], "full_features.parquet")
+    with _candidate_feature_artifact(feature_path) as candidate_feature_path:
+        return _main_impl(
+            **kwargs, _candidate_feature_path=candidate_feature_path
+        )
 
 
 def _cli() -> argparse.Namespace:
@@ -2163,7 +2866,10 @@ def _cli() -> argparse.Namespace:
     p.add_argument("--test-fraction", type=float, default=0.15)
     p.add_argument("--grid-size", type=float, default=float(os.getenv("GRID_SIZE", "0.1")))
     p.add_argument("--min-confidence", type=int, default=0)
-    p.add_argument("--n-ensemble", type=int, default=10)
+    p.add_argument(
+        "--n-ensemble", type=int, default=5,
+        help="Ensemble members (default 5; raise only with sufficient RAM)",
+    )
     p.add_argument("--early-stopping-rounds", type=int, default=50)
     p.add_argument("--quick", action="store_true",
                    help="Fast iteration: n_iter=12, n_splits=3")

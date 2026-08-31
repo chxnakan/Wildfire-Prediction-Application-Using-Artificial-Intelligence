@@ -273,10 +273,23 @@ def latest_hotspot_time() -> Optional[datetime]:
 def insert_predictions(df: pd.DataFrame, base_date) -> int:
     """Persist one snapshot of risk_map predictions. Re-running the same
     base_date overwrites that snapshot (delete + insert) so the table always
-    holds exactly one row per (base_date, cell)."""
-    if not enabled() or df.empty:
+    holds exactly one row per (base_date, cell).
+
+    An empty frame is a valid snapshot: it means the model produced no cells
+    for that date.  It must therefore delete any previously persisted rows for
+    the same date instead of leaving a stale snapshot behind.
+    """
+    if not enabled():
         return 0
     from sqlalchemy import text
+
+    snapshot_date = pd.to_datetime(base_date).date()
+    delete_stmt = text("DELETE FROM risk_predictions WHERE base_date = :bd")
+
+    if df.empty:
+        with _conn() as conn:
+            conn.execute(delete_stmt, {"bd": snapshot_date})
+        return 0
 
     col_map = {
         "lat_grid": "lat_grid",
@@ -292,7 +305,7 @@ def insert_predictions(df: pd.DataFrame, base_date) -> int:
     }
     present = {src: dst for src, dst in col_map.items() if src in df.columns}
     sub = df[list(present)].rename(columns=present).copy()
-    sub["base_date"] = pd.to_datetime(base_date).date()
+    sub["base_date"] = snapshot_date
     if "predicted_fire_date" in sub.columns:
         sub["predicted_fire_date"] = pd.to_datetime(
             sub["predicted_fire_date"], errors="coerce"
@@ -306,10 +319,7 @@ def insert_predictions(df: pd.DataFrame, base_date) -> int:
         "ON CONFLICT (base_date, lat_grid, lon_grid) DO NOTHING"
     )
     with _conn() as conn:
-        conn.execute(
-            text("DELETE FROM risk_predictions WHERE base_date = :bd"),
-            {"bd": sub["base_date"].iloc[0]},
-        )
+        conn.execute(delete_stmt, {"bd": snapshot_date})
         conn.execute(stmt, records)
     return len(records)
 

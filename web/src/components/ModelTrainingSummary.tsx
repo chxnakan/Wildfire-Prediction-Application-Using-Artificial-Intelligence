@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchTrainingSummary } from "../api";
+import { useLang } from "../utils/i18n";
 import type {
   RollingMonthPoint,
   ScientificStats,
@@ -25,6 +26,7 @@ interface Props {
 }
 
 export default function ModelTrainingSummary({ metrics }: Props) {
+  const { lang } = useLang();
   // Prefer the training_summary baked into geojson metadata (one HTTP round
   // trip already done). If absent — e.g. risk_map.py hasn't been re-run since
   // we added the bundle — pull it from /api/training-summary.
@@ -50,23 +52,26 @@ export default function ModelTrainingSummary({ metrics }: Props) {
   const sci = metrics?.scientific_stats ?? null;
   const rolling = metrics?.rolling_by_month ?? [];
 
-  // Aggregate per-month stability stats — these are not raw CV folds but
-  // are the closest decomposition we have (the BayesSearchCV CV scores
-  // aren't persisted). Per-month AUC across the test window gives the same
-  // "mean / std / min / max" view requested.
+  // Aggregate the persisted per-month descriptive diagnostic. The same
+  // deployed model is scored across available calendar months, which can
+  // include months used for training; this is not CV or walk-forward evidence.
   const stability = useMemo(() => computeStability(rolling, metrics), [rolling, metrics]);
 
   if (loadError && !summary) {
     return (
       <section className="report-section">
         <div className="report-inline-error" role="alert">
-          <span>ไม่สามารถโหลด training summary: {loadError}</span>
+          <span>
+            {lang === "th"
+              ? `ไม่สามารถโหลด training summary: ${loadError}`
+              : `Could not load training summary: ${loadError}`}
+          </span>
           <button
             type="button"
             className="action-btn"
             onClick={() => setRetryKey((key) => key + 1)}
           >
-            ลองอีกครั้ง
+            {lang === "th" ? "ลองอีกครั้ง" : "Try again"}
           </button>
         </div>
       </section>
@@ -105,15 +110,23 @@ export default function ModelTrainingSummary({ metrics }: Props) {
             label="ROC-AUC"
             point={sci.ci_95.roc_auc.point}
             ci={[sci.ci_95.roc_auc.lower, sci.ci_95.roc_auc.upper]}
-            interpret="ความสามารถจัดอันดับ cell · ≥0.8 = ดี"
+            interpret={lang === "th"
+              ? "ความสามารถจัดอันดับ cell · ≥0.8 = ดี"
+              : "Cell-ranking ability · ≥0.8 = good"}
             tone={sci.ci_95.roc_auc.point >= 0.80 ? "great" : sci.ci_95.roc_auc.point >= 0.70 ? "good" : "ok"}
           />
           <ResultCard
-            label="Recall @ deploy"
+            label={lang === "th"
+              ? "Recall ของ HIGH บน held-out"
+              : "HIGH-tier held-out recall"}
             point={sci.ci_95.recall_at_deploy.point}
             ci={[sci.ci_95.recall_at_deploy.lower, sci.ci_95.recall_at_deploy.upper]}
-            interpret={`จับไฟจริงได้ ${Math.round(sci.ci_95.recall_at_deploy.point * 100)} / 100 จุด`}
-            tone={sci.ci_95.recall_at_deploy.point >= 0.6 ? "great" : "ok"}
+            interpret={lang === "th"
+              ? `HIGH จับ hotspot จริงได้ ${Math.round(sci.ci_95.recall_at_deploy.point * 100)} / 100 ผลบวกในชุด held-out; WATCH บน dashboard ใช้ cutoff ที่กว้างกว่า${metrics?.prevalence_drift?.drift_flag ? " และค่านี้ถูกจำกัดด้วย seasonal drift" : ""}`
+              : `HIGH caught ${Math.round(sci.ci_95.recall_at_deploy.point * 100)} of 100 observed-positive held-out outcomes; the dashboard WATCH headline uses a broader cutoff${metrics?.prevalence_drift?.drift_flag ? " and this result is limited by seasonal drift" : ""}`}
+            tone={metrics?.prevalence_drift?.drift_flag
+              ? "info"
+              : sci.ci_95.recall_at_deploy.point >= 0.6 ? "great" : "ok"}
           />
           <ResultCard
             label="Precision @ deploy"
@@ -129,14 +142,18 @@ export default function ModelTrainingSummary({ metrics }: Props) {
             label="F1 @ deploy"
             point={sci.ci_95.f1_at_deploy.point}
             ci={[sci.ci_95.f1_at_deploy.lower, sci.ci_95.f1_at_deploy.upper]}
-            interpret="สมดุล precision + recall ที่ threshold ใช้งานจริง"
+            interpret={lang === "th"
+              ? "สมดุล precision + recall ที่ threshold ใช้งานจริง"
+              : "Precision/recall balance at the deployed threshold"}
             tone="ok"
           />
           <ResultCard
             label="Brier score"
             point={sci.ci_95.brier_score.point}
             ci={[sci.ci_95.brier_score.lower, sci.ci_95.brier_score.upper]}
-            interpret="Mean squared probability error · ยิ่งต่ำยิ่งดี"
+            interpret={lang === "th"
+              ? "Mean squared probability error · ยิ่งต่ำยิ่งดี"
+              : "Mean squared probability error · lower is better"}
             tone={sci.ci_95.brier_score.point < 0.05 ? "great" : "good"}
             invert
           />
@@ -186,7 +203,7 @@ export default function ModelTrainingSummary({ metrics }: Props) {
         <SummaryCard title="🎓 Training">
           <DefRow
             k="Split"
-            v={sci ? "Chronological train / validation / test" : "—"}
+            v={sci ? "Chronological train / validation / calibration / test" : "—"}
             suffix={sci ? "(persisted date ranges below)" : undefined}
           />
           <DefRow k="HP search"    v={summary?.search_method ?? "—"} suffix={summary?.search_iterations ? `${summary.search_iterations} iters` : undefined} />
@@ -248,13 +265,14 @@ export default function ModelTrainingSummary({ metrics }: Props) {
         </div>
       )}
 
-      {/* ── Per-month stability (substitute for CV-fold table) ── */}
+      {/* ── Per-month descriptive diagnostic (not CV/walk-forward) ── */}
       {stability && (
         <div style={{ marginTop: 18 }}>
-          <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>📈 Per-month stability across {stability.n} months</h3>
+          <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>📈 Monthly AUC descriptive diagnostic · {stability.n ?? "—"} months</h3>
           <p style={{ fontSize: 11, color: "var(--text-3)", marginBottom: 8 }}>
-            Monthly held-out AUC + positive rate across the full test window — same role as CV-fold variance,
-            but computed on real test-set months (not in-distribution folds).
+            One deployed model scored across available calendar months, including
+            months that may have been used for training. This is in-sample
+            description, not CV, held-out, or walk-forward stability evidence.
           </p>
           <table className="stats-table">
             <thead>
@@ -271,19 +289,19 @@ export default function ModelTrainingSummary({ metrics }: Props) {
               <tr>
                 <td><b>AUC (monthly)</b></td>
                 <td className="mono right"><b>{stability.aucMean.toFixed(4)}</b></td>
-                <td className="mono right">{stability.aucStd.toFixed(4)}</td>
-                <td className="mono right">{stability.aucMin.toFixed(4)}</td>
-                <td className="mono right">{stability.aucMax.toFixed(4)}</td>
-                <td className="mono right">{stability.n}</td>
+                <td className="mono right">{fixedOrDash(stability.aucStd, 4)}</td>
+                <td className="mono right">{fixedOrDash(stability.aucMin, 4)}</td>
+                <td className="mono right">{fixedOrDash(stability.aucMax, 4)}</td>
+                <td className="mono right">{stability.n ?? "—"}</td>
               </tr>
               {stability.posRateMean != null && (
                 <tr>
                   <td><b>Positive rate (monthly)</b></td>
                   <td className="mono right"><b>{(stability.posRateMean * 100).toFixed(2)}%</b></td>
-                  <td className="mono right">{(stability.posRateStd * 100).toFixed(2)}%</td>
-                  <td className="mono right">{(stability.posRateMin * 100).toFixed(2)}%</td>
-                  <td className="mono right">{(stability.posRateMax * 100).toFixed(2)}%</td>
-                  <td className="mono right">{stability.n}</td>
+                  <td className="mono right">{percentOrDash(stability.posRateStd)}</td>
+                  <td className="mono right">{percentOrDash(stability.posRateMin)}</td>
+                  <td className="mono right">{percentOrDash(stability.posRateMax)}</td>
+                  <td className="mono right">{stability.n ?? "—"}</td>
                 </tr>
               )}
             </tbody>
@@ -315,10 +333,16 @@ function ResultCard({
   point: number;
   ci: [number, number];
   interpret: string;
-  tone: "great" | "good" | "ok";
+  tone: "great" | "good" | "ok" | "info";
   invert?: boolean;
 }) {
-  const toneColor = tone === "great" ? "#22c55e" : tone === "good" ? "#84cc16" : "#eab308";
+  const toneColor = tone === "great"
+    ? "#22c55e"
+    : tone === "good"
+      ? "#84cc16"
+      : tone === "info"
+        ? "#60a5fa"
+        : "#eab308";
   const fmtVal = invert ? point.toFixed(4) : point >= 1 ? point.toFixed(3) : point.toFixed(point >= 0.1 ? 3 : 4);
   return (
     <div className="result-card">
@@ -394,19 +418,19 @@ function prettyMetricName(key: keyof ScientificStats["ci_95"]): string {
   return map[key as string] ?? String(key);
 }
 
-interface StabilityStats {
-  n: number;
+export interface StabilityStats {
+  n: number | null;
   aucMean: number;
-  aucStd: number;
-  aucMin: number;
-  aucMax: number;
+  aucStd: number | null;
+  aucMin: number | null;
+  aucMax: number | null;
   posRateMean: number | null;
-  posRateStd: number;
-  posRateMin: number;
-  posRateMax: number;
+  posRateStd: number | null;
+  posRateMin: number | null;
+  posRateMax: number | null;
 }
 
-function computeStability(
+export function computeStability(
   rolling: RollingMonthPoint[],
   metrics: ValidationMetrics | null,
 ): StabilityStats | null {
@@ -427,23 +451,27 @@ function computeStability(
       aucMin: Math.min(...aucs),
       aucMax: Math.max(...aucs),
       posRateMean: rMean,
-      posRateStd: rates.length && rMean != null ? std(rates, rMean) : 0,
-      posRateMin: rates.length ? Math.min(...rates) : 0,
-      posRateMax: rates.length ? Math.max(...rates) : 0,
+      posRateStd: rates.length && rMean != null ? std(rates, rMean) : null,
+      posRateMin: rates.length ? Math.min(...rates) : null,
+      posRateMax: rates.length ? Math.max(...rates) : null,
     };
   }
 
   // Fallback path — pre-aggregated only, no per-month data.
+  const aucMean = finiteOrNull(metrics?.stability_auc_mean);
+  if (aucMean == null) return null;
   return {
-    n: metrics?.stability_months ?? 0,
-    aucMean: metrics?.stability_auc_mean ?? 0,
-    aucStd:  metrics?.stability_auc_std  ?? 0,
-    aucMin:  metrics?.stability_auc_min  ?? 0,
-    aucMax:  metrics?.stability_auc_max  ?? 0,
+    n:
+      finiteOrNull(metrics?.stability_valid_months) ??
+      finiteOrNull(metrics?.stability_months),
+    aucMean,
+    aucStd: finiteOrNull(metrics?.stability_auc_std),
+    aucMin: finiteOrNull(metrics?.stability_auc_min),
+    aucMax: finiteOrNull(metrics?.stability_auc_max),
     posRateMean: null,
-    posRateStd: 0,
-    posRateMin: 0,
-    posRateMax: 0,
+    posRateStd: null,
+    posRateMin: null,
+    posRateMax: null,
   };
 }
 
@@ -451,8 +479,20 @@ function mean(arr: number[]): number {
   return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
-function std(arr: number[], m: number): number {
-  if (arr.length < 2) return 0;
+function std(arr: number[], m: number): number | null {
+  if (arr.length < 2) return null;
   const v = arr.reduce((acc, x) => acc + (x - m) ** 2, 0) / (arr.length - 1);
   return Math.sqrt(v);
+}
+
+function finiteOrNull(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function fixedOrDash(value: number | null, digits: number): string {
+  return value == null ? "—" : value.toFixed(digits);
+}
+
+function percentOrDash(value: number | null): string {
+  return value == null ? "—" : `${(value * 100).toFixed(2)}%`;
 }

@@ -207,6 +207,19 @@ export default function HotspotAnalyticsPage({
   const transboundaryMeta = analyticsData?.transboundary_metadata;
   const transboundaryUnavailable =
     analyticsError || transboundaryMeta?.available === false;
+  const transboundaryWindowEnd = useMemo(() => {
+    const raw = transboundaryMeta?.window_end_utc;
+    if (!raw) return "—";
+    const parsed = new Date(raw);
+    return Number.isFinite(parsed.getTime())
+      ? parsed.toLocaleString(th ? "th-TH" : "en-GB")
+      : raw;
+  }, [transboundaryMeta?.window_end_utc, th]);
+  const transboundarySourceAge =
+    typeof transboundaryMeta?.source_age_hours === "number" &&
+    Number.isFinite(transboundaryMeta.source_age_hours)
+      ? transboundaryMeta.source_age_hours.toFixed(1)
+      : "—";
 
   const historicalData = useMemo(() => {
     return (analyticsData?.historical_burned_mrai ?? []).map((d) => ({
@@ -214,6 +227,7 @@ export default function HotspotAnalyticsPage({
       burned: d.burned_mrai,
     }));
   }, [analyticsData, th]);
+  const historicalMeta = analyticsData?.historical_burned_mrai_metadata;
 
   const historicalYears =
     (analyticsData?.historical_burned_mrai ?? [])
@@ -311,18 +325,31 @@ export default function HotspotAnalyticsPage({
       >
         <strong>{t(`analytics.feed.status.${feedState}`)}</strong>
         <span>
-          {fmtTr(t(feedMessageKey), { count: liveFires.length })}
+          {fmtTr(t(feedMessageKey), {
+            count: `${liveFires.length}${liveFireMeta.truncated ? "+" : ""}`,
+          })}
         </span>
       </div>
 
+      {liveFireMeta.truncated && (
+        <div className="data-scope-notice" role="status">
+          {fmtTr(t("analytics.feed.capped"), {
+            count: liveFires.length.toLocaleString(),
+            limit: (liveFireMeta.requestedLimit ?? 3000).toLocaleString(),
+          })}
+        </div>
+      )}
+
       {/* KPI strip */}
-      <div className="alert-counts" style={{ gridTemplateColumns: "repeat(3, 1fr)", marginBottom: 16 }}>
+      <div className="alert-counts analytics-kpi-grid">
         <div className="alert-count-card" style={{ borderLeftColor: "#06b6d4" }}>
           <div className="alert-count-label" style={{ color: "#06b6d4" }}>
             {t("analytics.kpi.hotspots")}
           </div>
           <div className="alert-count-value">
-            {hasUsableLiveState ? liveFires.length : "—"}
+            {hasUsableLiveState
+              ? `${liveFires.length}${liveFireMeta.truncated ? "+" : ""}`
+              : "—"}
           </div>
         </div>
         <div className="alert-count-card" style={{ borderLeftColor: "#f97316" }}>
@@ -344,7 +371,7 @@ export default function HotspotAnalyticsPage({
       </div>
 
       {/* Row 1: Land use donut + Time-based bar */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
+      <div className="analytics-grid-two">
 
         {/* Land use donut */}
         <div className="report-section">
@@ -436,7 +463,7 @@ export default function HotspotAnalyticsPage({
       </div>
 
       {/* Row 2: Region bar + Province horizontal bar */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
+      <div className="analytics-grid-two">
 
         {/* By region */}
         <div className="report-section">
@@ -501,13 +528,28 @@ export default function HotspotAnalyticsPage({
       </div>
 
       {/* Row 3: Transboundary + Historical */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
+      <div className="analytics-grid-two">
 
         {/* Transboundary */}
         <div className="report-section">
           <h3 className="report-section-title">
-            {th ? "จุดความร้อนประเทศเพื่อนบ้าน (จุด)" : "Transboundary Hotspots (FIRMS last 24h)"}
+            {fmtTr(t("analytics.transboundary.title"), {
+              hours: transboundaryMeta?.window_hours ?? 24,
+            })}
           </h3>
+          {transboundaryMeta?.available && (
+            <p className={transboundaryMeta.is_stale
+              ? "source-window-note stale"
+              : "source-window-note"}
+            >
+              {fmtTr(t(transboundaryMeta.is_stale
+                ? "analytics.transboundary.window.stale"
+                : "analytics.transboundary.window"), {
+                time: transboundaryWindowEnd,
+                age: transboundarySourceAge,
+              })}
+            </p>
+          )}
           {loading ? (
             <div className="empty-state" style={{ minHeight: 200 }}>
               <div className="empty-hint">{th ? "กำลังโหลด…" : "Loading…"}</div>
@@ -570,6 +612,16 @@ export default function HotspotAnalyticsPage({
                 {t("analytics.history.unavailable")}
               </div>
             </div>
+          ) : historicalMeta?.available === false ? (
+            <div className="empty-state" style={{ minHeight: 180 }}>
+              <div className="empty-icon">📭</div>
+              <div className="empty-title">
+                {t("analytics.history.not_configured")}
+              </div>
+              <div className="empty-hint">
+                {t("analytics.history.source.unavailable")}
+              </div>
+            </div>
           ) : historicalData.length === 0 ? (
             <div className="empty-state" style={{ minHeight: 180 }}>
               <div className="empty-hint">
@@ -588,9 +640,13 @@ export default function HotspotAnalyticsPage({
               </BarChart>
             </ResponsiveContainer>
           )}
-          <p style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>
-            {t("analytics.history.source")}
-          </p>
+          {historicalMeta?.available && historicalMeta.source && (
+            <p style={{ fontSize: 10, color: "var(--text-3)", marginTop: 4 }}>
+              {fmtTr(t("analytics.history.source.available"), {
+                source: historicalMeta.source,
+              })}
+            </p>
+          )}
         </div>
       </div>
 

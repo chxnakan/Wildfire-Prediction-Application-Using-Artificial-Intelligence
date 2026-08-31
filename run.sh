@@ -147,8 +147,13 @@ import os, sys
 sys.path.insert(0, "src")
 from datetime import date
 import pandas as pd
+from dotenv import load_dotenv
 from io_utils import resolve_existing
-p = resolve_existing(os.getenv("FIRMS_PATH", "data/firms/firms_all.parquet"))
+load_dotenv(".env")
+data_dir = os.getenv("DATA_DIR", "./data")
+p = resolve_existing(os.getenv(
+    "FIRMS_PATH", os.path.join(data_dir, "firms", "firms_all.parquet")
+))
 if not p:
     print("missing"); sys.exit(0)
 df = pd.read_parquet(p) if p.endswith(".parquet") else pd.read_csv(p)
@@ -172,7 +177,11 @@ elif [[ "$STALENESS" == "unknown" ]]; then
 else
   LATEST_DATE="${STALENESS%|*}"
   LAG_DAYS="${STALENESS#*|}"
-  echo "→ FIRMS cache: latest=${LATEST_DATE} (${LAG_DAYS} day(s) behind today)"
+  if [[ "${LAG_DAYS}" -le 1 ]]; then
+    echo "→ FIRMS cache: latest complete UTC day=${LATEST_DATE} (current for complete-day scoring)"
+  else
+    echo "→ FIRMS cache: latest=${LATEST_DATE} (${LAG_DAYS} day(s) behind today)"
+  fi
   if [[ "${LAG_DAYS}" -gt "${STALE_DAYS}" && $FETCH_FIRMS -eq 0 ]]; then
     if [[ $DEMO_MODE -eq 1 ]]; then
       echo "  ℹ️  DEMO mode keeps the promoted snapshot; no FIRMS refresh is started."
@@ -227,16 +236,77 @@ elif [[ $DO_TRAIN -eq 1 ]]; then
 fi
 
 # ── Sanity check artefacts before serving ───────────────────────────────
-if [[ ! -f "outputs/models/lgbm_fire_date_model.pkl" ]]; then
+# Resolve OUTPUT_DIR exactly as the Python runtime does. Previously the
+# pipeline could write to an env-configured directory while this preflight
+# silently checked ./outputs and then served a different/stale snapshot.
+if [[ -n "${OUTPUT_DIR:-}" ]]; then
+  # An explicitly exported value wins over .env, matching python-dotenv.
+  FIREWATCH_OUTPUT_DIR="$OUTPUT_DIR"
+else
+  FIREWATCH_OUTPUT_DIR=$(python <<'PY'
+# FIREWATCH_OUTPUT_DIR_LOOKUP (also used by the hermetic shell regression test)
+import os
+from dotenv import load_dotenv
+
+load_dotenv(".env")
+print(os.getenv("OUTPUT_DIR", "./outputs"))
+PY
+)
+fi
+if [[ "$FIREWATCH_OUTPUT_DIR" != /* ]]; then
+  FIREWATCH_OUTPUT_DIR="$SCRIPT_DIR/${FIREWATCH_OUTPUT_DIR#./}"
+fi
+FIREWATCH_MODEL_PATH="$FIREWATCH_OUTPUT_DIR/models/lgbm_fire_date_model.pkl"
+FIREWATCH_FEATURE_PARQUET="$FIREWATCH_OUTPUT_DIR/features/full_features.parquet"
+FIREWATCH_FEATURE_CSV="$FIREWATCH_OUTPUT_DIR/features/full_features.csv"
+FIREWATCH_METADATA_PATH="$FIREWATCH_OUTPUT_DIR/metadata/dataset_info.json"
+FIREWATCH_GEOJSON_PATH="$FIREWATCH_OUTPUT_DIR/riskmap/fire_dates_all.geojson"
+
+if [[ ! -f "$FIREWATCH_MODEL_PATH" ]]; then
   cat <<'EOF' >&2
-❌ No trained model at outputs/models/lgbm_fire_date_model.pkl
+❌ No trained model in the configured OUTPUT_DIR.
    Run without --no-train, or place a trained artefact there first.
 EOF
   exit 1
 fi
-if [[ ! -f "outputs/riskmap/fire_dates_all.geojson" ]]; then
+
+# Model inference also requires the feature frame. The old check only required
+# the pickle, so --demo/--no-train could print "Ready" while every prediction
+# endpoint was actually degraded (HTTP 503).
+if [[ ! -f "$FIREWATCH_FEATURE_PARQUET" && ! -f "$FIREWATCH_FEATURE_CSV" ]]; then
+  cat <<EOF >&2
+❌ No serving feature frame in the configured OUTPUT_DIR.
+   Expected: $FIREWATCH_FEATURE_PARQUET (or .csv)
+EOF
+  exit 1
+fi
+
+if [[ ! -f "$FIREWATCH_GEOJSON_PATH" ]]; then
+  if [[ $DEMO_MODE -eq 1 ]]; then
+    cat <<EOF >&2
+❌ DEMO mode requires a complete promoted snapshot, but GeoJSON is missing:
+   $FIREWATCH_GEOJSON_PATH
+   Presentation mode will not generate or modify model artifacts.
+EOF
+    exit 1
+  fi
   echo "→ GeoJSON missing; running risk_map.py to generate it from real data …"
   (cd src && python risk_map.py)
+  if [[ ! -f "$FIREWATCH_GEOJSON_PATH" ]]; then
+    echo "❌ risk_map.py completed without creating $FIREWATCH_GEOJSON_PATH" >&2
+    exit 1
+  fi
+fi
+
+# /health/ready requires metadata. A normal operational run may intentionally
+# boot degraded while automation repairs it, but a presentation must fail
+# before claiming that an incomplete snapshot is ready.
+if [[ ! -f "$FIREWATCH_METADATA_PATH" ]]; then
+  if [[ $DEMO_MODE -eq 1 ]]; then
+    echo "❌ DEMO mode requires metadata at $FIREWATCH_METADATA_PATH" >&2
+    exit 1
+  fi
+  echo "  ⚠️  Metadata missing at $FIREWATCH_METADATA_PATH; API readiness will be degraded."
 fi
 
 # ── Stage 4: serve the FastAPI (which serves the built React SPA at /) ─────

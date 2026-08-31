@@ -73,6 +73,87 @@ def test_prior_correction_formula_recovers_natural_probability():
     assert abs(corrected[0] - (0.1 * 0.5) / (0.1 * 0.5 + 0.5)) < 1e-12
 
 
+def test_auto_calibration_selects_on_chronological_calib_tail_only():
+    # A deliberately step-shaped reliability curve: isotonic should calibrate
+    # it better than a single sigmoid without changing the ranking materially.
+    dates = pd.Series(pd.date_range("2025-01-01", periods=80, freq="D").repeat(20))
+    raw = np.tile(np.linspace(0.01, 0.99, 20), 80)
+    y = (raw >= 0.60).astype(np.int8)
+
+    calibrator, audit = train._fit_probability_calibrator(
+        raw, y, dates, method="auto"
+    )
+    pred = train._calibrator_predict(calibrator, raw)
+
+    assert audit["selected"] == "isotonic"
+    assert audit["selected_on"] == "calib_only"
+    assert audit["purge_days"] == train.PURGE_DAYS
+    assert audit["evaluation_date_start"] > audit["fit_date_end"]
+    assert set(audit["candidates"]) == {"platt", "isotonic"}
+    assert ((0 <= pred) & (pred <= 1)).all()
+
+
+def test_weather_gate_rejects_stale_or_incomplete_contract():
+    dates = pd.date_range("2026-01-01", periods=30, freq="D")
+    cols = ["temp_max", "temp_min", "precip_sum", "wind_max", "et0"]
+    frame = pd.DataFrame({"date": dates})
+    for col in cols:
+        frame[col] = 1.0
+    # All columns stop ten days before the dataset tail.
+    frame.loc[frame.index[-10:], cols] = np.nan
+
+    stale = train._weather_quality_report(
+        frame, cols, min_coverage=0.2, max_staleness_days=5
+    )
+    complete = frame.copy()
+    complete.loc[:, cols] = 1.0
+    fresh = train._weather_quality_report(
+        complete, cols, min_coverage=0.2, max_staleness_days=0
+    )
+    incomplete = train._weather_quality_report(
+        frame.drop(columns=["et0"]), cols, min_coverage=0.2,
+        max_staleness_days=12,
+    )
+
+    assert stale["enabled_for_training"] is False
+    assert "stale" in stale["reason"]
+    assert fresh["enabled_for_training"] is True
+    assert incomplete["enabled_for_training"] is False
+
+
+def test_weather_gate_rejects_one_cell_latest_date_as_spatially_incomplete():
+    cols = ["temp_max", "temp_min", "precip_sum", "wind_max", "et0"]
+    dates = pd.date_range("2026-01-01", periods=14, freq="D")
+    cells = range(100)
+    frame = pd.DataFrame(
+        [(date, cell) for date in dates for cell in cells],
+        columns=["date", "cell"],
+    )
+    for col in cols:
+        frame[col] = 1.0
+
+    latest = frame["date"] == dates[-1]
+    frame.loc[latest, cols] = np.nan
+    # One real cell on the newest date is enough to make max(date) look fresh,
+    # but it is only 1% spatial coverage and must not enable weather features.
+    one_latest_row = frame.index[latest][0]
+    frame.loc[one_latest_row, cols] = 1.0
+
+    report = train._weather_quality_report(
+        frame,
+        cols,
+        min_coverage=0.2,
+        max_staleness_days=0,
+        min_tail_coverage=0.8,
+        tail_days=7,
+    )
+
+    assert report["column_staleness_days"]["temp_max"] == 0
+    assert report["column_latest_date_coverage"]["temp_max"] == 0.01
+    assert report["enabled_for_training"] is False
+    assert "spatial coverage" in report["reason"]
+
+
 def test_multisat_none_removes_boost():
     y, dates = _y_dates()
     sat = np.zeros(len(y), dtype=int); sat[:100] = 3

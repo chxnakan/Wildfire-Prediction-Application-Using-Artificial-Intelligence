@@ -1,5 +1,6 @@
 import type {
   FireGeoJson,
+  NotifyCapabilities,
   NotifyLogRecord,
   NotifyRequest,
   NotifyResponse,
@@ -115,6 +116,8 @@ export interface HotspotAnalyticsData {
     source_rows_in_window?: number;
     assigned_rows?: number;
     unassigned_rows?: number;
+    source_age_hours?: number | null;
+    is_stale?: boolean;
     counts_are_mutually_exclusive?: boolean;
     method?: string;
   };
@@ -123,6 +126,11 @@ export interface HotspotAnalyticsData {
     year_ce: number;
     burned_mrai: number;
   }[];
+  historical_burned_mrai_metadata: {
+    available: boolean;
+    source?: string | null;
+    reason?: string | null;
+  };
 }
 
 function isHotspotAnalyticsData(value: unknown): value is HotspotAnalyticsData {
@@ -131,7 +139,10 @@ function isHotspotAnalyticsData(value: unknown): value is HotspotAnalyticsData {
   if (
     typeof data.as_of !== "string" ||
     !Array.isArray(data.transboundary) ||
-    !Array.isArray(data.historical_burned_mrai)
+    !Array.isArray(data.historical_burned_mrai) ||
+    typeof data.historical_burned_mrai_metadata !== "object" ||
+    data.historical_burned_mrai_metadata === null ||
+    typeof data.historical_burned_mrai_metadata.available !== "boolean"
   ) {
     return false;
   }
@@ -153,7 +164,15 @@ function isHotspotAnalyticsData(value: unknown): value is HotspotAnalyticsData {
       typeof row.burned_mrai === "number" &&
       Number.isFinite(row.burned_mrai),
   );
-  return validTransboundary && validHistory;
+  const historyMetadata = data.historical_burned_mrai_metadata;
+  const validHistoryMetadata =
+    (historyMetadata.source === undefined ||
+      historyMetadata.source === null ||
+      typeof historyMetadata.source === "string") &&
+    (historyMetadata.reason === undefined ||
+      historyMetadata.reason === null ||
+      typeof historyMetadata.reason === "string");
+  return validTransboundary && validHistory && validHistoryMetadata;
 }
 
 /**
@@ -202,18 +221,26 @@ export async function fetchHealth(timeoutMs = 4000): Promise<LiveStatus> {
     const res = await fetch(`${API_BASE}/health`, { signal: ctrl.signal });
     if (!res.ok) return "offline";
     const body = await res.json().catch(() => ({}));
-    // Current FastAPI returns `geojson_age_days` + `ready`; retain
-    // `data_stale_days` for compatibility with older deployments. The
-    // previous frontend checked only the obsolete field and could show LIVE
-    // while the current backend explicitly reported ready=false.
-    const ageDays =
+    // File freshness and source-data freshness are independent: a stale
+    // dataset can be written into a brand-new GeoJSON file. Check both, while
+    // retaining either field for compatibility with older deployments.
+    const geojsonAgeDays =
       typeof body?.geojson_age_days === "number"
         ? body.geojson_age_days
-        : body?.data_stale_days;
+        : null;
+    const sourceDataAgeDays =
+      typeof body?.data_stale_days === "number"
+        ? body.data_stale_days
+        : null;
     if (
       body?.ready === false ||
       body?.status !== "ok" ||
-      (typeof ageDays === "number" && ageDays > 5)
+      (geojsonAgeDays !== null && geojsonAgeDays > 5) ||
+      (sourceDataAgeDays !== null && sourceDataAgeDays > 5) ||
+      // More than one calendar day in the future usually means a bad clock or
+      // mislabeled artifact, not fresh evidence. A one-day tolerance covers
+      // Bangkok-vs-UTC rollover around midnight.
+      (sourceDataAgeDays !== null && sourceDataAgeDays < -1)
     ) {
       return "stale";
     }
@@ -226,6 +253,29 @@ export async function fetchHealth(timeoutMs = 4000): Promise<LiveStatus> {
 }
 
 // ── Notify dispatch + log ──
+export async function fetchNotifyCapabilities(): Promise<NotifyCapabilities> {
+  const res = await fetch(`${API_BASE}/api/notify/capabilities`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) {
+    throw new Error(`Notify capability fetch failed: HTTP ${res.status}`);
+  }
+  const body: unknown = await res.json();
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    (body as Partial<NotifyCapabilities>).mode !== "stub" ||
+    (body as Partial<NotifyCapabilities>).delivery_available !== false ||
+    typeof (body as Partial<NotifyCapabilities>).browser_queue_available !== "boolean" ||
+    typeof (body as Partial<NotifyCapabilities>).browser_log_available !== "boolean" ||
+    (body as Partial<NotifyCapabilities>).persistence !== "process_memory"
+  ) {
+    throw new Error("Notify capability fetch failed: invalid response schema");
+  }
+  return body as NotifyCapabilities;
+}
+
 export async function postNotify(req: NotifyRequest): Promise<NotifyResponse> {
   const res = await fetch(`${API_BASE}/api/notify`, {
     method: "POST",

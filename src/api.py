@@ -54,6 +54,7 @@ from storage import exists, read_json, read_pickle, read_table, resolve_existing
 import inference
 import security
 import gridutil
+import thailand_boundary
 
 import db as db_module
 import scheduler as scheduler_module
@@ -264,13 +265,16 @@ def _build_model_state() -> Optional[dict]:
     features = _resolve_features(meta, df_latest)
     model_version = str(meta.get("trained_at") or "unknown")
     # Score the latest snapshot ONCE at load — cached and served immutably by
-    # /predictions/*. A model reload rebuilds this state dict (and its cache)
-    # atomically, so the cache can never lag the model.
+    # /predictions/*. This is also the final compatibility gate between the
+    # promoted bundle and its feature frame. Never publish a state that cannot
+    # score: startup will stay degraded, while reload_model_state preserves the
+    # previous known-good state.
     try:
         scored_snapshot = _compute_snapshot(model, df_latest, features, meta, model_version)
     except Exception as exc:
-        _log.warning("Snapshot pre-scoring failed at load (%s) — will score lazily", exc)
-        scored_snapshot = None
+        raise RuntimeError(
+            f"Snapshot pre-scoring failed for model {model_version}: {exc}"
+        ) from exc
     return {
         "model": model,
         "df": df_latest,
@@ -366,6 +370,13 @@ async def lifespan(app: FastAPI):
     # this running process — no restart required, and a failed reload keeps
     # the previous in-memory model serving.
     scheduler_module.register_model_promoted_callback(
+        lambda: reload_model_state(app)
+    )
+    # A predict-only sync keeps the model bundle but rewrites the feature frame
+    # and GeoJSON. Reload the same model against those new features atomically
+    # so file-backed /geojson and in-memory /predictions + /health advance
+    # together without waiting for a process restart.
+    scheduler_module.register_prediction_refreshed_callback(
         lambda: reload_model_state(app)
     )
 
@@ -515,17 +526,87 @@ def _cached_snapshot(state):
 # ROUTES
 # =====================================
 
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    """Read a non-negative integer setting without making startup fragile."""
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        _log.warning("Invalid %s; using default %s", name, default)
+        return default
+
+
+def _nonnegative_float_env(name: str, default: float) -> float:
+    """Read a finite, non-negative float setting with a safe fallback."""
+    try:
+        value = float(os.getenv(name, str(default)))
+        if not np.isfinite(value) or value < 0:
+            raise ValueError
+        return value
+    except (TypeError, ValueError):
+        _log.warning("Invalid %s; using default %s", name, default)
+        return default
+
+
+# A recently-written GeoJSON is not enough to prove that its underlying data
+# is current. Readiness therefore checks both file age and the latest date in
+# the feature frame belonging to the served model. Two days matches run.sh's
+# operational stale-data default; one future day is tolerated because a
+# Bangkok-local base date can legitimately lead the UTC calendar date around
+# midnight.
+_GEOJSON_MAX_AGE_DAYS = _nonnegative_float_env(
+    "READY_GEOJSON_MAX_AGE_DAYS", 7.0
+)
+_DATA_MAX_AGE_DAYS = _nonnegative_int_env("READY_DATA_MAX_AGE_DAYS", 2)
+_DATA_FUTURE_TOLERANCE_DAYS = _nonnegative_int_env(
+    "READY_DATA_FUTURE_TOLERANCE_DAYS", 1
+)
+
+
+def _served_data_age(state) -> tuple[Optional[str], Optional[int], bool]:
+    """Latest served feature date, UTC-relative age, and readiness freshness.
+
+    A negative age means the feature date is ahead of the UTC calendar date.
+    Only the configured Bangkok/UTC tolerance is accepted; a farther-future
+    date is treated as invalid rather than silently marked fresh.
+    """
+    frame = getattr(state, "df", None)
+    latest_value = (
+        frame["date"].max()
+        if frame is not None and not frame.empty and "date" in frame.columns
+        else None
+    )
+    if latest_value is None or pd.isna(latest_value):
+        return None, None, False
+    try:
+        latest_day = pd.Timestamp(latest_value).date()
+        data_stale_days = (datetime.now(timezone.utc).date() - latest_day).days
+    except (TypeError, ValueError, OverflowError):
+        return str(latest_value), None, False
+    data_fresh = (
+        -_DATA_FUTURE_TOLERANCE_DAYS
+        <= data_stale_days
+        <= _DATA_MAX_AGE_DAYS
+    )
+    return str(latest_value), data_stale_days, data_fresh
+
+
 @app.get("/api/status")
-def api_status():
+def api_status(request: Request):
     """Programmatic status / version info. The unauthenticated GET / endpoint
     serves the SPA dashboard in production, so this moved to /api/status."""
     return {
         "status": "FireWatch Thailand API running",
         "version": "2.1",
         "prediction_type": "binary_fire_within_horizon",
-        # The real model horizon (imminent_days, default 3) — NOT the 7-day
-        # pseudo-day display range. Agrees with GeoJSON + /predictions/*.
-        "horizon_days": int((_load_metadata() or {}).get("imminent_days", 3)),
+        # Read the metadata belonging to the model bundle that this process is
+        # actually serving. Reading dataset_info.json again here could observe
+        # a different version during an artifact promotion.
+        "horizon_days": int(
+            (getattr(request.app.state, "meta", None) or {}).get(
+                "imminent_days", 3
+            )
+        ),
         "data_sources": [
             "NASA FIRMS VIIRS NRT (real)",
             "Open-Meteo Archive (real, ECMWF ERA5) - if fetch_weather.py was run",
@@ -541,14 +622,18 @@ def health(request: Request):
     The API is *ready* only when:
       - model artifact loaded
       - dataset_info.json present
-      - feature CSV loaded
-      - GeoJSON exists and was refreshed within the last 7 days
+      - serving feature frame loaded and its latest actual date is fresh
+      - GeoJSON exists and was refreshed within its configured age limit
 
-    A non-fresh GeoJSON still returns 200 (the model is technically usable),
-    but `geojson_age_days` flags it for the operator.
+    This combined endpoint always returns HTTP 200 for monitoring continuity;
+    readiness failures are explicit in `ready`, `data_fresh`, and the age
+    fields. `/health/ready` returns HTTP 503 for the same failed checks.
     """
     state = request.app.state
-    meta = _load_metadata()
+    # The embedded bundle metadata is authoritative for the model this process
+    # actually serves. dataset_info.json can briefly belong to another version
+    # during promotion, so it must not supply served-model fields here.
+    meta = getattr(state, "meta", None) or {}
 
     # GeoJSON freshness — operators care more about this than `latest_date`,
     # since the dashboard reads the GeoJSON directly.
@@ -562,21 +647,7 @@ def health(request: Request):
         except OSError:
             geojson_age_days = None
 
-    latest_value = (
-        state.df["date"].max()
-        if hasattr(state, "df") and state.df is not None and not state.df.empty
-        else None
-    )
-    latest_observed = str(latest_value) if latest_value is not None else None
-    data_stale_days: Optional[int] = None
-    if latest_value is not None:
-        try:
-            latest_day = pd.Timestamp(latest_value).date()
-            data_stale_days = (
-                datetime.now(timezone.utc).date() - latest_day
-            ).days
-        except (TypeError, ValueError, OverflowError):
-            data_stale_days = None
+    latest_observed, data_stale_days, data_fresh = _served_data_age(state)
     skill_check_passed = (meta.get("model", {}) or {}).get("skill_check_passed")
     ready = all([
         getattr(state, "model", None) is not None,
@@ -586,6 +657,7 @@ def health(request: Request):
         os.path.exists(GEOJSON_PATH),
         geojson_age_days is not None
         and geojson_age_days <= _GEOJSON_MAX_AGE_DAYS,
+        data_fresh,
     ])
 
     return {
@@ -601,6 +673,9 @@ def health(request: Request):
         # Stable frontend contract for the header's LIVE/STALE distinction.
         # This is age of the actual latest input date, not merely file mtime.
         "data_stale_days": data_stale_days,
+        "data_fresh": data_fresh,
+        "data_max_age_days": _DATA_MAX_AGE_DAYS,
+        "data_future_tolerance_days": _DATA_FUTURE_TOLERANCE_DAYS,
         "best_model": meta.get("best_model"),
         "skill_check_passed": skill_check_passed,
         "feature_count": len(getattr(state, "features", []) or []),
@@ -610,7 +685,6 @@ def health(request: Request):
 # Kubernetes/Railway-style split probes. Liveness = "the process is up";
 # readiness = "safe to route prediction traffic". A degraded boot (no model
 # yet) stays LIVE (so the platform doesn't kill it) but NOT READY.
-_GEOJSON_MAX_AGE_DAYS = float(os.getenv("READY_GEOJSON_MAX_AGE_DAYS", "7"))
 
 
 @app.get("/health/live")
@@ -621,8 +695,8 @@ def health_live():
 
 @app.get("/health/ready")
 def health_ready(request: Request):
-    """Readiness: 200 only when the model, metadata, and a *fresh* GeoJSON are
-    all present; otherwise 503 with a stable schema so the platform withholds
+    """Readiness: 200 only when model artifacts, GeoJSON, and actual data date
+    are fresh; otherwise 503 with a stable schema so the platform withholds
     traffic (and a fresh deploy doesn't crash-loop — it just isn't ready yet)."""
     state = request.app.state
     geojson_age_days: Optional[float] = None
@@ -633,6 +707,7 @@ def health_ready(request: Request):
         except OSError:
             geojson_age_days = None
 
+    latest_observed, data_stale_days, data_fresh = _served_data_age(state)
     checks = {
         "model_loaded": getattr(state, "model", None) is not None,
         "features_loaded": bool(getattr(state, "features", None)),
@@ -640,25 +715,16 @@ def health_ready(request: Request):
         "geojson_present": os.path.exists(GEOJSON_PATH),
         "geojson_fresh": geojson_age_days is not None
                          and geojson_age_days <= _GEOJSON_MAX_AGE_DAYS,
+        "data_fresh": data_fresh,
     }
-    latest_value = (
-        state.df["date"].max()
-        if getattr(state, "df", None) is not None and not state.df.empty
-        else None
-    )
-    data_stale_days: Optional[int] = None
-    if latest_value is not None:
-        try:
-            data_stale_days = (
-                datetime.now(timezone.utc).date()
-                - pd.Timestamp(latest_value).date()
-            ).days
-        except (TypeError, ValueError, OverflowError):
-            data_stale_days = None
     ready = all(checks.values())
     body = {"ready": ready, "checks": checks,
             "geojson_age_days": geojson_age_days,
+            "latest_observed_date": latest_observed,
             "data_stale_days": data_stale_days,
+            "data_fresh": data_fresh,
+            "data_max_age_days": _DATA_MAX_AGE_DAYS,
+            "data_future_tolerance_days": _DATA_FUTURE_TOLERANCE_DAYS,
             "model_version": getattr(state, "model_version", None)}
     if not ready:
         return JSONResponse(status_code=503, content={"error": "not_ready", **body})
@@ -721,8 +787,13 @@ def admin_sync(request: Request):
     _check_admin(request)
     import threading
 
-    from sync_worker import run_sync
-    threading.Thread(target=run_sync, name="manual-sync", daemon=True).start()
+    # Route through scheduler.sync_job so a successful predict-only refresh
+    # fires the same in-process state-reload callback as the scheduled job.
+    threading.Thread(
+        target=scheduler_module.sync_job,
+        name="manual-sync",
+        daemon=True,
+    ).start()
     return {"status": "started", "detail": "sync running in background; "
             "watch /api/automation/status"}
 
@@ -781,8 +852,13 @@ def _json_sanitize(obj):
 
 
 @app.get("/metadata")
-def metadata():
-    return _json_sanitize(_load_metadata())
+def metadata(request: Request):
+    """Metadata for the exact model bundle this process is serving.
+
+    Reading dataset_info.json independently can cross an artifact-promotion
+    boundary and expose thresholds from a different version than inference.
+    """
+    return _json_sanitize(getattr(request.app.state, "meta", None) or {})
 
 
 @app.get("/metrics")
@@ -969,8 +1045,10 @@ def predict_location(
     training (gridutil), and matched by INTEGER cell index — exactly zero or one
     cell can match, with no float tolerance.
     """
-    # This is a Thailand-only service — validate against the model BBOX
-    # (lon 96..107, lat 4..22) so out-of-country coordinates get a clear 422.
+    # Reject obviously unsupported coordinates cheaply, then enforce the
+    # actual Thailand land polygon.  FIRMS_BBOX is only a collection envelope
+    # and includes large parts of Myanmar, Laos, Cambodia and Vietnam; treating
+    # that rectangle as Thailand allowed foreign cells through this endpoint.
     _bbox = [float(x) for x in os.getenv("FIRMS_BBOX", "96,4,107,22").split(",")]
     lon_min, lat_min, lon_max, lat_max = _bbox
     if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
@@ -978,8 +1056,16 @@ def predict_location(
             status_code=422,
             detail={
                 "error": "coordinates_out_of_bounds",
-                "detail": f"lat/lon must be within Thailand "
+                "detail": f"lat/lon must be within the supported service envelope "
                           f"(lat {lat_min}..{lat_max}, lon {lon_min}..{lon_max}).",
+            },
+        )
+    if not bool(thailand_boundary.is_in_thailand([lat], [lon])[0]):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "coordinates_outside_thailand",
+                "detail": "lat/lon must fall within Thailand's land boundary.",
             },
         )
 
@@ -1057,8 +1143,9 @@ def predict_location(
 # in-memory ring buffer (deque, last 100 records). Does not deliver SMS /
 # LINE / Email — real delivery requires a per-channel provider integration
 # (LINE Messaging API, Twilio, SendGrid, etc.) and per-recipient consent.
-# Operators on the /web/ Notify page see immediate "queued" confirmation;
-# the entry shows in the call log below.
+# The public SPA first reads /api/notify/capabilities. Production browsers are
+# preview-only because ADMIN_TOKEN must never be embedded in frontend code;
+# only the deliberately open local-development stub can create queue records.
 #
 # Thread-safety: a Lock guards both list mutation and snapshot reads so the
 # log endpoint never sees a half-formed record under FastAPI's threadpool.
@@ -1077,6 +1164,26 @@ class NotifyRequest(BaseModel):
     zone_ids: List[str] = Field(default_factory=list, max_length=500)
     priority: Literal["normal", "urgent", "emergency"] = "normal"
     template: Optional[str] = None
+
+
+@app.get("/api/notify/capabilities")
+def notify_capabilities():
+    """Public, non-secret description of the notification surface.
+
+    No delivery provider is implemented. A browser may write to the temporary
+    stub queue only in the intentionally open development configuration. In
+    production (or whenever ADMIN_TOKEN is configured), the SPA stays
+    preview-only because putting that shared secret in JavaScript would expose
+    it to every visitor.
+    """
+    browser_stub_available = not security.IS_PRODUCTION and not ADMIN_TOKEN
+    return {
+        "mode": "stub",
+        "delivery_available": False,
+        "browser_queue_available": browser_stub_available,
+        "browser_log_available": browser_stub_available,
+        "persistence": "process_memory",
+    }
 
 
 @app.post("/api/notify")
@@ -1242,21 +1349,34 @@ def live_hotspots(
     since_iso = _parse_since_param(since)
     if not (1 <= int(limit) <= 10000):
         raise HTTPException(status_code=422, detail="limit must be 1..10000")
+    requested_limit = int(limit)
+    # Read one extra row so the response can disclose truncation instead of
+    # presenting a full page as the complete live population. The database
+    # helper has a hard 10,000-row ceiling, so an exactly-full maximum request
+    # remains conservatively marked as truncated/possibly capped.
+    query_limit = min(requested_limit + 1, 10000)
     try:
         records = db_module.get_live_hotspots(
             since=since_iso, province=province, satellite=satellite,
-            bbox=bbox_vals, limit=limit,
+            bbox=bbox_vals, limit=query_limit,
         )
     except Exception as exc:
         _log.error("live_hotspots store read failed: %s", exc)
         raise HTTPException(status_code=503, detail="live-hotspot store unavailable")
 
+    truncated = len(records) > requested_limit or (
+        requested_limit == 10000 and len(records) == requested_limit
+    )
+    records = records[:requested_limit]
     meta = _live_status_payload()
     return _json_sanitize({
         "metadata": {
             "source": "GISTDA",
             "layer_kind": "observed_hotspots",   # observations — not predictions
             "count": len(records),
+            "returned_count": len(records),
+            "requested_limit": requested_limit,
+            "truncated": truncated,
             "server_time_utc": datetime.now(timezone.utc).isoformat(),
             **meta,
         },
@@ -1355,8 +1475,8 @@ async def fires_stream(request: Request):
 # =====================================
 #
 # Returns transboundary FIRMS hotspot counts (last 24 h) derived from the
-# local FIRMS parquet cache, plus static historical burned-area figures
-# sourced from GISTDA's official annual reports.
+# local FIRMS parquet cache. Historical burned-area values remain unavailable
+# until a versioned, source-backed dataset is configured.
 #
 # Land-use breakdown, province breakdown, and time-based VIIRS counts are
 # all derived client-side from the live GISTDA fire features already loaded
@@ -1375,21 +1495,6 @@ _NEIGHBOR_COUNTRY_BOXES = {
     "Vietnam":   (8.3,  23.4, 102.0, 109.5),
     "Cambodia":  (10.0, 14.7, 102.3, 107.6),
 }
-
-# Historical burned area in million rai — from GISTDA annual wildfire reports.
-# Buddhist-era years: 2560=2017, 2566=2023, 2567=2024, 2568=2025.
-_HISTORICAL_BURNED_MRAI = [
-    {"year": "2560", "year_ce": 2017, "burned_mrai": 8.2},
-    {"year": "2561", "year_ce": 2018, "burned_mrai": 6.4},
-    {"year": "2562", "year_ce": 2019, "burned_mrai": 5.1},
-    {"year": "2563", "year_ce": 2020, "burned_mrai": 4.8},
-    {"year": "2564", "year_ce": 2021, "burned_mrai": 3.9},
-    {"year": "2565", "year_ce": 2022, "burned_mrai": 5.7},
-    {"year": "2566", "year_ce": 2023, "burned_mrai": 9.5},
-    {"year": "2567", "year_ce": 2024, "burned_mrai": 12.1},
-    {"year": "2568", "year_ce": 2025, "burned_mrai": 10.8},
-]
-
 
 def _firms_source_signature() -> "Optional[tuple[str, int, int]]":
     """Current FIRMS cache identity for analytics-cache invalidation."""
@@ -1416,6 +1521,8 @@ def _compute_transboundary_payload() -> dict:
             "reason": "FIRMS cache is not available",
             "counts": [],
             "window_hours": 24,
+            "source_age_hours": None,
+            "is_stale": True,
         }
     firms_path = signature[0]
     try:
@@ -1430,11 +1537,19 @@ def _compute_transboundary_payload() -> dict:
                 "reason": "FIRMS cache has no valid timestamped detections",
                 "counts": [],
                 "window_hours": 24,
+                "source_age_hours": None,
+                "is_stale": True,
             }
         # Exact rolling 24-hour window ending at the newest source detection.
         # The previous normalize()+inclusive-date filter could span almost 48 h.
         latest = df["acq_datetime"].max()
         cutoff = latest - pd.Timedelta(hours=24)
+        source_age_hours = max(
+            0.0,
+            (
+                pd.Timestamp(datetime.now(timezone.utc)) - pd.Timestamp(latest)
+            ).total_seconds() / 3600.0,
+        )
         recent = df[
             (df["acq_datetime"] > cutoff)
             & (df["acq_datetime"] <= latest)
@@ -1446,8 +1561,6 @@ def _compute_transboundary_payload() -> dict:
         # assign each remaining point to at most one matching extent: the
         # smallest matching box is the most geographically specific. The
         # approximation and unassigned count are explicit in metadata.
-        import thailand_boundary
-
         latitudes = recent["latitude"].to_numpy(dtype=float)
         longitudes = recent["longitude"].to_numpy(dtype=float)
         in_thailand = thailand_boundary.is_in_thailand(
@@ -1493,6 +1606,8 @@ def _compute_transboundary_payload() -> dict:
             "window_hours": 24,
             "window_start_utc": cutoff.isoformat(),
             "window_end_utc": latest.isoformat(),
+            "source_age_hours": round(source_age_hours, 2),
+            "is_stale": source_age_hours > 24.0,
             "source_rows_in_window": int(len(recent)),
             "assigned_rows": int(sum(counts.values())),
             "unassigned_rows": int(unassigned),
@@ -1509,6 +1624,8 @@ def _compute_transboundary_payload() -> dict:
             "reason": "FIRMS analytics could not be computed",
             "counts": [],
             "window_hours": 24,
+            "source_age_hours": None,
+            "is_stale": True,
         }
 
 
@@ -1521,7 +1638,11 @@ def _compute_transboundary() -> list[dict]:
 async def analytics_hotspots():
     """
     Aggregated hotspot stats for the analytics dashboard.
-    Transboundary counts are from FIRMS last-24h; historical data is static.
+    Transboundary counts are from the latest available FIRMS 24-hour source
+    window. Metadata discloses the exact end time and whether that source is
+    stale; it must not be presented as the current 24 hours when re-anchored.
+    Historical burned-area data is withheld until a versioned, source-backed
+    dataset is configured.
     """
     signature = _firms_source_signature()
 
@@ -1549,7 +1670,14 @@ async def analytics_hotspots():
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "transboundary": transboundary_payload.pop("counts"),
         "transboundary_metadata": transboundary_payload,
-        "historical_burned_mrai": _HISTORICAL_BURNED_MRAI,
+        "historical_burned_mrai": [],
+        "historical_burned_mrai_metadata": {
+            "available": False,
+            "source": None,
+            "reason": (
+                "No source-backed historical burned-area dataset is configured"
+            ),
+        },
     }
     with _ANALYTICS_CACHE_LOCK:
         _ANALYTICS_CACHE["hotspots"] = {

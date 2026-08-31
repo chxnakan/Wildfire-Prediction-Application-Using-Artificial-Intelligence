@@ -10,6 +10,9 @@ const API_BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 
 export interface LiveFireMetadata {
   count: number;
+  returnedCount: number;
+  requestedLimit: number;
+  truncated: boolean;
   isStale: boolean;
   lastSuccessAt: string | null;
   pollingIntervalSeconds: number | null;
@@ -54,7 +57,10 @@ export async function fetchLiveFires(signal?: AbortSignal): Promise<LiveFiresRes
       // Backend already emits the legacy GistdaFeature shape under `features`.
       features: payload.features as GistdaFeature[],
       metadata: {
-        count: Number(meta.count ?? 0),
+        count: Number(meta.count ?? payload.features.length),
+        returnedCount: Number(meta.returned_count ?? payload.features.length),
+        requestedLimit: Number(meta.requested_limit ?? 3000),
+        truncated: meta.truncated === true,
         isStale: Boolean(meta.is_stale),
         lastSuccessAt: meta.last_success_at ?? null,
         pollingIntervalSeconds: meta.polling_interval_seconds ?? null,

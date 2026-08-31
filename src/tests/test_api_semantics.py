@@ -145,7 +145,8 @@ def test_all_surfaces_agree_on_probability_and_tier(client):
 
 
 def test_location_outside_universe_is_unscored_not_zero(client):
-    r = client.get("/predict/location", params={"lat": 4.2, "lon": 96.3})
+    # Valid Thai land coordinate, but absent from the tiny model fixture.
+    r = client.get("/predict/location", params={"lat": 19.9, "lon": 99.9})
     assert r.status_code == 200
     body = r.json()
     assert body["scored"] is False

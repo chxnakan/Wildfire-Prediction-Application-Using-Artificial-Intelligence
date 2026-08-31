@@ -17,11 +17,13 @@
 #      Dockerfile defaults OUTPUT_DIR=/srv/outputs, DATA_DIR=/srv/data)
 #   4. Web service variables:
 #        FIRMS_API_KEY   = <your NASA FIRMS map key>          (required)
-#        ADMIN_TOKEN     = <random secret for /api/admin/* endpoints>
+#        ADMIN_TOKEN     = <server-side secret for /api/admin/* + stub notify>
+#                          Never expose it to VITE_* or browser code; the
+#                          production Alerts page intentionally stays preview-only.
 #      Optional tuning:
 #        SYNC_INTERVAL_MINUTES = 10
 #        RETRAIN_EVERY_DAYS    = 3
-#        TRAIN_ARGS            = --quick
+#        TRAIN_ARGS            = --quick --max-history-days 400
 #        PREDICT_MAX_HISTORY_DAYS = 180
 #      GISTDA live-hotspot layer (observed detections — not predictions):
 #        GISTDA_ENABLED        = true
@@ -53,20 +55,18 @@
 # are safe WITH a database. Without PostgreSQL, run exactly ONE replica
 # (locks and SSE fall back to process-local state).
 #
-# Fresh/empty volume behaviour (tested): the API boots DEGRADED — /health
-# returns 200 with ready:false + model_loaded:false (so the Railway health
-# check passes and the service stays up), map/predict endpoints stay empty,
-# and the scheduler accumulates FIRMS data until training succeeds and the
-# quality gates promote a first bundle. The image also bakes bootstrap
-# copies of data/+outputs/ (scripts/start.sh seeds an empty volume from
-# them), so committing a trained outputs/models/lgbm_fire_date_model.pkl
-# gives fresh deploys a trusted starting model immediately.
+# Fresh/empty volume behaviour (tested): scripts/start.sh seeds the complete,
+# build-validated model/features/metadata/GeoJSON bundle baked into the image,
+# so the API can become ready immediately. A partial mounted bundle fails
+# loudly instead of being mixed with bootstrap files. `/health` still returns
+# HTTP 200 with ready:false for other degraded states so the process remains
+# observable; `/health/ready` is the strict traffic/readiness probe.
 
 [build]
 builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-healthcheckPath = "/health"
+healthcheckPath = "/health/ready"
 healthcheckTimeout = 300
 restartPolicyType = "on_failure"

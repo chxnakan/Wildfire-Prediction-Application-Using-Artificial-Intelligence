@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useLang } from "../utils/i18n";
 
 // Reusable card for showing a single ML metric with:
 //   • plain-language label
@@ -61,6 +62,7 @@ export default function MetricCard({
   label, value, statusLabel, status, range, description, goodRange,
   subtitle, secondaryStat, highlight = false,
 }: Props) {
+  const { t } = useLang();
   const [expanded, setExpanded] = useState(false);
   const color = STATUS_COLORS[status];
   const bg = STATUS_BG[status];
@@ -79,8 +81,8 @@ export default function MetricCard({
           className="metric-card-help"
           type="button"
           onClick={() => setExpanded((v) => !v)}
-          aria-label={expanded ? "Hide info" : "What is this?"}
-          title={expanded ? "ซ่อนรายละเอียด" : "ค่านี้คืออะไร?"}
+          aria-label={expanded ? t("metric.help.hide") : t("metric.help.show")}
+          title={expanded ? t("metric.help.hide") : t("metric.help.show")}
         >
           {expanded ? "−" : "?"}
         </button>
@@ -112,11 +114,11 @@ export default function MetricCard({
       {expanded && (
         <div className="metric-card-expand">
           <div className="metric-card-section">
-            <div className="metric-card-section-label">ความหมาย</div>
+            <div className="metric-card-section-label">{t("metric.meaning")}</div>
             <div className="metric-card-section-text">{description}</div>
           </div>
           <div className="metric-card-section">
-            <div className="metric-card-section-label">ค่าที่ดี</div>
+            <div className="metric-card-section-label">{t("metric.good_range")}</div>
             <div className="metric-card-section-text">{goodRange}</div>
           </div>
         </div>

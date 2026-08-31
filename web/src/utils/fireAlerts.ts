@@ -238,8 +238,9 @@ export function useFireAlerts(
     const previous = seenIdsRef.current;
     const newFeatures = liveFires.filter((f) => !previous.has(_stableId(f)));
     if (newFeatures.length === 0) {
-      // Update seen set in case ids rotated (still no new alerts)
-      seenIdsRef.current = currentIds;
+      // Keep a cumulative session history. Replacing it with only the latest
+      // poll made a temporarily missing hotspot look "new" when it reappeared.
+      currentIds.forEach((id) => previous.add(id));
       return;
     }
 
@@ -259,7 +260,10 @@ export function useFireAlerts(
       return merged.slice(0, maxKeptAlerts);
     });
 
-    seenIdsRef.current = currentIds;
+    // Never forget an ID during this browser session: feeds can temporarily
+    // omit/reorder records, which must not generate duplicate "new fire"
+    // alerts on the next poll.
+    currentIds.forEach((id) => previous.add(id));
   }, [liveFires, enableSound, enableOsNotify, maxKeptAlerts]);
 
   const dismissAlert = (id: string) => {

@@ -6,7 +6,6 @@ import {
   dateFallsWithin,
   hasSufficientRateSample,
   isWindowMature,
-  observedDatesCoverWindow,
   riskWindowForBaseDate,
   selectDefaultReviewDate,
 } from "./compareStats";
@@ -26,18 +25,28 @@ describe("comparison date windows", () => {
     });
   });
 
+  it("honours a persisted non-default model horizon", () => {
+    expect(riskWindowForBaseDate("2026-07-16", 5)).toEqual({
+      start: "2026-07-17",
+      end: "2026-07-21",
+    });
+    expect(contextWindowForBaseDate("2026-07-16", 1, 5)).toEqual({
+      start: "2026-07-16",
+      end: "2026-07-22",
+    });
+  });
+
   it("does not treat an unrelated later FIRMS date as an evaluated outcome", () => {
     const window = riskWindowForBaseDate("2026-07-16");
     expect(dateFallsWithin("2026-07-24", window)).toBe(false);
-    expect(observedDatesCoverWindow(["2026-07-24"], window)).toBe(false);
   });
 
-  it("recognizes an observed artifact spanning the complete target window", () => {
-    const window = riskWindowForBaseDate("2026-07-16");
-    expect(observedDatesCoverWindow(
-      ["2026-07-17", "2026-07-18", "2026-07-19"],
-      window,
-    )).toBe(true);
+  it("rejects impossible calendar dates instead of normalising them", () => {
+    expect(riskWindowForBaseDate("2026-02-31")).toBeNull();
+    expect(dateFallsWithin("2026-02-31", {
+      start: "2026-02-01",
+      end: "2026-03-05",
+    })).toBe(false);
   });
 });
 
@@ -79,36 +88,36 @@ describe("isWindowMature", () => {
 });
 
 describe("computeCompareStats", () => {
-  it("computes precision independent of window maturity", () => {
-    // 2 hits, 2 false alarms, window immature (recall must stay 0)
-    const s = computeCompareStats(["hit", "hit", "alarm", "alarm"], 5, false);
+  it("does not turn an unknown validation label into a false alarm", () => {
+    expect(computeCompareStats(["unknown"])).toMatchObject({
+      hits: 0,
+      falseAlarms: 0,
+      future: 0,
+      precision: 0,
+    });
+  });
+  it("computes precision from persisted cell outcomes", () => {
+    const s = computeCompareStats(["hit", "hit", "alarm", "alarm"]);
     expect(s.precision).toBeCloseTo(0.5);
-    expect(s.recall).toBe(0); // gated off — this is the bug this fix prevents
+    expect(s.hits).toBe(2);
+    expect(s.falseAlarms).toBe(2);
   });
 
-  it("computes recall once the window is mature", () => {
-    // 3 hits, 1 alarm, 2 missed observed fires → recall = 3 / (3+2) = 0.6
-    const s = computeCompareStats(["hit", "hit", "hit", "alarm"], 2, true);
-    expect(s.recall).toBeCloseTo(0.6);
+  it("structurally withholds recall, misses, and F1", () => {
+    const s = computeCompareStats(["hit", "hit", "hit", "alarm"]);
     expect(s.precision).toBeCloseTo(0.75);
+    expect(s.misses).toBeNull();
+    expect(s.recall).toBeNull();
+    expect(s.f1).toBeNull();
   });
 
   it("never divides by zero", () => {
-    const s = computeCompareStats([], 0, true);
+    const s = computeCompareStats([]);
     expect(s.precision).toBe(0);
-    expect(s.recall).toBe(0);
-    expect(s.f1).toBe(0);
-  });
-
-  it("f1 is the harmonic mean of precision and recall when both are available", () => {
-    const s = computeCompareStats(["hit", "hit", "alarm"], 2, true);
-    // precision = 2/3, recall = 2/4 = 0.5
-    const expectedF1 = (2 * (2 / 3) * 0.5) / ((2 / 3) + 0.5);
-    expect(s.f1).toBeCloseTo(expectedF1);
   });
 
   it("counts future separately from hits/alarms", () => {
-    const s = computeCompareStats(["hit", "future", "future"], 0, false);
+    const s = computeCompareStats(["hit", "future", "future"]);
     expect(s.future).toBe(2);
     expect(s.hits).toBe(1);
   });

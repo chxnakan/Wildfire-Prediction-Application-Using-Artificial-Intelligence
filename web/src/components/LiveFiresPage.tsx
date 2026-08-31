@@ -6,6 +6,10 @@ import {
   type TimestampPrecision,
 } from "../utils/gistdaTime";
 import { fmtTr, useLang } from "../utils/i18n";
+import {
+  countFixedRecencyWindows,
+  isVerifiedThailandHotspot,
+} from "../utils/liveScope";
 
 interface Props {
   liveFires: GistdaFeature[];               // GISTDA NRT — live <30 min latency
@@ -90,10 +94,8 @@ function _gistdaToIncident(f: GistdaFeature): Incident | null {
   };
 }
 
-// Approximate Thailand bbox — used as a fallback for FIRMS observed features
-// that don't have a province annotation (risk_map.py only annotates predicted
-// cells; observed FIRMS rows in the GeoJSON keep raw lat/lon only).
-// Bounds cover Mae Hong Son (NW) → Yala (S) → Ubon Ratchathani (E).
+// Approximate Thailand bbox used only to describe a source row whose province
+// is unavailable. It is never used to admit FIRMS rows into Thailand scope.
 function _isInThailandBbox(lat: number, lon: number): boolean {
   return lat >= 5.5 && lat <= 20.6 && lon >= 97.3 && lon <= 105.7;
 }
@@ -171,11 +173,6 @@ export default function LiveFiresPage({
   const [provinceFilter, setProvinceFilter] = useState<string>("ALL");
   const [timeWindow, setTimeWindow] = useState<number>(3); // days
   const [search, setSearch] = useState<string>("");
-  // Thailand-only filter — defaults ON because the FIRMS layer's BBOX
-  // (96–107°E, 4–22°N) spills into Cambodia/Vietnam/Myanmar/Laos.
-  // Without this filter the feed is mostly cross-border fires which isn't
-  // what a Thai operator wants to see.
-  const [thailandOnly, setThailandOnly] = useState<boolean>(true);
   const [showHelp, setShowHelp] = useState<boolean>(false);
   // Pagination — start with 50 visible, "load more" reveals 50 at a time.
   const [pageSize, setPageSize] = useState<number>(50);
@@ -200,22 +197,16 @@ export default function LiveFiresPage({
     return Array.from(s).sort();
   }, [incidents]);
 
-  const filtered = useMemo(() => {
+  // Country/province/search define the operator's geographic scope. Fixed
+  // 1 h / 24 h KPIs come from this population and must not shrink when the
+  // list's independent time-window selector changes.
+  const baseScopedIncidents = useMemo(() => {
     return incidents.filter((i) => {
-      if (sourceFilter !== "ALL" && i.source !== sourceFilter) return false;
       if (provinceFilter !== "ALL" && i.province !== provinceFilter) return false;
-      if (i.daysOld == null || i.daysOld > timeWindow) return false;
-      // A date-only FIRMS row cannot honestly be placed inside an exact
-      // sub-day window. Keep it in 3/7/30-day views, where day precision is
-      // sufficient, instead of presenting it as a precise "past 24 h" hit.
-      if (timeWindow <= 1 && i.timePrecision !== "minute") return false;
-      // Thailand only — accept if province is annotated OR coordinates fall
-      // inside the Thai bbox (fallback for FIRMS observed rows, which the
-      // backend doesn't yet annotate with province).
-      if (thailandOnly) {
-        const hasProvince = i.province && i.province !== "—";
-        const inBbox = _isInThailandBbox(i.lat, i.lon);
-        if (!hasProvince && !inBbox) return false;
+      // This page is explicitly Thailand-scoped. FIRMS rows need a province
+      // annotation; a rectangular bbox is not enough evidence near borders.
+      if (!isVerifiedThailandHotspot(i.source, i.province)) {
+        return false;
       }
       if (search.trim()) {
         const q = search.toLowerCase();
@@ -227,14 +218,34 @@ export default function LiveFiresPage({
       }
       return true;
     });
-  }, [incidents, sourceFilter, provinceFilter, timeWindow, search, thailandOnly]);
+  }, [incidents, provinceFilter, search]);
+
+  // The list and per-source cards respect the selected time window.
+  const scopedIncidents = useMemo(() => {
+    return baseScopedIncidents.filter((i) => {
+      if (i.daysOld == null || i.daysOld < 0 || i.daysOld > timeWindow) {
+        return false;
+      }
+      // A date-only FIRMS row cannot honestly be placed inside an exact
+      // sub-day window. Keep it in 3/7/30-day views, where day precision is
+      // sufficient, instead of presenting it as a precise "past 24 h" hit.
+      return timeWindow > 1 || i.timePrecision === "minute";
+    });
+  }, [baseScopedIncidents, timeWindow]);
+
+  const filtered = useMemo(
+    () => scopedIncidents.filter(
+      (incident) => sourceFilter === "ALL" || incident.source === sourceFilter,
+    ),
+    [scopedIncidents, sourceFilter],
+  );
 
   // Source-overlap cue: this is supporting context, not independent proof.
   // GISTDA and FIRMS may distribute observations from the same VIIRS sensor.
   const sourceOverlap = useMemo(() => {
     const map = new Map<string, IncidentSource[]>();
-    const others = incidents;
-    for (const i of incidents) {
+    const others = scopedIncidents;
+    for (const i of scopedIncidents) {
       const matches: IncidentSource[] = [];
       for (const o of others) {
         if (o.id === i.id || o.source === i.source) continue;
@@ -248,31 +259,21 @@ export default function LiveFiresPage({
       if (matches.length) map.set(i.id, Array.from(new Set(matches)));
     }
     return map;
-  }, [incidents]);
+  }, [scopedIncidents]);
 
   const sourceCounts = useMemo(() => {
-    const c = { GISTDA: 0, FIRMS: 0, total: 0, last1h: 0, last24h: 0 };
-    for (const i of incidents) {
+    const c = { GISTDA: 0, FIRMS: 0, total: 0 };
+    for (const i of scopedIncidents) {
       if (i.source === "GISTDA") c.GISTDA++;
       if (i.source === "FIRMS") c.FIRMS++;
       c.total++;
-      if (
-        i.timePrecision === "minute" &&
-        i.daysOld != null &&
-        i.daysOld * 24 <= 1
-      ) {
-        c.last1h++;
-      }
-      if (
-        i.timePrecision === "minute" &&
-        i.daysOld != null &&
-        i.daysOld <= 1
-      ) {
-        c.last24h++;
-      }
     }
     return c;
-  }, [incidents]);
+  }, [scopedIncidents]);
+  const fixedWindowCounts = useMemo(
+    () => countFixedRecencyWindows(baseScopedIncidents),
+    [baseScopedIncidents],
+  );
 
   const liveStatus = liveFireMeta.status;
   const hasCachedGistda = liveFires.length > 0;
@@ -291,14 +292,16 @@ export default function LiveFiresPage({
         : liveStatus;
   const liveStatusLabel = fmtTr(
     t(`live.status.${effectiveLiveStatus}`),
-    { count: liveFires.length },
+    { count: `${liveFires.length}${liveFireMeta.truncated ? "+" : ""}` },
   );
+  const possiblyCappedCount = (count: number) =>
+    `${count}${liveFireMeta.truncated ? "+" : ""}`;
 
   // Reset pagination whenever filters change so user starts from the top
   // again — otherwise switching province while at page 200 looks empty.
   useEffect(() => {
     setPageSize(50);
-  }, [sourceFilter, provinceFilter, timeWindow, search, thailandOnly]);
+  }, [sourceFilter, provinceFilter, timeWindow, search]);
 
   return (
     <div className="notify-page">
@@ -426,6 +429,15 @@ export default function LiveFiresPage({
         </div>
       )}
 
+      {liveFireMeta.truncated && (
+        <div className="data-scope-notice" role="status">
+          {fmtTr(t("live.limit.notice"), {
+            count: liveFires.length.toLocaleString(),
+            limit: (liveFireMeta.requestedLimit ?? 3000).toLocaleString(),
+          })}
+        </div>
+      )}
+
       {/* Top counts strip */}
       <div className="alert-counts" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
         <div className="alert-count-card" style={{ borderLeftColor: "#ef4444" }}>
@@ -433,7 +445,7 @@ export default function LiveFiresPage({
           <div className="alert-count-value">
             {waitingForFirstLiveResult && !observedAvailable
               ? "—"
-              : sourceCounts.last1h}
+              : possiblyCappedCount(fixedWindowCounts.last1h)}
           </div>
         </div>
         <div className="alert-count-card" style={{ borderLeftColor: "#f97316" }}>
@@ -441,7 +453,7 @@ export default function LiveFiresPage({
           <div className="alert-count-value">
             {waitingForFirstLiveResult && !observedAvailable
               ? "—"
-              : sourceCounts.last24h}
+              : possiblyCappedCount(fixedWindowCounts.last24h)}
           </div>
         </div>
         <button
@@ -454,7 +466,7 @@ export default function LiveFiresPage({
           <div className="alert-count-label" style={{ color: SOURCE_COLOR.GISTDA }}>GISTDA</div>
           <div className="alert-count-value">
             {liveStatus === "ok" || hasCachedGistda
-              ? sourceCounts.GISTDA
+              ? possiblyCappedCount(sourceCounts.GISTDA)
               : "—"}
           </div>
         </button>
@@ -474,33 +486,14 @@ export default function LiveFiresPage({
 
       {/* Filters */}
       <div className="alert-filters">
-        <label style={{
-          display: "inline-flex", alignItems: "center", gap: 6,
-          padding: "7px 10px",
-          background: thailandOnly ? "var(--accent-soft)" : "var(--surface)",
-          border: `1px solid ${thailandOnly ? "var(--accent)" : "var(--border)"}`,
-          borderRadius: 5,
-          fontSize: 12,
-          color: thailandOnly ? "var(--accent)" : "var(--text-2)",
-          fontWeight: 600,
-          cursor: "pointer",
-        }}>
-          <input
-            type="checkbox"
-            checked={thailandOnly}
-            onChange={(e) => setThailandOnly(e.target.checked)}
-            style={{ margin: 0 }}
-          />
-          {t("live.filter.thailand")}
-        </label>
         <select
           value={sourceFilter}
           onChange={(e) => setSourceFilter(e.target.value as IncidentSource | "ALL")}
           aria-label={t("live.filter.source.label")}
         >
           <option value="ALL">{t("live.filter.all_source")}</option>
-          <option value="GISTDA">GISTDA only</option>
-          <option value="FIRMS">FIRMS only</option>
+          <option value="GISTDA">{t("live.filter.gistda_only")}</option>
+          <option value="FIRMS">{t("live.filter.firms_only")}</option>
         </select>
         <select
           value={provinceFilter}
@@ -531,7 +524,7 @@ export default function LiveFiresPage({
         <div className="alert-filter-summary">
           {fmtTr(t("live.paginator.summary"), {
             n: filtered.length,
-            total: incidents.length,
+            total: scopedIncidents.length,
           })}
         </div>
       </div>

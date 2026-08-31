@@ -51,7 +51,7 @@ The FastAPI process serves both the React SPA and APIs on the same origin.
 | Live Fires | Recent GISTDA satellite detections with feed-health context |
 | Analytics | Live-feed composition plus clearly labelled historical context |
 | Predicted vs Actual | Mature archived risk windows compared with matching FIRMS dates |
-| Alerts | Operator notification workflow and audit log |
+| Alerts | Operator-reviewed message preview; local-dev stub queue only (no delivery provider) |
 | Reports | Held-out metrics, baselines, calibration, and methodology |
 
 The map uses two separate concepts:
@@ -213,6 +213,11 @@ volume stores model/data artifacts.
 Follow [`DEPLOY.md`](DEPLOY.md). Do not create a second Railway cron service
 that expects to share the web service's volume: Railway volumes attach to one
 service, so that topology would train into a different filesystem.
+
+The Alerts route is preview-only in production. `ADMIN_TOKEN` protects the
+server-side stub/admin endpoints and is never embedded in the React bundle;
+SMS, LINE, and email delivery require a separate authenticated provider
+integration that is not implemented in this repository.
 
 ## Intended use and limits
 

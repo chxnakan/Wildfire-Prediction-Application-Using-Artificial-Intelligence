@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 
 import db
+import scheduler
 import sync_worker as sw
 
 
@@ -97,6 +98,80 @@ def test_prediction_lock_prevents_duplicate_jobs(sync_env):
             out = sw.run_sync()                              # replica B
     assert calls == []                  # B skipped — no duplicate prediction
     assert out["predictions_refreshed"] is False
+
+
+def test_scheduler_reload_callback_fires_only_after_successful_refresh(monkeypatch):
+    callbacks = []
+    scheduler.register_prediction_refreshed_callback(
+        lambda: callbacks.append("reload") or True
+    )
+    outcomes = [
+        {"predictions_refreshed": True, "noop": False},
+        {"predictions_refreshed": False, "noop": True},
+        {"predictions_refreshed": False, "noop": False, "error": "failed"},
+    ]
+    monkeypatch.setattr(sw, "run_sync", lambda: outcomes.pop(0))
+
+    refreshed = scheduler.sync_job()
+    noop = scheduler.sync_job()
+    failed = scheduler.sync_job()
+
+    assert refreshed["predictions_refreshed"] is True
+    assert noop["noop"] is True
+    assert failed["error"] == "failed"
+    assert callbacks == ["reload"]
+
+
+def test_prediction_reload_callback_failure_does_not_break_sync(monkeypatch):
+    def broken_reload():
+        raise RuntimeError("reload failed")
+
+    scheduler.register_prediction_refreshed_callback(broken_reload)
+    monkeypatch.setattr(
+        sw,
+        "run_sync",
+        lambda: {"predictions_refreshed": True, "noop": False},
+    )
+
+    summary = scheduler.sync_job()
+
+    assert summary["predictions_refreshed"] is True
+    assert summary["serving_state_reload_attempted"] is True
+    assert summary["serving_state_reloaded"] is False
+    assert summary["serving_state_reload_pending"] is True
+
+
+def test_failed_prediction_reload_retries_on_next_identical_noop(monkeypatch):
+    """The input version is already committed after predict-only succeeds.
+
+    If the in-process serving reload then fails, the next identical sync is a
+    worker no-op.  It must still retry the pending reload instead of leaving
+    the API pinned to the previous snapshot forever.
+    """
+    reload_outcomes = [False, True]
+    reload_calls = []
+
+    def flaky_reload():
+        reload_calls.append("reload")
+        return reload_outcomes.pop(0)
+
+    scheduler.register_prediction_refreshed_callback(flaky_reload)
+    sync_outcomes = [
+        {"predictions_refreshed": True, "noop": False},
+        {"predictions_refreshed": False, "noop": True},
+    ]
+    monkeypatch.setattr(sw, "run_sync", lambda: sync_outcomes.pop(0))
+
+    first = scheduler.sync_job()
+    second = scheduler.sync_job()
+
+    assert first["serving_state_reloaded"] is False
+    assert first["serving_state_reload_pending"] is True
+    assert second["noop"] is True
+    assert second["serving_state_reload_attempted"] is True
+    assert second["serving_state_reloaded"] is True
+    assert second["serving_state_reload_pending"] is False
+    assert reload_calls == ["reload", "reload"]
 
 
 # ─── model bundle: gates / atomic promotion / rollback ───────────────────────

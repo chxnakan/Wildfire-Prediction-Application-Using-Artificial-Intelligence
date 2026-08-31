@@ -3,6 +3,7 @@ import {
   calendarDayLag,
   computeFreshness,
   dateAdd,
+  isIsoCalendarDate,
   localIsoDate,
 } from "./dates";
 
@@ -20,6 +21,9 @@ describe("calendar date utilities", () => {
   it("rejects rolled-over and malformed calendar dates", () => {
     expect(dateAdd("2026-02-30", 1)).toBe("—");
     expect(dateAdd("not-a-date", 1)).toBe("—");
+    expect(isIsoCalendarDate("2026-02-28")).toBe(true);
+    expect(isIsoCalendarDate("2026-02-31")).toBe(false);
+    expect(isIsoCalendarDate("2026-13-01")).toBe(false);
   });
 
   it("computes lag by calendar day rather than elapsed local hours", () => {

@@ -7,6 +7,8 @@ import type {
   UrgencyThresholds,
   ValidationMetrics,
 } from "../types";
+import { fmtTr, useLang } from "../utils/i18n";
+import { observedOverlayDateScope } from "../utils/observedOverlay";
 
 // Small inline SVG reliability diagram. Pure DOM, no chart library.
 // X = mean predicted probability per bin; Y = actual positive rate.
@@ -69,7 +71,7 @@ interface Props {
   onClose: () => void;
   activeBaseDate: string;
   predicted: FireFeature[]; // current snapshot (post-province filter)
-  observed: FireFeature[]; // all observed features
+  observed: FireFeature[]; // current Thailand-wide FIRMS overlay
   liveFires: GistdaFeature[];
   metrics: ValidationMetrics | null;
   thresholds: UrgencyThresholds | null;
@@ -83,6 +85,7 @@ interface Props {
 // data freshness, etc. Reads everything from already-loaded state — no
 // network call.
 export default function InfoModal(props: Props) {
+  const { lang, t } = useLang();
   useEffect(() => {
     if (!props.open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -160,6 +163,17 @@ export default function InfoModal(props: Props) {
     props.thresholds.MEDIUM >= 0 &&
     props.thresholds.MEDIUM <= 1,
   );
+  const isArchivedSnapshot = Boolean(
+    (props.metadata?.thresholds_apply_to_base_date || props.metadata?.base_date) &&
+    props.activeBaseDate &&
+    (props.metadata?.thresholds_apply_to_base_date ?? props.metadata?.base_date) !==
+      props.activeBaseDate,
+  );
+  const observedDate =
+    observedOverlayDateScope(
+      props.observed,
+      props.metadata?.latest_data_time,
+    ) ?? t("info.overlay.date_unknown");
 
   return (
     <div className="info-modal-backdrop" onClick={props.onClose}>
@@ -182,9 +196,15 @@ export default function InfoModal(props: Props) {
             <h3>Held-out test performance</h3>
             {!hasPerformanceMetrics ? (
               <p className="info-note" role="status">
-                Model metrics are unavailable in the loaded artifact. Risk
-                cells can still be inspected, but performance claims are
-                intentionally withheld until the metrics payload is restored.
+                {isArchivedSnapshot
+                  ? fmtTr(t("info.metrics.archived"), {
+                      selected: props.activeBaseDate,
+                      current:
+                        props.metadata?.thresholds_apply_to_base_date ??
+                        props.metadata?.base_date ??
+                        "—",
+                    })
+                  : t("info.metrics.unavailable")}
               </p>
             ) : isBinary ? (
               <>
@@ -199,17 +219,17 @@ export default function InfoModal(props: Props) {
                   <div><span>ECE (calibration)</span><b>{fmt(m.ece, 4)}</b></div>
                 </div>
                 <p className="info-note" style={{ marginTop: 4 }}>
-                  <b>ROC-AUC</b> วัดคุณภาพ ranking (0.5=สุ่ม, 1.0=perfect).{" "}
-                  <b>ECE</b> = Expected Calibration Error — ยิ่งต่ำยิ่งดี แต่ต้องดู
-                  reliability curve และ seasonal drift ร่วมด้วย ไม่ใช่ตรารับรองว่า
-                  ทุก probability ใช้ได้ทุกฤดู{" "}
-                  <b>Test pos rate</b> = ภาคจริงมีไฟกี่% — เป็น baseline ของ P@top-K.
+                  {lang === "th" ? (
+                    <><b>ROC-AUC</b> วัดคุณภาพการจัดอันดับ (0.5=สุ่ม, 1.0=สมบูรณ์แบบ) <b>ECE</b> คือ Expected Calibration Error—ยิ่งต่ำยิ่งดี แต่ต้องอ่านร่วมกับ reliability curve และ seasonal drift ไม่ใช่การรับรองว่า probability รายเซลล์ใช้ได้ทุกฤดู <b>Test pos rate</b> คือสัดส่วนผลบวกจริงและเป็น baseline ของ P@top-K</>
+                  ) : (
+                    <><b>ROC-AUC</b> measures ranking quality (0.5=random, 1.0=perfect). <b>ECE</b> is Expected Calibration Error—lower is better, but it must be read with the reliability curve and seasonal drift; it does not certify every cell probability in every season. <b>Test positive rate</b> is the observed-positive baseline for P@top-K.</>
+                  )}
                 </p>
 
                 {typeof m.stability_auc_mean === "number" && (
                   <>
                     <h4 style={{ marginTop: 16, marginBottom: 6 }}>
-                      Stability across {m.stability_valid_months ?? m.stability_months} months
+                      Monthly AUC diagnostic across {m.stability_valid_months ?? m.stability_months} months
                     </h4>
                     <div className="info-grid">
                       <div><span>AUC mean</span><b>{fmt(m.stability_auc_mean, 3)}</b></div>
@@ -219,8 +239,8 @@ export default function InfoModal(props: Props) {
                     </div>
                     {m.rolling_by_month && m.rolling_by_month.length > 0 && (
                       <div style={{ marginTop: 6, fontSize: 11, color: "var(--text-3)" }}>
-                        Rolling monthly AUC ranges {fmt(m.stability_auc_min, 2)}–{fmt(m.stability_auc_max, 2)};
-                        ดูราย script <code style={{ background: "var(--surface-2)", padding: "1px 4px", borderRadius: 3 }}>scripts/rolling_eval.py</code>
+                        Descriptive monthly AUC ranges {fmt(m.stability_auc_min, 2)}–{fmt(m.stability_auc_max, 2)}.
+                        The same model is scored across available months; this is not walk-forward evidence. See <code style={{ background: "var(--surface-2)", padding: "1px 4px", borderRadius: 3 }}>scripts/rolling_eval.py</code>.
                       </div>
                     )}
                   </>
@@ -234,8 +254,9 @@ export default function InfoModal(props: Props) {
                   <div><span>F1</span><b>{fmtPct(m.deployment_f1)}</b></div>
                 </div>
                 <p className="info-note" style={{ marginTop: 4 }}>
-                  Probability cutoff ที่ใช้แปลงเป็น alert/no-alert. ตัวเลขข้างต้น
-                  คือ Precision/Recall ณ จุดนี้บน held-out test.
+                  {lang === "th"
+                    ? "Probability cutoff ที่ใช้แปลงเป็น alert/no-alert ตัวเลขข้างต้นคือ Precision/Recall ณจุดนี้บน held-out test"
+                    : "Probability cutoff used to convert scores into alert/no-alert decisions. The values above are held-out Precision/Recall at that operating point."}
                 </p>
 
                 <h4 style={{ marginTop: 16, marginBottom: 6 }}>Watch-list quality (top-K)</h4>
@@ -247,8 +268,9 @@ export default function InfoModal(props: Props) {
                 {typeof m.uplift_at_top_20pct === "number" && (
                   <p className="info-note" style={{ marginTop: 4 }}>
                     Watch-list lift @top-20%: <b>{m.uplift_at_top_20pct.toFixed(2)}×</b> —{" "}
-                    เลือก 20% เสี่ยงสุดที่โมเดลให้คะแนน เจอไฟมากกว่าสุ่มเลือก{" "}
-                    {m.uplift_at_top_20pct.toFixed(1)} เท่า
+                    {lang === "th"
+                      ? `กลุ่ม 20% ที่โมเดลจัดอันดับสูงสุดพบผลบวกมากกว่าสุ่ม ${m.uplift_at_top_20pct.toFixed(1)} เท่า`
+                      : `the top-ranked 20% contains ${m.uplift_at_top_20pct.toFixed(1)}× as many observed positives as random selection`}
                   </p>
                 )}
 
@@ -257,10 +279,9 @@ export default function InfoModal(props: Props) {
                     <h4 style={{ marginTop: 16, marginBottom: 6 }}>Reliability curve</h4>
                     <ReliabilityDiagram bins={m.reliability_bins} />
                     <p className="info-note" style={{ marginTop: 4 }}>
-                      แต่ละจุด = bin ของ probability โมเดล (X) vs อัตราเกิดไฟจริงในกลุ่มนั้น (Y).
-                      ทแยงสีแดง = perfect calibration. จุดที่ใกล้เส้นหมายถึง
-                      calibration ของ bin นั้นดีกว่า แต่ยังต้องดูจำนวนตัวอย่างและ
-                      seasonal drift ก่อนใช้ probability ราย cell.
+                      {lang === "th"
+                        ? "แต่ละจุดคือ bin ของ probability โมเดล (X) เทียบกับอัตราผลบวกจริง (Y) เส้นทแยงแดงคือ perfect calibration จุดที่ใกล้เส้นแปลว่า bin นั้น calibrate ดีกว่า แต่ยังต้องดูจำนวนตัวอย่างและ seasonal drift ก่อนใช้ probability รายเซลล์"
+                        : "Each point compares a model-probability bin (X) with that bin's observed-positive rate (Y). The red diagonal is perfect calibration. Points closer to it are better calibrated, but bin sample sizes and seasonal drift still matter before using a cell-level probability."}
                     </p>
                   </>
                 )}
@@ -293,16 +314,29 @@ export default function InfoModal(props: Props) {
           </section>
 
           <section>
-            <h3>Current snapshot · {props.activeBaseDate}</h3>
+            <h3>{t("info.snapshot.selected")} · {props.activeBaseDate}</h3>
             <div className="info-grid">
-              <div><span>Predicted cells</span><b>{props.predicted.length}</b></div>
-              <div><span>Observed (FIRMS)</span><b>{props.observed.length}</b></div>
+              <div><span>{t("info.snapshot.predicted_cells")}</span><b>{props.predicted.length}</b></div>
               <div>
-                <span>Live (GISTDA)</span>
-                <b>{props.liveFires.length > 0 ? props.liveFires.length : "see feed status"}</b>
+                <span>{t("info.snapshot.province_filter")}</span>
+                <b>{props.selectedProvince === "all" ? t("info.snapshot.all_provinces") : props.selectedProvince}</b>
               </div>
-              <div><span>Province filter</span><b>{props.selectedProvince === "all" ? "all" : props.selectedProvince}</b></div>
             </div>
+          </section>
+
+          <section>
+            <h3>{t("info.overlay.title")}</h3>
+            <div className="info-grid">
+              <div>
+                <span>{fmtTr(t("info.overlay.firms"), { date: observedDate })}</span>
+                <b>{props.observed.length}</b>
+              </div>
+              <div>
+                <span>{t("info.overlay.gistda")}</span>
+                <b>{props.liveFires.length > 0 ? props.liveFires.length : t("info.overlay.see_feed_status")}</b>
+              </div>
+            </div>
+            <p className="info-note">{t("info.overlay.scope_note")}</p>
           </section>
 
           <section>
@@ -440,7 +474,11 @@ export default function InfoModal(props: Props) {
               <li><b>NASA FIRMS VIIRS NRT</b> — hotspot detections + FRP / brightness, used for training labels and historical aggregates.</li>
               <li><b>GISTDA NRT VIIRS + MODIS</b> — a separate Thai satellite-hotspot feed used as an optional live overlay. It is useful corroborating context, but not fully independent proof of FIRMS because both share satellite-observation limitations.</li>
               <li><b>Open-Meteo ERA5</b> — daily reanalysis (temp / precip / wind), used as features only when the weather cache is present.</li>
-              <li><b>Hansen GFC v1.11</b> — per-cell tree cover baseline (2000) + recent loss %, distinguishes wildfire risk from agricultural-burn signal.</li>
+              <li>
+                <b>Hansen GFC v1.11</b> — {lang === "th"
+                  ? "บริบทพื้นที่ปกคลุมด้วยต้นไม้และการสูญเสียล่าสุดในแต่ละเซลล์ ข้อมูลนี้ไม่สามารถระบุสาเหตุของไฟหรือแยกไฟป่าออกจากการเผาเกษตรได้"
+                  : "per-cell tree-cover and recent-loss context. These fields do not identify fire cause or distinguish wildfire from agricultural burning."}
+              </li>
             </ul>
             <p className="info-note">
               Observation and metric records come from named real sources. Missing
