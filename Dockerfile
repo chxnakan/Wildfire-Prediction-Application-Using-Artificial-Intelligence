@@ -57,11 +57,84 @@ COPY outputs/ /app/bootstrap/outputs/
 COPY data/ /app/bootstrap/data/
 COPY scripts/start.sh /usr/local/bin/start.sh
 
-# A normal Git checkout can leave Git-LFS pointers in place when LFS smudging
-# is disabled. Such an image would build successfully but fail only after
-# deployment when PyArrow tries to open the pointer as Parquet. Validate all
-# serving-critical bootstrap artifacts while dependencies are available and
-# fail the build with an actionable error instead.
+# Railway's Git source snapshot does not materialise Git-LFS objects.  Its
+# injected commit SHA lets us retrieve the *exact* public GitHub object that
+# belongs with the model/metadata/GeoJSON copied above.  A normal local Docker
+# build already has the real parquet and never makes this download.
+#
+# Railway documents that build-time variables require an ARG declaration, and
+# RAILWAY_GIT_COMMIT_SHA is populated for GitHub-triggered deployments.  The
+# URL deliberately uses the immutable commit rather than main, so a concurrent
+# push can never mix feature data from a newer bundle into this image.
+ARG RAILWAY_GIT_COMMIT_SHA
+RUN python - <<'PY'
+import hashlib
+import os
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+feature = Path("/app/bootstrap/outputs/features/full_features.parquet")
+pointer_prefix = b"version https://git-lfs.github.com/spec/v1"
+with feature.open("rb") as handle:
+    prefix = handle.read(512)
+
+if prefix.startswith(pointer_prefix):
+    match = re.search(
+        rb"oid sha256:([0-9a-f]{64})\nsize (\d+)\n?", prefix
+    )
+    if match is None:
+        raise SystemExit("malformed Git-LFS pointer for bootstrap feature artifact")
+    expected_digest = match.group(1).decode("ascii")
+    expected_size = int(match.group(2))
+    revision = os.environ.get("RAILWAY_GIT_COMMIT_SHA", "").strip()
+    if not revision:
+        raise SystemExit(
+            "full_features.parquet is a Git-LFS pointer, but no "
+            "RAILWAY_GIT_COMMIT_SHA was supplied to resolve it"
+        )
+
+    url = (
+        "https://github.com/0Maruz/Wildfire-Prediction-Project/raw/"
+        f"{revision}/outputs/features/full_features.parquet"
+    )
+    with tempfile.NamedTemporaryFile(
+        prefix="full_features.", suffix=".parquet", dir=feature.parent,
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        subprocess.run(
+            [
+                "curl", "--fail", "--location", "--retry", "4",
+                "--retry-all-errors", "--connect-timeout", "20",
+                "--output", str(temporary), url,
+            ],
+            check=True,
+        )
+        actual_size = temporary.stat().st_size
+        if actual_size != expected_size:
+            raise SystemExit(
+                "downloaded bootstrap feature size mismatch: "
+                f"expected {expected_size}, got {actual_size}"
+            )
+        with temporary.open("rb") as downloaded:
+            digest = hashlib.file_digest(downloaded, "sha256").hexdigest()
+        if digest != expected_digest:
+            raise SystemExit(
+                "downloaded bootstrap feature checksum mismatch: "
+                f"expected {expected_digest}, got {digest}"
+            )
+        os.replace(temporary, feature)
+        print(f"materialised Git-LFS bootstrap feature ({actual_size:,} bytes)")
+    finally:
+        temporary.unlink(missing_ok=True)
+PY
+
+# Such an image would otherwise build successfully but fail only after
+# deployment when PyArrow tries to open a pointer as Parquet. Validate all
+# serving-critical bootstrap artifacts while dependencies are available.
 RUN python - <<'PY'
 import json
 import sys
@@ -80,8 +153,8 @@ with feature.open("rb") as handle:
     feature_prefix = handle.read(80)
 if feature_prefix.startswith(b"version https://git-lfs.github.com/spec/v1"):
     raise SystemExit(
-        "full_features.parquet is a Git-LFS pointer; materialise LFS objects "
-        "before the Docker build (git lfs pull)"
+        "full_features.parquet remains a Git-LFS pointer after bootstrap "
+        "materialisation"
     )
 parquet = pq.ParquetFile(feature)
 if parquet.metadata.num_rows < 1:

@@ -51,10 +51,11 @@ automation.
    APP_ENV=production
    ```
 
-6. Confirm the source checkout materialises Git LFS. The serving feature
-   parquet is an LFS object, not a normal Git blob. The Docker build now stops
-   with an explicit error if it receives the small LFS pointer instead of the
-   real Parquet file.
+6. No Railway Git-LFS setting is required. The serving feature parquet is an
+   LFS object, not a normal Git blob; Railway's Git snapshot contains its
+   pointer, so the Dockerfile resolves the corresponding object from GitHub at
+   the immutable `RAILWAY_GIT_COMMIT_SHA` and verifies its size and SHA-256.
+   The repository must remain publicly readable for this bootstrap mechanism.
 
 `ADMIN_TOKEN` is for trusted server-to-server/operator tooling only. Never put
 it in `VITE_*`, browser storage, or frontend code: every visitor could read it.
@@ -134,10 +135,11 @@ different versions. Boundary and tree-cover reference files can be filled
 independently because they are not a promoted model bundle.
 
 The supported production image must contain a complete, validated bootstrap
-bundle; the Docker build fails if it is missing, malformed, or still an LFS
-pointer. On an empty `/srv` volume, that complete set is seeded before Uvicorn
-starts. Before tomorrow's presentation, also verify that an existing volume
-contains all four promoted files and that `/health/ready` returns HTTP 200.
+bundle; when Railway provides an LFS pointer, the Docker build materialises and
+checksum-verifies its exact commit-pinned object before validation. On an empty
+`/srv` volume, that complete set is seeded before Uvicorn starts. Before
+tomorrow's presentation, also verify that an existing volume contains all four
+promoted files and that `/health/ready` returns HTTP 200.
 
 ## Pre-deploy validation
 

@@ -54,9 +54,8 @@ outputs/**
 
 # Bootstrap model + feature parquet — committed so Railway's first deploy
 # of the web service has a working model before runtime sync is enabled.
-# The feature parquet is stored with Git LFS (see .gitattributes); clones and
-# deployment builders must materialise the LFS object rather than copying its
-# small pointer file into the image.
+# The feature parquet is stored with Git LFS (see .gitattributes). Railway's
+# Git-source image build resolves the pointer at its immutable commit SHA.
 !outputs/models/lgbm_fire_date_model.pkl
 !outputs/features/full_features.parquet
 
