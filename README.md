@@ -36,6 +36,14 @@ grid-day windows, including 32,655 with a recorded hotspot within three days:
 | Brier score | 0.1130 |
 | Conditional date MAE | 0.674 days |
 
+Results reverified on **November 22, 2026**: all **82 software tests passed**.
+All 259,860 held-out labels were independently rebuilt from the saved observations,
+the metrics were recalculated, and production predictions were reproduced.
+The public API was checked against the saved evaluation. This verifies the existing
+historical test; it does not add new observations or retrain the model.
+See [the verification results](outputs/evaluation/test_results.json) for exact
+metrics, test dates and evidence hashes.
+
 The model flags roughly 38 of every 100 positive windows; roughly 39 of every
 100 flagged windows contain a recorded hotspot. The shorter target window,
 changed prevalence and revised test dates mean these are not a controlled
@@ -271,21 +279,21 @@ their default regional responses remain available for existing integrations.
   probability, recent detection history and weather context.
   The display threshold remains separate: at its default 50%, Low cells are
   hidden. Lower it below 40% to display them. Predicted dates remain separate
-  from likelihood. Legacy snapshots without calibrated probabilities use explicitly
+  from probability. Legacy snapshots without calibrated probabilities use explicitly
   labelled score bands (0.70 and 0.40), not probability percentages. The dashboard
   derives these levels from the probability/score; immutable snapshot files retain
   their original timing-based `urgency_level` field for compatibility.
 - **Live Fires**: the last 24 hours of NOAA-20/NOAA-21 detections with filters,
   "View on map" and a link to verify each detection on the FIRMS map.
 - **Analytics**: the forecast timeline, the probability distribution, the
-  likelihood breakdown, the top provinces and Thailand's daily detections.
+  probability-level breakdown, the top provinces and Thailand's daily detections.
 - **Predicted vs Actual**: a retrospective check of the selected snapshot
   against later records (labelled as such and never counted as prospective
   verification), the holdout comparison with the baselines, and the
   prospective scoring status.
 - **Alerts**: the forecast watch list, highest probability first, and a log of new live
   detections seen during the session.
-- **Reports**: training provenance, the likelihood distribution, feature
+- **Reports**: training provenance, the probability-level distribution, feature
   importance, cells per province and the recorded limitations, with JSON, CSV
   and PNG downloads.
 

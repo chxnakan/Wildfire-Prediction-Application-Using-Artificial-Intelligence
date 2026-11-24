@@ -235,11 +235,11 @@ const Reports = (() => {
       App.download(`firewatch_dataset_info.json`, JSON.stringify(state.metadata, null, 2), "application/json");
     } else if (kind === "png") {
       const canvas = document.getElementById("rpUrgency");
-      if (canvas) chartPNG(canvas, `firewatch_${App.isCalibrated() ? "likelihood" : "score"}_${stamp}.png`);
+      if (canvas) chartPNG(canvas, `firewatch_${App.isCalibrated() ? "probability" : "score"}_${stamp}.png`);
     } else if (kind === "urgency-csv") {
       const c = urgencyCounts();
       const rows = ["HIGH", "MEDIUM", "LOW", "NONE"].map(k => ({ tier: k === "NONE" ? "below_threshold" : k, cells: c[k] }));
-      App.download(`firewatch_${App.isCalibrated() ? "likelihood" : "score"}_${stamp}.csv`, App.toCSV(rows, [{ key: "tier" }, { key: "cells" }]));
+      App.download(`firewatch_${App.isCalibrated() ? "probability" : "score"}_${stamp}.csv`, App.toCSV(rows, [{ key: "tier" }, { key: "cells" }]));
     } else if (kind === "features-csv") {
       const rows = (state.metadata && state.metadata.feature_importance) || [];
       App.download("firewatch_feature_importance.csv", App.toCSV(rows, [{ key: "feature" }, { key: "gain_pct" }, { key: "splits" }]));

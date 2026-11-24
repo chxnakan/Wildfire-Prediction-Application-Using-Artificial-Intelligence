@@ -50,7 +50,7 @@ const Compare = (() => {
         ${kpi("cyan", t("cmp.mae"), timing && timing.mae_days !== null ? `${App.num(timing.mae_days, 2)} ${t("cmp.days")}` : "—", t("cmp.maeSub"))}
       </div>
       <div class="grid two section-gap">
-        <div style="position:relative;height:380px;border-radius:9px;overflow:hidden;border:1px solid var(--border)"><div id="cmpMap" style="position:absolute;inset:0"></div></div>
+        <div class="cmp-map-wrap" style="position:relative;border-radius:9px;overflow:hidden;border:1px solid var(--border)"><div id="cmpMap" style="position:absolute;inset:0"></div></div>
         <div>
           <div class="m-section">${t("cmp.legend")}</div>
           <div class="legend-item"><span class="legend-dot" style="background:var(--green)"></span>${t("cmp.legendHit")}</div>

@@ -1,0 +1,69 @@
+{
+  "verified_at": "2026-11-22T09:41:51.767646+00:00",
+  "model_version": "98bfd2a97aab",
+  "horizon_days": 3,
+  "scope": "Reverification of the existing historical holdout; no new observations or retraining.",
+  "software_tests": {
+    "command": ".venv/bin/python -m unittest discover -s tests -v",
+    "passed": 82,
+    "failures": 0,
+    "errors": 0
+  },
+  "verification": {
+    "holdout_metrics_recomputed": true,
+    "holdout_labels_rebuilt_from_observations": true,
+    "holdout_windows_checked": 259860,
+    "production_predictions_reproduced": true,
+    "forecast_dates_within_three_days": true,
+    "thailand_grid_centres_verified": true,
+    "chronological_label_purge_verified": true,
+    "public_api_matches_saved_evaluation": true
+  },
+  "split": {
+    "method": "chronological holdout with 3-day label purge",
+    "train_start": "2025-03-02",
+    "train_end": "2025-11-02",
+    "training_labels_through": "2025-11-05",
+    "test_start": "2025-11-06",
+    "test_end": "2026-01-14",
+    "train_rows": 909510,
+    "test_rows": 259860
+  },
+  "performance": {
+    "samples": 259860,
+    "classification": {
+      "threshold": 0.5,
+      "actual_positive_windows": 32655,
+      "actual_negative_windows": 227205,
+      "precision": 0.3941259619915188,
+      "recall": 0.38422906139947943,
+      "f1": 0.38911459140952087,
+      "false_positive_rate": 0.0848924979643934,
+      "average_precision": 0.36246609981070177,
+      "roc_auc": 0.7800356902498424,
+      "brier_score": 0.11296180699685965,
+      "true_positive": 12547,
+      "false_positive": 19288,
+      "false_negative": 20108,
+      "true_negative": 207917
+    },
+    "timing": {
+      "samples": 32655,
+      "scope": "All windows with a recorded future detection, including classifier misses",
+      "mae_days": 0.674365639598679,
+      "rmse_days": 0.8104841546414576,
+      "within_one_day": 0.9962945950084213
+    }
+  },
+  "evidence_sha256": {
+    "outputs/evaluation/metrics.json": "d1877424daec6ac8f6885dfd7b2db88279237c6313e844627155b47210560a25",
+    "outputs/evaluation/98bfd2a97aab/holdout_predictions.csv.gz": "c6ca4941a8cd3ededdec2712d11a2c658f410ad03053c9c08e1a6aefeb7a30e6",
+    "outputs/features/observation_coordinates.csv.gz": "fd98d620e59c8a388daac748640df596951d0e74b0f0f51bd01bc1e194b5037f",
+    "outputs/models/lgbm_fire_date_model.pkl": "dc4f89c43220794284d6234b816cce846fe3ab9d2bfd28b146e28d4e062e372c"
+  },
+  "limitations": [
+    "Historical test windows, not a current live evaluation.",
+    "Satellite hotspots are not confirmed wildfires.",
+    "Overlapping grid-day windows are not independent fire incidents."
+  ]
+}

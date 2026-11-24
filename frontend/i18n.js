@@ -5,8 +5,8 @@
 
 const I18N = (() => {
   const en = {
-    "tier.probability": "likelihood", "tier.score": "model score",
-    "tier.probabilityTitle": "{horizon}-day hotspot likelihood", "tier.scoreTitle": "Model score (uncalibrated)",
+    "tier.probability": "probability", "tier.score": "model score",
+    "tier.probabilityTitle": "{horizon}-day hotspot probability", "tier.scoreTitle": "Model score (uncalibrated)",
     "nav.map": "Map", "nav.live": "Live Fires", "nav.analytics": "Analytics", "nav.compare": "Predicted vs Actual",
     "nav.alerts": "Alerts", "nav.reports": "Reports", "nav.language": "Switch language (EN / ไทย)",
     "nav.theme": "Toggle light / dark theme", "nav.toggleSidebar": "Show / hide sidebar",
@@ -193,7 +193,7 @@ const I18N = (() => {
     "cmp.baseDate": "Base date",
 
     "al.title": "Alerts · Forecast watch list",
-    "al.subtitle": "Cells the model flagged for {date} at threshold {t}, most likely first. Research forecast — not an official warning.",
+    "al.subtitle": "Cells the model flagged for {date} at threshold {t}, highest probability first. Research forecast — not an official warning.",
     "al.urgencyFilter": "{measureTitle} filter", "al.all": "All", "al.search": "Search province / coordinates…",
     "al.count": "{shown} / {total} cells", "al.none": "No flagged cells match.", "al.estimated": "Est. {date} (Day +{n})",
     "al.probability": "{horizon}-day probability", "al.score": "model score", "al.map": "Map", "al.showAll": "Show all {n}",
@@ -201,6 +201,13 @@ const I18N = (() => {
     "al.logSub": "New FIRMS detections reported since you opened the dashboard",
     "al.logEmpty": "No new detections since you opened the dashboard. The log fills as the live feed reports new detections.",
     "al.newDetection": "New detection",
+    "notify.title": "New FIRMS hotspots: {n}",
+    "notify.location": "Latest: {province} · {lat}°N, {lon}°E",
+    "notify.time": "Satellite detection: {time}",
+    "notify.note": "Satellite hotspot detections, not confirmed wildfires. Updates follow the live FIRMS feed.",
+    "notify.map": "View latest on map",
+    "notify.dismiss": "Dismiss",
+    "notify.close": "Dismiss hotspot notification",
 
     "rp.title": "Reports · Model evaluation",
     "rp.subtitle": "Held-out test performance, calibration, training provenance and limitations",
@@ -235,8 +242,8 @@ const I18N = (() => {
   };
 
   const th = {
-    "tier.probability": "โอกาสเกิดจุดความร้อน", "tier.score": "คะแนนโมเดล",
-    "tier.probabilityTitle": "โอกาสเกิดจุดความร้อนใน {horizon} วัน", "tier.scoreTitle": "คะแนนโมเดล (ไม่ปรับเทียบ)",
+    "tier.probability": "ความน่าจะเป็นเกิดจุดความร้อน", "tier.score": "คะแนนโมเดล",
+    "tier.probabilityTitle": "ความน่าจะเป็นเกิดจุดความร้อนใน {horizon} วัน", "tier.scoreTitle": "คะแนนโมเดล (ไม่ปรับเทียบ)",
     "nav.map": "แผนที่", "nav.live": "ไฟล่าสุด", "nav.analytics": "วิเคราะห์", "nav.compare": "คาดการณ์เทียบจริง",
     "nav.alerts": "การแจ้งเตือน", "nav.reports": "รายงาน", "nav.language": "เปลี่ยนภาษา (EN / ไทย)",
     "nav.theme": "สลับธีมสว่าง / มืด", "nav.toggleSidebar": "แสดง / ซ่อนแถบข้าง",
@@ -278,7 +285,7 @@ const I18N = (() => {
     "legend.title": "{measureTitle}", "legend.high": "สูง ({high})", "legend.medium": "กลาง ({medium})",
     "legend.low": "ต่ำ ({low})", "legend.observed": "ตรวจพบ (FIRMS)", "legend.live": "ล่าสุด (FIRMS NRT)",
 
-    "pop.probability": "โอกาสเกิดจุดความร้อนภายใน {horizon} วัน", "pop.score": "คะแนนโมเดล (ยังไม่ปรับเทียบ)",
+    "pop.probability": "ความน่าจะเป็นเกิดจุดความร้อนภายใน {horizon} วัน", "pop.score": "คะแนนโมเดล (ยังไม่ปรับเทียบ)",
     "pop.thresholdTick": "เกณฑ์ {t}",
     "pop.reliability": "จาก 10 เซลล์ที่ระดับนี้ในชุดทดสอบ ประมาณ {n} เซลล์มีจุดความร้อนภายใน {horizon} วัน",
     "pop.notCalibrated": "สแนปช็อตนี้เก็บคะแนนที่ยังไม่ปรับเทียบ ไม่ใช่ความน่าจะเป็น",
@@ -423,14 +430,21 @@ const I18N = (() => {
     "cmp.baseDate": "วันฐาน",
 
     "al.title": "การแจ้งเตือน · รายการเฝ้าระวัง",
-    "al.subtitle": "เซลล์ที่โมเดลแจ้งเตือนสำหรับ {date} ที่เกณฑ์ {t} เรียงจากโอกาสสูงสุด เป็นการคาดการณ์เพื่อการวิจัย ไม่ใช่ประกาศเตือนภัยอย่างเป็นทางการ",
+    "al.subtitle": "เซลล์ที่โมเดลแจ้งเตือนสำหรับ {date} ที่เกณฑ์ {t} เรียงจากความน่าจะเป็นสูงสุด เป็นการคาดการณ์เพื่อการวิจัย ไม่ใช่ประกาศเตือนภัยอย่างเป็นทางการ",
     "al.urgencyFilter": "กรองตาม{measureTitle}", "al.all": "ทั้งหมด", "al.search": "ค้นหาจังหวัด / พิกัด…",
     "al.count": "{shown} / {total} เซลล์", "al.none": "ไม่มีเซลล์ที่ตรงเงื่อนไข", "al.estimated": "คาด {date} (วันที่ +{n})",
-    "al.probability": "โอกาส {horizon} วัน", "al.score": "คะแนนโมเดล", "al.map": "แผนที่", "al.showAll": "แสดงทั้งหมด {n}",
+    "al.probability": "ความน่าจะเป็น {horizon} วัน", "al.score": "คะแนนโมเดล", "al.map": "แผนที่", "al.showAll": "แสดงทั้งหมด {n}",
     "al.logTitle": "บันทึกการตรวจพบล่าสุด (เซสชันนี้)",
     "al.logSub": "การตรวจพบ FIRMS ใหม่ตั้งแต่เปิดแดชบอร์ด",
     "al.logEmpty": "ยังไม่มีการตรวจพบใหม่ตั้งแต่เปิดแดชบอร์ด รายการจะเพิ่มขึ้นเมื่อมีรายงานใหม่",
     "al.newDetection": "ตรวจพบใหม่",
+    "notify.title": "จุดความร้อนใหม่จาก FIRMS: {n}",
+    "notify.location": "ล่าสุด: {province} · {lat}°N, {lon}°E",
+    "notify.time": "เวลาที่ดาวเทียมตรวจพบ: {time}",
+    "notify.note": "เป็นจุดความร้อนที่ดาวเทียมตรวจพบ ยังไม่ใช่การยืนยันไฟป่า อัปเดตตามข้อมูลล่าสุดจาก FIRMS",
+    "notify.map": "ดูจุดล่าสุดบนแผนที่",
+    "notify.dismiss": "ปิด",
+    "notify.close": "ปิดการแจ้งเตือนจุดความร้อน",
 
     "rp.title": "รายงาน · การประเมินโมเดล",
     "rp.subtitle": "ประสิทธิภาพบนชุดทดสอบ การปรับเทียบ ที่มาของการฝึก และข้อจำกัด",

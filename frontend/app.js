@@ -391,7 +391,21 @@ const App = (() => {
     window.addEventListener("hashchange", () => show(parseHash().view));
     on("lang", updateLivePill);
     on("live", updateLivePill);
-    if (window.matchMedia("(max-width: 760px)").matches) document.body.classList.add("sidebar-collapsed");
+    // Phones/small tablets: the sidebar overlays the map, so start it closed,
+    // close it when the dimmed backdrop is tapped, and re-sync on resize/rotation.
+    const narrow = window.matchMedia("(max-width: 760px)");
+    if (narrow.matches) document.body.classList.add("sidebar-collapsed");
+    const onNarrow = e => { document.body.classList.toggle("sidebar-collapsed", e.matches); emit("layout"); };
+    if (narrow.addEventListener) narrow.addEventListener("change", onNarrow); else narrow.addListener(onNarrow);
+    document.getElementById("view-map").addEventListener("click", e => {
+      if (e.target !== e.currentTarget || !narrow.matches || document.body.classList.contains("sidebar-collapsed")) return;
+      document.body.classList.add("sidebar-collapsed");
+      emit("layout");
+    });
+    // Compact screens: the map legend collapses to its title; tap to expand.
+    const legend = document.getElementById("legend");
+    if (window.matchMedia("(max-width: 600px), (max-height: 500px)").matches) legend.classList.add("collapsed");
+    legend.addEventListener("click", () => legend.classList.toggle("collapsed"));
 
     show(view);
     updateLivePill();

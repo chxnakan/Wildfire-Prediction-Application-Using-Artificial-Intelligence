@@ -2,7 +2,7 @@
 <html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>FireWatch Thailand</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🔥%3C/text%3E%3C/svg%3E" />
   <script>
@@ -62,6 +62,21 @@
   </div>
 </div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
+<section id="liveNotification" class="card live-notification" aria-labelledby="liveNotificationTitle" hidden>
+  <div class="live-notification-head">
+    <div id="liveNotificationSummary" role="status" aria-live="polite" aria-atomic="true">
+      <h2 id="liveNotificationTitle" class="card-title"></h2>
+      <div id="liveNotificationLocation" class="card-sub"></div>
+      <div id="liveNotificationTime" class="card-sub"></div>
+    </div>
+    <button id="liveNotificationClose" class="modal-close" type="button" aria-label="Dismiss notification">×</button>
+  </div>
+  <p id="liveNotificationNote" class="card-sub"></p>
+  <div class="live-notification-actions">
+    <button id="liveNotificationMap" class="btn sm primary" type="button"></button>
+    <button id="liveNotificationDismiss" class="btn sm" type="button"></button>
+  </div>
+</section>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" integrity="sha384-9nhczxUqK87bcKHh20fSQcTGD4qq5GhayNYSYWqwBkINBhOfQLg/P5HG5lF1urn4" crossorigin="anonymous"></script>
@@ -73,6 +88,7 @@
 <script src="app.js"></script>
 <script src="map.js"></script>
 <script src="live.js"></script>
+<script src="live_notifications.js"></script>
 <script src="analytics.js"></script>
 <script src="compare.js"></script>
 <script src="alerts.js"></script>

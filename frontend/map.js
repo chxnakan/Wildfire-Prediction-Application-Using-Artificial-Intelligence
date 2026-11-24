@@ -39,13 +39,57 @@ const MapView = (() => {
   }
 
   // ---------------- markers ----------------
+  // The forecast grid is 0.1° (~4–5 px apart at zoom 6), so full-size markers and their
+  // halos merge into blobs when zoomed out. Shrink markers, drop halos at low zoom, and
+  // draw only the most important marker of a layer where several would overlap.
+  function markerScale(z) {
+    return z >= 8 ? 1 : z === 7 ? 0.85 : z === 6 ? 0.75 : 0.6;
+  }
+
+  function coreRadius(core, ring) {
+    return Math.max(1.8, core * markerScale(map.getZoom())) + (ring ? 1 : 0);
+  }
+
+  // `items` must be ordered most important first. Keeps an item only if its marker core
+  // (plus a small gap) does not overlap one already kept, using a pixel hash grid.
+  function declutter(items, latlngOf, core, ring = false) {
+    const zoom = map.getZoom();
+    const minPx = 2 * coreRadius(core, ring) + 2;
+    const grid = new Map();
+    const kept = [];
+    for (const item of items) {
+      const p = map.project(latlngOf(item), zoom);
+      const gx = Math.floor(p.x / minPx), gy = Math.floor(p.y / minPx);
+      let clash = false;
+      for (let dx = -1; dx <= 1 && !clash; dx++) {
+        for (let dy = -1; dy <= 1 && !clash; dy++) {
+          for (const q of grid.get(`${gx + dx},${gy + dy}`) || []) {
+            if ((q.x - p.x) ** 2 + (q.y - p.y) ** 2 < minPx * minPx) { clash = true; break; }
+          }
+        }
+      }
+      if (clash) continue;
+      const key = `${gx},${gy}`;
+      if (!grid.has(key)) grid.set(key, []);
+      grid.get(key).push(p);
+      kept.push(item);
+    }
+    return kept;
+  }
+
   function glow(layer, lat, lon, color, { core = 3, halo = 7, ring = false } = {}, onClick) {
-    L.circleMarker([lat, lon], { renderer, radius: halo * 1.7, stroke: false, fillColor: color, fillOpacity: 0.05, interactive: false }).addTo(layer);
-    const h = L.circleMarker([lat, lon], { renderer, radius: halo, stroke: false, fillColor: color, fillOpacity: 0.16 }).addTo(layer);
-    const c = L.circleMarker([lat, lon], ring
-      ? { renderer, radius: core + 1, color, weight: 1.6, fill: true, fillOpacity: 0.1, fillColor: color }
-      : { renderer, radius: core, color: "rgba(255,255,255,0.8)", weight: 0.8, fillColor: color, fillOpacity: 1 }).addTo(layer);
-    if (onClick) { h.on("click", onClick); c.on("click", onClick); }
+    const z = map.getZoom();
+    const s = markerScale(z);
+    const r = coreRadius(core, false);
+    const targets = [];
+    if (z >= 7) {
+      L.circleMarker([lat, lon], { renderer, radius: halo * s * 1.7, stroke: false, fillColor: color, fillOpacity: 0.05, interactive: false }).addTo(layer);
+      targets.push(L.circleMarker([lat, lon], { renderer, radius: halo * s, stroke: false, fillColor: color, fillOpacity: 0.16 }).addTo(layer));
+    }
+    targets.push(L.circleMarker([lat, lon], ring
+      ? { renderer, radius: r + 1, color, weight: z >= 7 ? 1.6 : 1.2, fill: true, fillOpacity: 0.1, fillColor: color }
+      : { renderer, radius: r, color: "rgba(255,255,255,0.8)", weight: z >= 7 ? 0.8 : 0.6, fillColor: color, fillOpacity: 1 }).addTo(layer));
+    if (onClick) targets.forEach(m => m.on("click", onClick));
   }
 
   function liveAlerts() {
@@ -57,16 +101,19 @@ const MapView = (() => {
     let visible = 0;
     if (show.observed) {
       const color = App.cssVar("--observed");
-      for (const o of state.observed) {
-        if (!App.matchesProvince(o.province)) continue;
+      const observed = declutter(state.observed.filter(o => App.matchesProvince(o.province)), o => [o.lat, o.lon], 2.6, true);
+      for (const o of observed) {
         glow(layers.observed, o.lat, o.lon, color, { core: 2.6, halo: 5, ring: true },
              e => openPopup(e.latlng, observedPopup(o)));
       }
     }
     if (show.predicted) {
       const order = { LOW: 0, MEDIUM: 1, HIGH: 2 };
-      const flagged = App.flaggedCells().sort((a, b) => order[a.view.urgency] - order[b.view.urgency]);
-      for (const { cell, view } of flagged) {
+      const flagged = App.flaggedCells().sort((a, b) =>
+        order[b.view.urgency] - order[a.view.urgency] || (b.view.prob ?? 0) - (a.view.prob ?? 0));
+      // Keep the highest-risk cell where markers would overlap; draw HIGH last so it sits on top.
+      const drawn = declutter(flagged, f => [f.cell.lat, f.cell.lon], 3.4).reverse();
+      for (const { cell, view } of drawn) {
         glow(layers.predicted, cell.lat, cell.lon, App.urgencyColor(view.urgency),
              { core: view.urgency === "HIGH" ? 3.4 : 3, halo: view.urgency === "HIGH" ? 8 : 7 },
              e => openPopup(e.latlng, predictedPopup(cell), el => fillPredicted(el, cell)));
@@ -81,9 +128,12 @@ const MapView = (() => {
     layers.live.clearLayers();
     if (!show.live) return;
     const color = App.cssVar("--live");
-    for (const a of liveAlerts()) {
-      const code = Geo.locate(a.latitude, a.longitude);
-      if (!App.matchesProvince(code)) continue;
+    const alerts = liveAlerts()
+      .map(a => ({ a, code: Geo.locate(a.latitude, a.longitude) }))
+      .filter(({ code }) => App.matchesProvince(code))
+      .sort((x, y) => Date.parse(y.a.observed_at) - Date.parse(x.a.observed_at));
+    // Keep the most recent detection where markers would overlap.
+    for (const { a, code } of declutter(alerts, ({ a }) => [a.latitude, a.longitude], 3.2)) {
       glow(layers.live, a.latitude, a.longitude, color, { core: 3.2, halo: 8 },
            e => openPopup(e.latlng, livePopup(a, code)));
     }
@@ -390,7 +440,7 @@ const MapView = (() => {
       { label: "lon", value: r => r.cell.lon.toFixed(3) },
       { label: "probability_7d", value: r => r.view.prob === null ? "" : r.view.prob.toFixed(4) },
       { label: "raw_model_score", value: r => r.cell.detection_score.toFixed(4) },
-      { label: App.isCalibrated() ? "likelihood_level" : "score_level", value: r => r.view.urgency },
+      { label: App.isCalibrated() ? "probability_level" : "score_level", value: r => r.view.urgency },
       { label: "estimated_first_detection", value: r => r.view.date },
       { label: "days_after_base", value: r => r.view.days },
       { label: "base_date", value: () => m.base_date },
@@ -612,6 +662,8 @@ const MapView = (() => {
   });
   App.on("meta", buildSidebar);
   App.on("filters", redraw);
+  // Marker size and decluttering depend on zoom.
+  map.on("zoomend", redraw);
   App.on("lang", () => {
     tiles.forEach(layer => layer.setLanguage(state.lang));
     buildSidebar(); buildLegend(); map.closePopup();
