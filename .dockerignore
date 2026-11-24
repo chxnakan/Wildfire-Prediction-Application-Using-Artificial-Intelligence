@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!deploy/
+!deploy/requirements.lock
+!src/
+!src/**
+!frontend/
+!frontend/**
+**/__pycache__/
+**/*.pyc
+**/.env*

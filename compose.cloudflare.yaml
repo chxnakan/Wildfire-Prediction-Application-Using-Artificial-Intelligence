@@ -1,0 +1,20 @@
+services:
+  tunnel:
+    # Pinned for reproducible, reviewed upgrades; see deploy/README.md to update.
+    image: cloudflare/cloudflared:2026.11.1
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    env_file: .cloudflare.env
+    depends_on:
+      app:
+        condition: service_healthy
+    read_only: true
+    mem_limit: 256m
+    pids_limit: 256
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

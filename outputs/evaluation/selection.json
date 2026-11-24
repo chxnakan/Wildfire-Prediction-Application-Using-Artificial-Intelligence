@@ -1,0 +1,878 @@
+{
+  "method": "Three expanding chronological validation blocks within the fitting period; 3-day label purge",
+  "horizon_days": 3,
+  "rule": "Maximize mean average precision among candidates with mean Brier <= weather baseline + 0.002 and mean recall at 2% FPR >= weather baseline; tie favors fewer features",
+  "holdout_used_for_selection": false,
+  "selected": "terrain",
+  "candidates": {
+    "weather_baseline": {
+      "features": [
+        "fire_3d",
+        "frp_3d",
+        "frp_max",
+        "fire_days_7d",
+        "fire_yesterday",
+        "frp_trend",
+        "bright_mean",
+        "confidence_mean",
+        "weather_rain_past_3d",
+        "weather_rain_past_7d",
+        "weather_temp_max_past_3d",
+        "weather_humidity_min_past_3d",
+        "weather_wind_max_past_3d",
+        "weather_rain_forecast_3d",
+        "weather_temp_max_forecast_3d",
+        "weather_humidity_min_forecast_3d",
+        "weather_wind_max_forecast_3d"
+      ],
+      "blocks": [
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-06-27",
+          "validation_start": "2025-07-11",
+          "validation_end": "2025-08-11",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 3259,
+              "actual_negative_windows": 135333,
+              "precision": 0.6923076923076923,
+              "recall": 0.005523166615526235,
+              "f1": 0.010958904109589041,
+              "false_positive_rate": 5.911344609223175e-05,
+              "average_precision": 0.1943248267283561,
+              "roc_auc": 0.8224442100811249,
+              "brier_score": 0.021086094525612286,
+              "true_positive": 18,
+              "false_positive": 8,
+              "false_negative": 3241,
+              "true_negative": 135325
+            },
+            "timing": {
+              "samples": 3259,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6852814678316349,
+              "rmse_days": 0.8373459848313926,
+              "within_one_day": 0.989260509358699
+            }
+          },
+          "ece": 0.007709258242005055,
+          "recall_at_fpr": {
+            "0.02": 0.2681804234427739,
+            "0.05": 0.38815587603559376
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-08-08",
+          "validation_start": "2025-08-12",
+          "validation_end": "2025-09-21",
+          "metrics": {
+            "samples": 134261,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1844,
+              "actual_negative_windows": 132417,
+              "precision": 0.6666666666666666,
+              "recall": 0.0010845986984815619,
+              "f1": 0.002165674066053059,
+              "false_positive_rate": 7.551900435744655e-06,
+              "average_precision": 0.12117550510233228,
+              "roc_auc": 0.7692973253150825,
+              "brier_score": 0.012841793487178422,
+              "true_positive": 2,
+              "false_positive": 1,
+              "false_negative": 1842,
+              "true_negative": 132416
+            },
+            "timing": {
+              "samples": 1844,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6587376356310582,
+              "rmse_days": 0.8116647596538464,
+              "within_one_day": 0.9972885032537961
+            }
+          },
+          "ece": 0.008182065483469622,
+          "recall_at_fpr": {
+            "0.02": 0.2738611713665944,
+            "0.05": 0.3882863340563991
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-09-18",
+          "validation_start": "2025-09-22",
+          "validation_end": "2025-11-02",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1817,
+              "actual_negative_windows": 136775,
+              "precision": null,
+              "recall": 0.0,
+              "f1": 0.0,
+              "false_positive_rate": 0.0,
+              "average_precision": 0.05953597322446279,
+              "roc_auc": 0.6599781526791537,
+              "brier_score": 0.012870172310103742,
+              "true_positive": 0,
+              "false_positive": 0,
+              "false_negative": 1817,
+              "true_negative": 136775
+            },
+            "timing": {
+              "samples": 1817,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6811807503256158,
+              "rmse_days": 0.8227716834614861,
+              "within_one_day": 0.9966978536048432
+            }
+          },
+          "ece": 0.010346496089846464,
+          "recall_at_fpr": {
+            "0.02": 0.170610897083104,
+            "0.05": 0.27077600440286187
+          }
+        }
+      ],
+      "mean_average_precision": 0.1250121016850504,
+      "mean_brier": 0.015599353440964817,
+      "mean_recall_at_2pct_fpr": 0.23755083063082405
+    },
+    "quality_and_season": {
+      "features": [
+        "fire_3d",
+        "frp_3d",
+        "frp_max",
+        "fire_days_7d",
+        "fire_yesterday",
+        "frp_trend",
+        "bright_mean",
+        "confidence_mean",
+        "weather_rain_past_3d",
+        "weather_rain_past_7d",
+        "weather_temp_max_past_3d",
+        "weather_humidity_min_past_3d",
+        "weather_wind_max_past_3d",
+        "weather_rain_forecast_3d",
+        "weather_temp_max_forecast_3d",
+        "weather_humidity_min_forecast_3d",
+        "weather_wind_max_forecast_3d",
+        "low_confidence_fraction_7d",
+        "night_fraction_7d",
+        "daynight_known_fraction_7d",
+        "season_sin",
+        "season_cos"
+      ],
+      "blocks": [
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-06-27",
+          "validation_start": "2025-07-11",
+          "validation_end": "2025-08-11",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 3259,
+              "actual_negative_windows": 135333,
+              "precision": 0.05,
+              "recall": 0.0003068425897514575,
+              "f1": 0.000609942055504727,
+              "false_positive_rate": 0.00014039443446905043,
+              "average_precision": 0.1640797702979527,
+              "roc_auc": 0.8174915079460323,
+              "brier_score": 0.02164172969280455,
+              "true_positive": 1,
+              "false_positive": 19,
+              "false_negative": 3258,
+              "true_negative": 135314
+            },
+            "timing": {
+              "samples": 3259,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6951579224058951,
+              "rmse_days": 0.8464957910963442,
+              "within_one_day": 0.9585762503835532
+            }
+          },
+          "ece": 0.002587137985025027,
+          "recall_at_fpr": {
+            "0.02": 0.292420988033139,
+            "0.05": 0.4166922368824793
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-08-08",
+          "validation_start": "2025-08-12",
+          "validation_end": "2025-09-21",
+          "metrics": {
+            "samples": 134261,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1844,
+              "actual_negative_windows": 132417,
+              "precision": 0.3053435114503817,
+              "recall": 0.08676789587852494,
+              "f1": 0.13513513513513514,
+              "false_positive_rate": 0.0027488917586110545,
+              "average_precision": 0.12458832764273564,
+              "roc_auc": 0.8044645762383761,
+              "brier_score": 0.013553605465909902,
+              "true_positive": 160,
+              "false_positive": 364,
+              "false_negative": 1684,
+              "true_negative": 132053
+            },
+            "timing": {
+              "samples": 1844,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.7767142290901773,
+              "rmse_days": 0.898085116990226,
+              "within_one_day": 0.9126898047722343
+            }
+          },
+          "ece": 0.010543855572836163,
+          "recall_at_fpr": {
+            "0.02": 0.2993492407809111,
+            "0.05": 0.4436008676789588
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-09-18",
+          "validation_start": "2025-09-22",
+          "validation_end": "2025-11-02",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1817,
+              "actual_negative_windows": 136775,
+              "precision": 0.0,
+              "recall": 0.0,
+              "f1": 0.0,
+              "false_positive_rate": 7.3112776457685984e-06,
+              "average_precision": 0.05092288071766147,
+              "roc_auc": 0.6120001484788911,
+              "brier_score": 0.012812071217737503,
+              "true_positive": 0,
+              "false_positive": 1,
+              "false_negative": 1817,
+              "true_negative": 136774
+            },
+            "timing": {
+              "samples": 1817,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.697704621291686,
+              "rmse_days": 0.8324214004364204,
+              "within_one_day": 0.9873417721518988
+            }
+          },
+          "ece": 0.00619084393336035,
+          "recall_at_fpr": {
+            "0.02": 0.1728123280132086,
+            "0.05": 0.259768849752339
+          }
+        }
+      ],
+      "mean_average_precision": 0.11319699288611662,
+      "mean_brier": 0.016002468792150653,
+      "mean_recall_at_2pct_fpr": 0.2548608522757529
+    },
+    "land_cover": {
+      "features": [
+        "fire_3d",
+        "frp_3d",
+        "frp_max",
+        "fire_days_7d",
+        "fire_yesterday",
+        "frp_trend",
+        "bright_mean",
+        "confidence_mean",
+        "weather_rain_past_3d",
+        "weather_rain_past_7d",
+        "weather_temp_max_past_3d",
+        "weather_humidity_min_past_3d",
+        "weather_wind_max_past_3d",
+        "weather_rain_forecast_3d",
+        "weather_temp_max_forecast_3d",
+        "weather_humidity_min_forecast_3d",
+        "weather_wind_max_forecast_3d",
+        "land_tree_fraction",
+        "land_shrub_fraction",
+        "land_grass_fraction",
+        "land_crop_fraction",
+        "land_built_fraction",
+        "land_bare_fraction",
+        "land_snow_fraction",
+        "land_water_fraction",
+        "land_wetland_fraction",
+        "land_mangrove_fraction",
+        "land_moss_fraction"
+      ],
+      "blocks": [
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-06-27",
+          "validation_start": "2025-07-11",
+          "validation_end": "2025-08-11",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 3259,
+              "actual_negative_windows": 135333,
+              "precision": 0.5211267605633803,
+              "recall": 0.011353175820803928,
+              "f1": 0.022222222222222223,
+              "false_positive_rate": 0.00025123214589198496,
+              "average_precision": 0.1843078638039201,
+              "roc_auc": 0.8266512783519652,
+              "brier_score": 0.021011983115299726,
+              "true_positive": 37,
+              "false_positive": 34,
+              "false_negative": 3222,
+              "true_negative": 135299
+            },
+            "timing": {
+              "samples": 3259,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6835365529444793,
+              "rmse_days": 0.8429795722341458,
+              "within_one_day": 0.9742252224608776
+            }
+          },
+          "ece": 0.004572266092608974,
+          "recall_at_fpr": {
+            "0.02": 0.26879410862227676,
+            "0.05": 0.39367904265111997
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-08-08",
+          "validation_start": "2025-08-12",
+          "validation_end": "2025-09-21",
+          "metrics": {
+            "samples": 134261,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1844,
+              "actual_negative_windows": 132417,
+              "precision": 0.21739130434782608,
+              "recall": 0.005422993492407809,
+              "f1": 0.010582010582010581,
+              "false_positive_rate": 0.0002718684156868076,
+              "average_precision": 0.11357467502593714,
+              "roc_auc": 0.8091170014951616,
+              "brier_score": 0.012902072929175662,
+              "true_positive": 10,
+              "false_positive": 36,
+              "false_negative": 1834,
+              "true_negative": 132381
+            },
+            "timing": {
+              "samples": 1844,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6533967744921004,
+              "rmse_days": 0.8058211388905925,
+              "within_one_day": 1.0
+            }
+          },
+          "ece": 0.008937704082145673,
+          "recall_at_fpr": {
+            "0.02": 0.2727765726681128,
+            "0.05": 0.40455531453362253
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-09-18",
+          "validation_start": "2025-09-22",
+          "validation_end": "2025-11-02",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1817,
+              "actual_negative_windows": 136775,
+              "precision": 0.4166666666666667,
+              "recall": 0.00275178866263071,
+              "f1": 0.005467468562055768,
+              "false_positive_rate": 5.117894352038018e-05,
+              "average_precision": 0.08610463269317964,
+              "roc_auc": 0.7601435597733665,
+              "brier_score": 0.012808528424628395,
+              "true_positive": 5,
+              "false_positive": 7,
+              "false_negative": 1812,
+              "true_negative": 136768
+            },
+            "timing": {
+              "samples": 1817,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6830986121044281,
+              "rmse_days": 0.821010810726584,
+              "within_one_day": 0.9983489268024216
+            }
+          },
+          "ece": 0.013352755738462098,
+          "recall_at_fpr": {
+            "0.02": 0.2058337919647771,
+            "0.05": 0.2988442487616951
+          }
+        }
+      ],
+      "mean_average_precision": 0.1279957238410123,
+      "mean_brier": 0.015574194823034593,
+      "mean_recall_at_2pct_fpr": 0.24913482441838888
+    },
+    "terrain": {
+      "features": [
+        "fire_3d",
+        "frp_3d",
+        "frp_max",
+        "fire_days_7d",
+        "fire_yesterday",
+        "frp_trend",
+        "bright_mean",
+        "confidence_mean",
+        "weather_rain_past_3d",
+        "weather_rain_past_7d",
+        "weather_temp_max_past_3d",
+        "weather_humidity_min_past_3d",
+        "weather_wind_max_past_3d",
+        "weather_rain_forecast_3d",
+        "weather_temp_max_forecast_3d",
+        "weather_humidity_min_forecast_3d",
+        "weather_wind_max_forecast_3d",
+        "terrain_elevation_mean_m",
+        "terrain_elevation_sd_m",
+        "terrain_slope_mean_deg"
+      ],
+      "blocks": [
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-06-27",
+          "validation_start": "2025-07-11",
+          "validation_end": "2025-08-11",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 3259,
+              "actual_negative_windows": 135333,
+              "precision": 0.6904761904761905,
+              "recall": 0.008898435102792267,
+              "f1": 0.017570433202059983,
+              "false_positive_rate": 9.60593498998766e-05,
+              "average_precision": 0.23468112803736035,
+              "roc_auc": 0.8638278350176278,
+              "brier_score": 0.020630462584612118,
+              "true_positive": 29,
+              "false_positive": 13,
+              "false_negative": 3230,
+              "true_negative": 135320
+            },
+            "timing": {
+              "samples": 3259,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6955681646020813,
+              "rmse_days": 0.8305953398021481,
+              "within_one_day": 0.9901810371279534
+            }
+          },
+          "ece": 0.004198515220194742,
+          "recall_at_fpr": {
+            "0.02": 0.3163547100337527,
+            "0.05": 0.45259281988339983
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-08-08",
+          "validation_start": "2025-08-12",
+          "validation_end": "2025-09-21",
+          "metrics": {
+            "samples": 134261,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1844,
+              "actual_negative_windows": 132417,
+              "precision": 0.3230769230769231,
+              "recall": 0.0113882863340564,
+              "f1": 0.022001047668936617,
+              "false_positive_rate": 0.0003322836191727648,
+              "average_precision": 0.1299427412790095,
+              "roc_auc": 0.8464281443963334,
+              "brier_score": 0.012722009085035933,
+              "true_positive": 21,
+              "false_positive": 44,
+              "false_negative": 1823,
+              "true_negative": 132373
+            },
+            "timing": {
+              "samples": 1844,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6544785226731241,
+              "rmse_days": 0.8072370516845135,
+              "within_one_day": 0.9989154013015185
+            }
+          },
+          "ece": 0.007543748564113593,
+          "recall_at_fpr": {
+            "0.02": 0.28524945770065074,
+            "0.05": 0.4121475054229935
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-09-18",
+          "validation_start": "2025-09-22",
+          "validation_end": "2025-11-02",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1817,
+              "actual_negative_windows": 136775,
+              "precision": 0.0,
+              "recall": 0.0,
+              "f1": 0.0,
+              "false_positive_rate": 7.3112776457685984e-06,
+              "average_precision": 0.06870074660041037,
+              "roc_auc": 0.7786924522324998,
+              "brier_score": 0.012882587623271477,
+              "true_positive": 0,
+              "false_positive": 1,
+              "false_negative": 1817,
+              "true_negative": 136774
+            },
+            "timing": {
+              "samples": 1817,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6815078335107225,
+              "rmse_days": 0.8222389236911127,
+              "within_one_day": 0.9988992845349477
+            }
+          },
+          "ece": 0.012954923049708555,
+          "recall_at_fpr": {
+            "0.02": 0.18657127132636214,
+            "0.05": 0.3037974683544304
+          }
+        }
+      ],
+      "mean_average_precision": 0.14444153863892675,
+      "mean_brier": 0.015411686430973176,
+      "mean_recall_at_2pct_fpr": 0.2627251463535885
+    },
+    "drying": {
+      "features": [
+        "fire_3d",
+        "frp_3d",
+        "frp_max",
+        "fire_days_7d",
+        "fire_yesterday",
+        "frp_trend",
+        "bright_mean",
+        "confidence_mean",
+        "weather_rain_past_3d",
+        "weather_rain_past_7d",
+        "weather_temp_max_past_3d",
+        "weather_humidity_min_past_3d",
+        "weather_wind_max_past_3d",
+        "weather_rain_forecast_3d",
+        "weather_temp_max_forecast_3d",
+        "weather_humidity_min_forecast_3d",
+        "weather_wind_max_forecast_3d",
+        "weather_vpd_mean_past_7d",
+        "weather_vpd_max_forecast_3d",
+        "weather_rain_past_30d",
+        "weather_dry_days_past_30d"
+      ],
+      "blocks": [
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-06-27",
+          "validation_start": "2025-07-11",
+          "validation_end": "2025-08-11",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 3259,
+              "actual_negative_windows": 135333,
+              "precision": 0.5,
+              "recall": 0.001841055538508745,
+              "f1": 0.0036686028737389176,
+              "false_positive_rate": 4.4335084569173816e-05,
+              "average_precision": 0.1493068608086366,
+              "roc_auc": 0.8063712318927689,
+              "brier_score": 0.021539876109555253,
+              "true_positive": 6,
+              "false_positive": 6,
+              "false_negative": 3253,
+              "true_negative": 135327
+            },
+            "timing": {
+              "samples": 3259,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6871480472625491,
+              "rmse_days": 0.8369411290667386,
+              "within_one_day": 0.9858852408714329
+            }
+          },
+          "ece": 0.0043316114456191405,
+          "recall_at_fpr": {
+            "0.02": 0.21847192390303774,
+            "0.05": 0.3347652654188401
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-08-08",
+          "validation_start": "2025-08-12",
+          "validation_end": "2025-09-21",
+          "metrics": {
+            "samples": 134261,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1844,
+              "actual_negative_windows": 132417,
+              "precision": 0.8,
+              "recall": 0.0021691973969631237,
+              "f1": 0.004326663061114116,
+              "false_positive_rate": 7.551900435744655e-06,
+              "average_precision": 0.128157215048144,
+              "roc_auc": 0.7881133152667631,
+              "brier_score": 0.012871886407539423,
+              "true_positive": 4,
+              "false_positive": 1,
+              "false_negative": 1840,
+              "true_negative": 132416
+            },
+            "timing": {
+              "samples": 1844,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6560389949844303,
+              "rmse_days": 0.8150328768144168,
+              "within_one_day": 0.9907809110629068
+            }
+          },
+          "ece": 0.011791740778795915,
+          "recall_at_fpr": {
+            "0.02": 0.2928416485900217,
+            "0.05": 0.40563991323210413
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-09-18",
+          "validation_start": "2025-09-22",
+          "validation_end": "2025-11-02",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1817,
+              "actual_negative_windows": 136775,
+              "precision": 0.0,
+              "recall": 0.0,
+              "f1": 0.0,
+              "false_positive_rate": 7.3112776457685984e-06,
+              "average_precision": 0.06377264449967406,
+              "roc_auc": 0.67853078930111,
+              "brier_score": 0.01273924882933952,
+              "true_positive": 0,
+              "false_positive": 1,
+              "false_negative": 1817,
+              "true_negative": 136774
+            },
+            "timing": {
+              "samples": 1817,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.6797493924552034,
+              "rmse_days": 0.8219246139227113,
+              "within_one_day": 0.9966978536048432
+            }
+          },
+          "ece": 0.0077537232180171535,
+          "recall_at_fpr": {
+            "0.02": 0.18051733626857458,
+            "0.05": 0.2845349477160154
+          }
+        }
+      ],
+      "mean_average_precision": 0.11374557345215154,
+      "mean_brier": 0.015717003782144735,
+      "mean_recall_at_2pct_fpr": 0.23061030292054466
+    },
+    "all_context": {
+      "features": [
+        "fire_3d",
+        "frp_3d",
+        "frp_max",
+        "fire_days_7d",
+        "fire_yesterday",
+        "frp_trend",
+        "bright_mean",
+        "confidence_mean",
+        "weather_rain_past_3d",
+        "weather_rain_past_7d",
+        "weather_temp_max_past_3d",
+        "weather_humidity_min_past_3d",
+        "weather_wind_max_past_3d",
+        "weather_rain_forecast_3d",
+        "weather_temp_max_forecast_3d",
+        "weather_humidity_min_forecast_3d",
+        "weather_wind_max_forecast_3d",
+        "low_confidence_fraction_7d",
+        "night_fraction_7d",
+        "daynight_known_fraction_7d",
+        "season_sin",
+        "season_cos",
+        "land_tree_fraction",
+        "land_shrub_fraction",
+        "land_grass_fraction",
+        "land_crop_fraction",
+        "land_built_fraction",
+        "land_bare_fraction",
+        "land_snow_fraction",
+        "land_water_fraction",
+        "land_wetland_fraction",
+        "land_mangrove_fraction",
+        "land_moss_fraction",
+        "terrain_elevation_mean_m",
+        "terrain_elevation_sd_m",
+        "terrain_slope_mean_deg",
+        "weather_vpd_mean_past_7d",
+        "weather_vpd_max_forecast_3d",
+        "weather_rain_past_30d",
+        "weather_dry_days_past_30d"
+      ],
+      "blocks": [
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-06-27",
+          "validation_start": "2025-07-11",
+          "validation_end": "2025-08-11",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 3259,
+              "actual_negative_windows": 135333,
+              "precision": 0.1951219512195122,
+              "recall": 0.00245474071801166,
+              "f1": 0.0048484848484848485,
+              "false_positive_rate": 0.000243842965130456,
+              "average_precision": 0.10777301794303412,
+              "roc_auc": 0.8307312205178291,
+              "brier_score": 0.022096141249404868,
+              "true_positive": 8,
+              "false_positive": 33,
+              "false_negative": 3251,
+              "true_negative": 135300
+            },
+            "timing": {
+              "samples": 3259,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.7000585955029895,
+              "rmse_days": 0.8232362064774922,
+              "within_one_day": 0.996624731512734
+            }
+          },
+          "ece": 0.005978539647596573,
+          "recall_at_fpr": {
+            "0.02": 0.1552623504142375,
+            "0.05": 0.31297944154648666
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-08-08",
+          "validation_start": "2025-08-12",
+          "validation_end": "2025-09-21",
+          "metrics": {
+            "samples": 134261,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1844,
+              "actual_negative_windows": 132417,
+              "precision": 0.2329136690647482,
+              "recall": 0.2809110629067245,
+              "f1": 0.25467059980334317,
+              "false_positive_rate": 0.012883542143380382,
+              "average_precision": 0.1515181162840585,
+              "roc_auc": 0.8814971079907182,
+              "brier_score": 0.01761807106108806,
+              "true_positive": 518,
+              "false_positive": 1706,
+              "false_negative": 1326,
+              "true_negative": 130711
+            },
+            "timing": {
+              "samples": 1844,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.8204290712991263,
+              "rmse_days": 0.9592062039574879,
+              "within_one_day": 0.8226681127982647
+            }
+          },
+          "ece": 0.0333128603175794,
+          "recall_at_fpr": {
+            "0.02": 0.35900216919739697,
+            "0.05": 0.5227765726681128
+          }
+        },
+        {
+          "fit_start": "2025-03-02",
+          "fit_end": "2025-09-18",
+          "validation_start": "2025-09-22",
+          "validation_end": "2025-11-02",
+          "metrics": {
+            "samples": 138592,
+            "classification": {
+              "threshold": 0.5,
+              "actual_positive_windows": 1817,
+              "actual_negative_windows": 136775,
+              "precision": 0.0,
+              "recall": 0.0,
+              "f1": 0.0,
+              "false_positive_rate": 4.3867665874611586e-05,
+              "average_precision": 0.06549472605635386,
+              "roc_auc": 0.7677354242970414,
+              "brier_score": 0.01274404378907765,
+              "true_positive": 0,
+              "false_positive": 6,
+              "false_negative": 1817,
+              "true_negative": 136769
+            },
+            "timing": {
+              "samples": 1817,
+              "scope": "All windows with a recorded future detection, including classifier misses",
+              "mae_days": 0.7220922047742985,
+              "rmse_days": 0.8529846590339192,
+              "within_one_day": 0.9867914144193726
+            }
+          },
+          "ece": 0.006966121340246239,
+          "recall_at_fpr": {
+            "0.02": 0.17721518987341772,
+            "0.05": 0.2955421023665383
+          }
+        }
+      ],
+      "mean_average_precision": 0.10826195342781549,
+      "mean_brier": 0.01748608536652353,
+      "mean_recall_at_2pct_fpr": 0.2304932364950174
+    }
+  },
+  "note": "ROC budget points are descriptive validation metrics, not deployed thresholds; the display/model threshold is unchanged"
+}

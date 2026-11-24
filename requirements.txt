@@ -6,3 +6,6 @@ joblib
 lightgbm
 folium
 python-dotenv
+requests
+scikit-learn
+rasterio>=1.4,<2

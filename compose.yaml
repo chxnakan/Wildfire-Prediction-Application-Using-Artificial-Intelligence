@@ -1,0 +1,51 @@
+name: wildfire
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      PROJECT_ROOT: /app
+      DATA_DIR: /app/data
+      RAW_DIR: /app/data/raw
+      FIRMS_DIR: /app/data/firms
+      FIRMS_PATH: /app/data/firms/firms_all.csv
+      OUTPUT_DIR: /app/outputs
+      MODEL_DIR: /app/outputs/models
+      RISKMAP_DIR: /app/outputs/riskmap
+      REPORT_DIR: /app/outputs/reports
+      OMP_NUM_THREADS: "2"
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8000}:8000"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./outputs
+        target: /app/outputs
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 1g
+    pids_limit: 256
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/metadata', timeout=5).read(); urllib.request.urlopen('http://127.0.0.1:8000/geojson', timeout=5).read()"]
+      interval: 30s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
