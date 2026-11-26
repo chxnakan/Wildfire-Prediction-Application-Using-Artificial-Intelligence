@@ -230,22 +230,22 @@ const Reports = (() => {
     const m = App.meta();
     const stamp = m ? m.base_date : "snapshot";
     if (kind === "all") {
-      App.download(`firewatch_metrics_${stamp}.json`, JSON.stringify({ metadata: state.metadata, performance: state.performance, snapshot: m }, null, 2), "application/json");
+      App.download(`wildfire_prediction_metrics_${stamp}.json`, JSON.stringify({ metadata: state.metadata, performance: state.performance, snapshot: m }, null, 2), "application/json");
     } else if (kind === "metadata") {
-      App.download(`firewatch_dataset_info.json`, JSON.stringify(state.metadata, null, 2), "application/json");
+      App.download(`wildfire_prediction_dataset_info.json`, JSON.stringify(state.metadata, null, 2), "application/json");
     } else if (kind === "png") {
       const canvas = document.getElementById("rpUrgency");
-      if (canvas) chartPNG(canvas, `firewatch_${App.isCalibrated() ? "probability" : "score"}_${stamp}.png`);
+      if (canvas) chartPNG(canvas, `wildfire_prediction_${App.isCalibrated() ? "probability" : "score"}_${stamp}.png`);
     } else if (kind === "urgency-csv") {
       const c = urgencyCounts();
       const rows = ["HIGH", "MEDIUM", "LOW", "NONE"].map(k => ({ tier: k === "NONE" ? "below_threshold" : k, cells: c[k] }));
-      App.download(`firewatch_${App.isCalibrated() ? "probability" : "score"}_${stamp}.csv`, App.toCSV(rows, [{ key: "tier" }, { key: "cells" }]));
+      App.download(`wildfire_prediction_${App.isCalibrated() ? "probability" : "score"}_${stamp}.csv`, App.toCSV(rows, [{ key: "tier" }, { key: "cells" }]));
     } else if (kind === "features-csv") {
       const rows = (state.metadata && state.metadata.feature_importance) || [];
-      App.download("firewatch_feature_importance.csv", App.toCSV(rows, [{ key: "feature" }, { key: "gain_pct" }, { key: "splits" }]));
+      App.download("wildfire_prediction_feature_importance.csv", App.toCSV(rows, [{ key: "feature" }, { key: "gain_pct" }, { key: "splits" }]));
     } else if (kind === "province-csv") {
       const rows = provinceRows().map(r => ({ ...r, name_en: r.code === "OUT" ? "Outside Thailand" : Geo.name(r.code, "en"), name_th: r.code === "OUT" ? "" : Geo.name(r.code, "th") }));
-      App.download(`firewatch_provinces_${stamp}.csv`, App.toCSV(rows, [
+      App.download(`wildfire_prediction_provinces_${stamp}.csv`, App.toCSV(rows, [
         { key: "code" }, { key: "name_en" }, { key: "name_th" }, { key: "HIGH" }, { key: "MEDIUM" }, { key: "LOW" }, { key: "total" }]));
     }
   }

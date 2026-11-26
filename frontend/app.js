@@ -1,5 +1,5 @@
 // =====================================================================
-// FireWatch Thailand — core: shared state, data loading, routing,
+// Wildfire Prediction — core: shared state, data loading, routing,
 // theme and language switching, and small helpers used by every view.
 // =====================================================================
 

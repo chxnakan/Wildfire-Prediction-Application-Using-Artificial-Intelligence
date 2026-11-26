@@ -448,7 +448,7 @@ const MapView = (() => {
       { label: "model_version", value: () => m.model_version },
       { label: "kind", value: () => m.kind },
     ]);
-    App.download(`firewatch_forecast_${m.base_date}_${m.model_version.slice(0, 6)}${state.province ? "_" + state.province : ""}.csv`, csv);
+    App.download(`wildfire_prediction_forecast_${m.base_date}_${m.model_version.slice(0, 6)}${state.province ? "_" + state.province : ""}.csv`, csv);
   }
 
   async function share() {
