@@ -4,9 +4,10 @@ const RoadBasemap = (() => {
   const attribution = '<a href="https://openfreemap.org/">OpenFreeMap</a> · © <a href="https://openmaptiles.org/">OpenMapTiles</a> · © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>';
 
   function labelExpression(lang) {
-    const fields = lang === "th"
-      ? ["name:th", "name_th", "name", "name:en", "name_en"]
-      : ["name:en", "name_en", "name:latin", "name"];
+    const fields = {
+      th: ["name:th", "name_th", "name", "name:en", "name_en"],
+      zh: ["name:zh-Hant", "name:zh", "name_zh", "name:en", "name_en", "name:latin", "name"],
+    }[lang] || ["name:en", "name_en", "name:latin", "name"];
     // Empty translations should fall through just like missing translations.
     return ["case", ...fields.flatMap(field => [
       ["all", ["has", field], ["!=", ["get", field], ""]],
@@ -56,7 +57,7 @@ const RoadBasemap = (() => {
       }
     },
     setLanguage(lang) {
-      this.lang = lang === "th" ? "th" : "en";
+      this.lang = ["th", "zh"].includes(lang) ? lang : "en";
       if (!this.ready || !this.vector) return;
       const gl = this.vector.getMaplibreMap();
       for (const layer of gl.getStyle().layers) {

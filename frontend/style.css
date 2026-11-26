@@ -38,7 +38,7 @@
   --map-bg: #0b0e13;
   --legend-bg: rgba(14, 17, 23, 0.94);
   --chart-grid: rgba(255, 255, 255, 0.07);
-  --font: "Inter", "Noto Sans Thai", "Segoe UI", Roboto, system-ui, -apple-system, sans-serif;
+  --font: "Inter", "Noto Sans Thai", "Noto Sans TC", "Segoe UI", Roboto, system-ui, -apple-system, sans-serif;
   --mono: "JetBrains Mono", "Noto Sans Thai", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color-scheme: dark;
   --safe-top: env(safe-area-inset-top, 0px);

@@ -103,7 +103,7 @@ const Live = (() => {
         </div>
         <div class="head-right">
           <div class="head-actions">${pillHTML()}<button type="button" class="btn sm" id="liveRefresh">↻ ${t("live.refresh")}</button></div>
-          <div class="head-note">${fetchedAt ? t("live.updated", { time: fetchedAt.toLocaleTimeString(state.lang === "th" ? "th-TH" : "en-GB") }) : t("common.loading")}</div>
+          <div class="head-note">${fetchedAt ? t("live.updated", { time: fetchedAt.toLocaleTimeString({ th: "th-TH", zh: "zh-TW" }[state.lang] || "en-GB") }) : t("common.loading")}</div>
         </div>
       </div>
       <div class="details-panel" ${detailsOpen ? "" : "hidden"}>

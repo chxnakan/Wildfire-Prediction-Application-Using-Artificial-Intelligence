@@ -43,7 +43,7 @@ const App = (() => {
   const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
   function esc(value) { return String(value ?? "").replace(/[&<>"']/g, c => ESC[c]); }
 
-  function locale() { return state.lang === "th" ? "th-TH" : "en-GB"; }
+  function locale() { return { th: "th-TH", zh: "zh-TW" }[state.lang] || "en-GB"; }
   function num(value, digits = 0) {
     if (value === null || value === undefined || Number.isNaN(value)) return "—";
     return Number(value).toLocaleString(locale(), { minimumFractionDigits: digits, maximumFractionDigits: digits });
@@ -337,11 +337,12 @@ const App = (() => {
     try { localStorage.setItem("fw.theme", theme); } catch (e) { /* storage unavailable */ }
     emit("theme");
   }
+  const LANGS = ["en", "th", "zh"];  // toggle order: EN → ไทย → 中文
   function setLang(lang) {
     state.lang = lang;
     I18N.setLang(lang);
-    document.documentElement.lang = lang;
-    document.getElementById("langToggle").textContent = lang === "th" ? "TH" : "EN";
+    document.documentElement.lang = lang === "zh" ? "zh-Hant-TW" : lang;
+    document.getElementById("langToggle").textContent = { th: "TH", zh: "中文" }[lang] || "EN";
     try { localStorage.setItem("fw.lang", lang); } catch (e) { /* storage unavailable */ }
     I18N.apply(document);
     emit("lang");
@@ -369,7 +370,7 @@ const App = (() => {
   async function start() {
     let lang = "en";
     try { lang = localStorage.getItem("fw.lang") || "en"; } catch (e) { /* storage unavailable */ }
-    setLang(lang === "th" ? "th" : "en");
+    setLang(LANGS.includes(lang) ? lang : "en");
     setTheme(state.theme === "light" ? "light" : "dark");
 
     const { view, params } = parseHash();
@@ -379,7 +380,7 @@ const App = (() => {
     const requested = params.get("snapshot") || "";
 
     document.getElementById("themeToggle").addEventListener("click", () => setTheme(state.theme === "dark" ? "light" : "dark"));
-    document.getElementById("langToggle").addEventListener("click", () => setLang(state.lang === "en" ? "th" : "en"));
+    document.getElementById("langToggle").addEventListener("click", () => setLang(LANGS[(LANGS.indexOf(state.lang) + 1) % LANGS.length]));
     document.getElementById("livePill").addEventListener("click", () => go("live"));
     document.getElementById("sidebarToggle").addEventListener("click", () => {
       document.body.classList.toggle("sidebar-collapsed");
