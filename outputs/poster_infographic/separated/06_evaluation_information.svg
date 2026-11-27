@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="1078.272pt" height="89.352pt" viewBox="0 0 1078.272 89.352" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.11.2, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 89.352 
+L 1078.272 89.352 
+L 1078.272 -0 
+L 0 -0 
+z
+" style="fill: #c6d8fa"/>
+  </g>
+  <g id="patch_2">
+   <path d="M 25.344 79.56 
+L 1052.928 79.56 
+Q 1069.056 79.56 1069.056 62.424 
+L 1069.056 26.928 
+Q 1069.056 9.792 1052.928 9.792 
+L 25.344 9.792 
+Q 9.216 9.792 9.216 26.928 
+L 9.216 62.424 
+Q 9.216 79.56 25.344 79.56 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="text_1">
+   <text style="font-weight: 700; font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #536477" x="34.56" y="34.272" transform="rotate(-0 34.56 34.272)">FORECAST HORIZON</text>
+  </g>
+  <g id="text_2">
+   <text style="font-weight: 600; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #343b7c" x="34.56" y="61.2" transform="rotate(-0 34.56 61.2)">72 hours (days 1–3)</text>
+  </g>
+  <g id="text_3">
+   <text style="font-weight: 700; font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #536477" x="377.856" y="34.272" transform="rotate(-0 377.856 34.272)">HISTORICAL TEST PERIOD</text>
+  </g>
+  <g id="text_4">
+   <text style="font-weight: 600; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #343b7c" x="377.856" y="61.2" transform="rotate(-0 377.856 61.2)">6 Nov 2025 – 14 Jan 2026</text>
+  </g>
+  <g id="text_5">
+   <text style="font-weight: 700; font-size: 10.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #536477" x="821.376" y="34.272" transform="rotate(-0 821.376 34.272)">ALERT THRESHOLD</text>
+  </g>
+  <g id="text_6">
+   <text style="font-weight: 600; font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #343b7c" x="821.376" y="61.2" transform="rotate(-0 821.376 61.2)">0.50</text>
+  </g>
+ </g>
+</svg>

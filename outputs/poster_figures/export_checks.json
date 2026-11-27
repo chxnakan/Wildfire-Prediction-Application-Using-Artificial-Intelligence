@@ -1,0 +1,15 @@
+{
+  "figures_verified": [
+    "01_observed_daily_activity.png",
+    "02_calibration_and_scores.png",
+    "03_model_discrimination.png",
+    "01_observed_daily_activity.svg",
+    "02_calibration_and_scores.svg",
+    "03_model_discrimination.svg"
+  ],
+  "portable_reproduction": "All six figure exports reproduced byte-for-byte from bundled evidence.",
+  "png_resolution": "4200 x 2100 pixels, nominal 300 DPI",
+  "aspect_ratio": "2:1",
+  "source_artifacts_unchanged": true,
+  "visual_inspection": "All three PNGs reviewed for readable labels, unclipped legends, shared axes, and preserved baselines."
+}

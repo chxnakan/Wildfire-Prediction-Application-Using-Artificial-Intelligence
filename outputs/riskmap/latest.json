@@ -1,15 +1,15 @@
 {
   "schema_version": 4,
-  "issued_at": "2026-11-22T01:36:10.587267+00:00",
-  "base_date": "2026-01-18",
-  "feature_cutoff": "2026-01-17",
+  "issued_at": "2026-11-27T01:48:21.123761+00:00",
+  "base_date": "2026-11-27",
+  "feature_cutoff": "2026-11-26",
   "horizon_days": 3,
-  "model_version": "98bfd2a97aab",
-  "training_labels_through": "2026-01-17",
+  "model_version": "85f660f39f07",
+  "training_labels_through": "2026-11-26",
   "grid_size": 0.1,
   "threshold": 0.5,
-  "prospective": false,
-  "kind": "historical_demo",
+  "prospective": true,
+  "kind": "prospective",
   "calibrated": true,
   "weather": {
     "provider": "Open-Meteo Previous Runs API",
@@ -24,7 +24,7 @@
     "spatial_method": "Nearest configured weather sampling point; no claim of local station resolution",
     "sampling_grid_degrees": 0.5,
     "locations": 228,
-    "complete_rows": 1351272,
+    "complete_rows": 2598600,
     "missing_rows": 0
   },
   "features": [
@@ -74,5 +74,5 @@
     "selected": "terrain",
     "note": "ROC budget points are descriptive validation metrics, not deployed thresholds; the display/model threshold is unchanged"
   },
-  "snapshot": "2026-01-18_98bfd2a97aab.json"
+  "snapshot": "2026-11-27_85f660f39f07.json"
 }

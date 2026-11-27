@@ -1,0 +1,62 @@
+{
+  "model_version": "98bfd2a97aab",
+  "horizon_days": 3,
+  "samples": 259860,
+  "split": {
+    "method": "chronological holdout with 3-day label purge",
+    "train_start": "2025-03-02",
+    "train_end": "2025-11-02",
+    "training_labels_through": "2025-11-05",
+    "test_start": "2025-11-06",
+    "test_end": "2026-01-14",
+    "train_rows": 909510,
+    "test_rows": 259860
+  },
+  "metrics_recomputed": {
+    "roc_auc": 0.7800356902498424,
+    "average_precision": 0.36246609981070177,
+    "recall": 0.38422906139947943,
+    "precision": 0.3941259619915188,
+    "false_positive_rate": 0.0848924979643934,
+    "brier_score": 0.11296180699685965,
+    "true_positive": 12547,
+    "false_positive": 19288,
+    "false_negative": 20108,
+    "true_negative": 207917
+  },
+  "prevalence": 0.12566381897945048,
+  "threshold": 0.5,
+  "positive_median": 0.40260094581300004,
+  "negative_median": 0.1058967738722785,
+  "calibration_bins": 10,
+  "histogram_bins": 40,
+  "activity_missing_dates": [
+    "2025-06-27",
+    "2025-07-03",
+    "2025-08-30",
+    "2025-09-27",
+    "2025-11-18"
+  ],
+  "activity_total_eligible_detections": 281891,
+  "activity_scope": "Unique satellite/time/pixel detections in cells whose 0.1-degree centres lie inside the project Thailand boundary. Known type 1/2/3 detections excluded; unknown types retained.",
+  "data_are_actual": true,
+  "mockups_used": false,
+  "poster_reference_available": false,
+  "new_downloads_used": false,
+  "canvas_inches": [
+    14,
+    7
+  ],
+  "png_dpi": 300,
+  "png_dimensions": [
+    4200,
+    2100
+  ],
+  "software": {
+    "python": "3.14.10",
+    "matplotlib": "3.11.2",
+    "pandas": "3.1.1",
+    "numpy": "2.5.5",
+    "scikit_learn": "1.9.1"
+  }
+}

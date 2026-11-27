@@ -1,0 +1,53 @@
+<section id="wildfire-three-day-performance" data-viz-composition>
+  <div data-viz-container></div>
+  <script type="application/json" data-viz-chart>
+    {
+      "charts": [
+        {
+          "id": "hotspots-captured",
+          "title": "How many hotspots did the forecast catch?",
+          "description": "32,655 test windows contained a recorded hotspot. The model flagged 12,547 and missed 20,108 at the 50% alert threshold.",
+          "height": 200,
+          "spec": {
+            "type": "horizontalStackedBar",
+            "y": "Population",
+            "x": ["Caught", "Missed"],
+            "xLabel": "Share of windows with a recorded hotspot",
+            "xDomain": [0, 1],
+            "showValues": true,
+            "showLegend": true,
+            "valueFormat": {"style": "percent", "maximumFractionDigits": 1},
+            "colors": {"Caught": "var(--chart-1)", "Missed": "var(--chart-2)"}
+          },
+          "columns": ["Population", "Caught", "Missed"],
+          "rows": [["Recorded hotspots", 0.38422906139947943, 0.6157709386005206]]
+        },
+        {
+          "id": "alerts-confirmed",
+          "title": "How often was an alert followed by a hotspot?",
+          "description": "31,835 test windows were flagged. A hotspot was recorded in 12,547; no hotspot was recorded in 19,288 within the three-day target window.",
+          "height": 200,
+          "spec": {
+            "type": "horizontalStackedBar",
+            "y": "Population",
+            "x": ["Hotspot recorded", "No hotspot recorded"],
+            "xLabel": "Share of windows flagged by the model",
+            "xDomain": [0, 1],
+            "showValues": true,
+            "showLegend": true,
+            "valueFormat": {"style": "percent", "maximumFractionDigits": 1},
+            "colors": {"Hotspot recorded": "var(--chart-1)", "No hotspot recorded": "var(--chart-2)"}
+          },
+          "columns": ["Population", "Hotspot recorded", "No hotspot recorded"],
+          "rows": [["Model alerts", 0.3941259619915188, 0.6058740380084813]]
+        }
+      ]
+    }
+  </script>
+</section>
+<script type="module">
+  import { mountChart } from "https://persistent.oaistatic.com/plugins/visualize/charts/1.2.3/element.js";
+  const root = document.getElementById("wildfire-three-day-performance");
+  const config = JSON.parse(root.querySelector("[data-viz-chart]").textContent);
+  mountChart(root.querySelector("[data-viz-container]"), config);
+</script>

@@ -1,0 +1,10 @@
+Existing data indexed
+fire_archive_J1V-C2_852088.csv 1273977 2018-04-01 2026-07-30 invalid {'key_or_coordinates': 0, 'future_timestamp': 0, 'confidence': 0, 'daynight': 0, 'frp': 0, 'brightness': 0, 'bright_t31': 0, 'scan': 0, 'track': 0, 'type': 0}
+fire_nrt_J1V-C2_852088.csv 2155 2026-08-01 2026-11-16 invalid {'key_or_coordinates': 0, 'future_timestamp': 0, 'confidence': 0, 'daynight': 0, 'frp': 0, 'brightness': 0, 'bright_t31': 0, 'scan': 0, 'track': 0, 'type': 0}
+fire_archive_J2V-C2_852089.csv 511080 2023-03-01 2026-07-31 invalid {'key_or_coordinates': 0, 'future_timestamp': 0, 'confidence': 0, 'daynight': 0, 'frp': 0, 'brightness': 0, 'bright_t31': 0, 'scan': 0, 'track': 0, 'type': 0}
+fire_nrt_J2V-C2_852089.csv 2059 2026-08-01 2026-11-16 invalid {'key_or_coordinates': 0, 'future_timestamp': 0, 'confidence': 0, 'daynight': 0, 'frp': 0, 'brightness': 0, 'bright_t31': 0, 'scan': 0, 'track': 0, 'type': 0}
+fire_archive_M-C61_852087.csv 692761 2000-11-18 2026-08-31 invalid {'key_or_coordinates': 0, 'future_timestamp': 0, 'confidence': 0, 'daynight': 0, 'frp': 0, 'brightness': 0, 'bright_t31': 0, 'scan': 0, 'track': 0, 'type': 0}
+fire_nrt_M-C61_852087.csv 357 2026-09-02 2026-11-17 invalid {'key_or_coordinates': 0, 'future_timestamp': 0, 'confidence': 0, 'daynight': 0, 'frp': 0, 'brightness': 0, 'bright_t31': 0, 'scan': 0, 'track': 0, 'type': 0}
+fire_archive_SV-C2_852090.csv 2437813 2012-01-20 2026-07-31 invalid {'key_or_coordinates': 0, 'future_timestamp': 0, 'confidence': 0, 'daynight': 0, 'frp': 0, 'brightness': 0, 'bright_t31': 0, 'scan': 0, 'track': 0, 'type': 0}
+fire_nrt_SV-C2_852090.csv 1416 2026-08-01 2026-11-01 invalid {'key_or_coordinates': 0, 'future_timestamp': 0, 'confidence': 0, 'daynight': 0, 'frp': 0, 'brightness': 0, 'bright_t31': 0, 'scan': 0, 'track': 0, 'type': 0}
+SAVED /home/xsmax/wildfire project/wild fire/outputs/data_quality/20261122_downloads/results.json

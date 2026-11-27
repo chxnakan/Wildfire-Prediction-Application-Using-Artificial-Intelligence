@@ -106,6 +106,74 @@ class WeatherCache:
             temporary.unlink(missing_ok=True)
         return record
 
+    def _cached_segments(self):
+        """Archived spans of earlier downloads, keyed by location.
+
+        Values for the two days before a download may still be filling in, so
+        only dates earlier than that are trusted for reuse.
+        """
+        with self._lock:
+            if getattr(self, "_segments", None) is None:
+                segments = {}
+                for path in self.directory.glob("*.json.gz"):
+                    try:
+                        with gzip.open(path, "rt") as handle:
+                            record = json.load(handle)
+                        request = record["request"]
+                        downloaded = pd.Timestamp(record["downloaded_at"]).tz_convert(None).normalize()
+                    except (OSError, ValueError, KeyError, TypeError):
+                        continue
+                    if (request.get("hourly") != ",".join(HOURLY) or request.get("models") != MODEL
+                            or request.get("timezone") != "GMT" or request.get("wind_speed_unit") != "ms"):
+                        continue
+                    start = pd.Timestamp(request["start_date"])
+                    trusted = min(pd.Timestamp(request["end_date"]), downloaded - pd.Timedelta(days=2))
+                    if trusted >= start:
+                        key = (float(request["latitude"]), float(request["longitude"]))
+                        segments.setdefault(key, []).append((start, trusted, path))
+                self._segments = segments
+            return self._segments
+
+    def fetch_range(self, latitude, longitude, start, end):
+        """Like fetch, but reuses archived spans of earlier downloads and only
+        requests the missing tail, so a longer window does not re-download history."""
+        start, end = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+        params = dict(latitude=float(latitude), longitude=float(longitude),
+                      start_date=str(start.date()), end_date=str(end.date()),
+                      hourly=",".join(HOURLY), models=MODEL, timezone="GMT", wind_speed_unit="ms")
+        key = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
+        if (self.directory / f"{key}.json.gz").exists():
+            return self.fetch(latitude, longitude, start, end)
+        available = self._cached_segments().get((float(latitude), float(longitude)), [])
+        parts, cursor = [], start
+        while cursor <= end:
+            usable = [segment for segment in available if segment[0] <= cursor and segment[1] >= cursor]
+            if not usable:
+                break
+            _, trusted, path = max(usable, key=lambda segment: segment[1])
+            with gzip.open(path, "rt") as handle:
+                record = json.load(handle)
+            stop = min(trusted, end)
+            parts.append((cursor, stop, record))
+            cursor = stop + pd.Timedelta(days=1)
+        if not parts:
+            return self.fetch(latitude, longitude, start, end)
+        if cursor <= end:
+            parts.append((cursor, end, self.fetch(latitude, longitude, cursor, end)))
+        hourly = {}
+        for first, last, record in parts:
+            frame = pd.DataFrame(record["response"]["hourly"])
+            day = frame.time.str[:10]
+            frame = frame[(day >= str(first.date())) & (day <= str(last.date()))]
+            for column in ["time"] + HOURLY:
+                hourly.setdefault(column, []).extend(frame[column].tolist())
+        response = {**parts[-1][2]["response"], "hourly": hourly}
+        digest = hashlib.sha256("".join(record["sha256"] for _, _, record in parts).encode()).hexdigest()
+        return {"request": params, "endpoint": ENDPOINT, "downloaded_at": max(record["downloaded_at"] for _, _, record in parts),
+                "sha256": digest, "response": response,
+                "composed_from": [{"start_date": str(first.date()), "end_date": str(last.date()), "sha256": record["sha256"]}
+                                  for first, last, record in parts]}
+
 
 def hourly_to_features(record):
     """One row per prediction date; incomplete weather stays missing, never zero."""
@@ -167,7 +235,7 @@ def attach_weather(panel, grid_size, cache_dir, weather_grid=.5, min_interval=3.
     cache = WeatherCache(cache_dir, min_interval)
     def download(location):
         lat, lon = location
-        record = cache.fetch(lat, lon, start, end)
+        record = cache.fetch_range(lat, lon, start, end)
         result = hourly_to_features(record)
         result["weather_lat"], result["weather_lon"] = lat, lon
         return result, {"latitude": lat, "longitude": lon, "sha256": record["sha256"], "request": record["request"]}

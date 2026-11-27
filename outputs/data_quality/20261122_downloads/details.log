@@ -1,0 +1,146 @@
+{
+  "duplicate_detail": {
+    "member": "fire_archive_SV-C2_852090.csv",
+    "repeated_key_rows": 4,
+    "extra_rows_by_observation_key": 2,
+    "extra_rows_exact_all_columns": 0,
+    "rows": [
+      {
+        "latitude": 16.27689,
+        "longitude": 100.48756,
+        "brightness": 338.58,
+        "scan": 0.67,
+        "track": 0.73,
+        "acq_date": "2015-01-28",
+        "acq_time": "0732",
+        "satellite": "SNPP",
+        "instrument": "SNPP",
+        "confidence": "n",
+        "version": 2,
+        "bright_t31": 305.82,
+        "frp": 4.58,
+        "daynight": "D",
+        "type": 0
+      },
+      {
+        "latitude": 16.27689,
+        "longitude": 100.48756,
+        "brightness": 339.69,
+        "scan": 0.67,
+        "track": 0.73,
+        "acq_date": "2015-01-28",
+        "acq_time": "0732",
+        "satellite": "SNPP",
+        "instrument": "SNPP",
+        "confidence": "n",
+        "version": 2,
+        "bright_t31": 306.19,
+        "frp": 8.66,
+        "daynight": "D",
+        "type": 0
+      },
+      {
+        "latitude": 17.71286,
+        "longitude": 102.74377,
+        "brightness": 367.0,
+        "scan": 0.44,
+        "track": 0.63,
+        "acq_date": "2019-02-03",
+        "acq_time": "0539",
+        "satellite": "SNPP",
+        "instrument": "SNPP",
+        "confidence": "h",
+        "version": 2,
+        "bright_t31": 298.64,
+        "frp": 10.73,
+        "daynight": "D",
+        "type": 0
+      },
+      {
+        "latitude": 17.71286,
+        "longitude": 102.74377,
+        "brightness": 367.0,
+        "scan": 0.44,
+        "track": 0.63,
+        "acq_date": "2019-02-03",
+        "acq_time": "0539",
+        "satellite": "SNPP",
+        "instrument": "SNPP",
+        "confidence": "h",
+        "version": 2,
+        "bright_t31": 298.55,
+        "frp": 10.82,
+        "daynight": "D",
+        "type": 0
+      }
+    ]
+  },
+  "outside_project_country_polygon_rows": 51400,
+  "outside_project_thailand_grid_rows": 89206,
+  "known_nonvegetation_rows": 46904,
+  "untyped_nrt_rows": 5987,
+  "old_missing_days_still_without_new_viirs": [
+    "2025-06-27",
+    "2025-07-03",
+    "2025-08-30",
+    "2025-09-27",
+    "2025-11-18"
+  ],
+  "latest_viirs_daily_counts": {
+    "2026-11-01": 116,
+    "2026-11-02": 83,
+    "2026-11-03": 99,
+    "2026-11-04": 120,
+    "2026-11-05": 81,
+    "2026-11-06": 37,
+    "2026-11-07": 31,
+    "2026-11-08": 17,
+    "2026-11-09": 35,
+    "2026-11-10": 51,
+    "2026-11-11": 15,
+    "2026-11-12": 32,
+    "2026-11-13": 43,
+    "2026-11-14": 66,
+    "2026-11-15": 183,
+    "2026-11-16": 129
+  },
+  "archive_summary": [
+    {
+      "archive": "/home/xsmax/Downloads/DL_FIRE_J1V-C2_852088.zip",
+      "rows": 1276132,
+      "first": "2018-04-01",
+      "last": "2026-11-16"
+    },
+    {
+      "archive": "/home/xsmax/Downloads/DL_FIRE_J2V-C2_852089.zip",
+      "rows": 513139,
+      "first": "2023-03-01",
+      "last": "2026-11-16"
+    },
+    {
+      "archive": "/home/xsmax/Downloads/DL_FIRE_M-C61_852087.zip",
+      "rows": 693118,
+      "first": "2000-11-18",
+      "last": "2026-11-17"
+    },
+    {
+      "archive": "/home/xsmax/Downloads/DL_FIRE_SV-C2_852090.zip",
+      "rows": 2439229,
+      "first": "2012-01-20",
+      "last": "2026-11-01"
+    }
+  ],
+  "code_compatibility": {
+    "brightness_column_supported": true,
+    "satellite_names_supported": true,
+    "nrt_missing_type_supported": true,
+    "static_context_rejects_dates_before": "2023-01-01",
+    "weather_cache_for_published_model_ends": "2026-01-21",
+    "direct_import_or_retraining_performed": false
+  },
+  "reference_urls": [
+    "https://firms.modaps.eosdis.nasa.gov/download/",
+    "https://firms.modaps.eosdis.nasa.gov/content/active_fire/",
+    "https://open-meteo.com/en/docs/previous-runs-api"
+  ]
+}

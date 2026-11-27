@@ -27,3 +27,7 @@ outputs/three_day_build/
 *.key
 
 .hosting-preview/
+
+# Full-history FIRMS archives (2000-2026, up to 188 MB) exceed GitHub limits;
+# data/train_window/ holds the trimmed copies used for training.
+data/raw/fire_archive_*_8520*.csv

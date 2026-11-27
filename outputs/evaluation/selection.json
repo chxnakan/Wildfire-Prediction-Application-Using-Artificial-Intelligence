@@ -28,119 +28,119 @@
       "blocks": [
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-06-27",
-          "validation_start": "2025-07-11",
-          "validation_end": "2025-08-11",
+          "fit_end": "2025-12-07",
+          "validation_start": "2025-12-11",
+          "validation_end": "2026-02-13",
           "metrics": {
-            "samples": 138592,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 3259,
-              "actual_negative_windows": 135333,
-              "precision": 0.6923076923076923,
-              "recall": 0.005523166615526235,
-              "f1": 0.010958904109589041,
-              "false_positive_rate": 5.911344609223175e-05,
-              "average_precision": 0.1943248267283561,
-              "roc_auc": 0.8224442100811249,
-              "brier_score": 0.021086094525612286,
-              "true_positive": 18,
-              "false_positive": 8,
-              "false_negative": 3241,
-              "true_negative": 135325
+              "actual_positive_windows": 55622,
+              "actual_negative_windows": 225893,
+              "precision": 0.5285239888977002,
+              "recall": 0.38342742080471753,
+              "f1": 0.44443286723487613,
+              "false_positive_rate": 0.08422129061104151,
+              "average_precision": 0.4784129124176057,
+              "roc_auc": 0.7525868943387262,
+              "brier_score": 0.14043451428565445,
+              "true_positive": 21327,
+              "false_positive": 19025,
+              "false_negative": 34295,
+              "true_negative": 206868
             },
             "timing": {
-              "samples": 3259,
+              "samples": 55622,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6852814678316349,
-              "rmse_days": 0.8373459848313926,
-              "within_one_day": 0.989260509358699
+              "mae_days": 0.6640532484442712,
+              "rmse_days": 0.8328413242162338,
+              "within_one_day": 0.9741289417856244
             }
           },
-          "ece": 0.007709258242005055,
+          "ece": 0.07700351831740414,
           "recall_at_fpr": {
-            "0.02": 0.2681804234427739,
-            "0.05": 0.38815587603559376
+            "0.02": 0.17343856747330194,
+            "0.05": 0.29263600733522704
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-08-08",
-          "validation_start": "2025-08-12",
-          "validation_end": "2025-09-21",
+          "fit_end": "2026-02-10",
+          "validation_start": "2026-02-14",
+          "validation_end": "2026-04-19",
           "metrics": {
-            "samples": 134261,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1844,
-              "actual_negative_windows": 132417,
-              "precision": 0.6666666666666666,
-              "recall": 0.0010845986984815619,
-              "f1": 0.002165674066053059,
-              "false_positive_rate": 7.551900435744655e-06,
-              "average_precision": 0.12117550510233228,
-              "roc_auc": 0.7692973253150825,
-              "brier_score": 0.012841793487178422,
-              "true_positive": 2,
-              "false_positive": 1,
-              "false_negative": 1842,
-              "true_negative": 132416
+              "actual_positive_windows": 100427,
+              "actual_negative_windows": 181088,
+              "precision": 0.8006773659700573,
+              "recall": 0.41431089248907166,
+              "f1": 0.5460618269868038,
+              "false_positive_rate": 0.05719871001943806,
+              "average_precision": 0.7305473245170766,
+              "roc_auc": 0.810706678043818,
+              "brier_score": 0.16822592937311823,
+              "true_positive": 41608,
+              "false_positive": 10358,
+              "false_negative": 58819,
+              "true_negative": 170730
             },
             "timing": {
-              "samples": 1844,
+              "samples": 100427,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6587376356310582,
-              "rmse_days": 0.8116647596538464,
-              "within_one_day": 0.9972885032537961
+              "mae_days": 0.5558376191381631,
+              "rmse_days": 0.7922710760023053,
+              "within_one_day": 0.9392792774851385
             }
           },
-          "ece": 0.008182065483469622,
+          "ece": 0.05247855179317531,
           "recall_at_fpr": {
-            "0.02": 0.2738611713665944,
-            "0.05": 0.3882863340563991
+            "0.02": 0.2577593675007717,
+            "0.05": 0.3912792376552122
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-09-18",
-          "validation_start": "2025-09-22",
-          "validation_end": "2025-11-02",
+          "fit_end": "2026-04-16",
+          "validation_start": "2026-04-20",
+          "validation_end": "2026-06-24",
           "metrics": {
-            "samples": 138592,
+            "samples": 285846,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1817,
-              "actual_negative_windows": 136775,
-              "precision": null,
-              "recall": 0.0,
-              "f1": 0.0,
-              "false_positive_rate": 0.0,
-              "average_precision": 0.05953597322446279,
-              "roc_auc": 0.6599781526791537,
-              "brier_score": 0.012870172310103742,
-              "true_positive": 0,
-              "false_positive": 0,
-              "false_negative": 1817,
-              "true_negative": 136775
+              "actual_positive_windows": 25502,
+              "actual_negative_windows": 260344,
+              "precision": 0.5335528657885369,
+              "recall": 0.2350796015998745,
+              "f1": 0.32636507158800154,
+              "false_positive_rate": 0.020131057370248593,
+              "average_precision": 0.38247786846541354,
+              "roc_auc": 0.8203400911732783,
+              "brier_score": 0.06824236985478244,
+              "true_positive": 5995,
+              "false_positive": 5241,
+              "false_negative": 19507,
+              "true_negative": 255103
             },
             "timing": {
-              "samples": 1817,
+              "samples": 25502,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6811807503256158,
-              "rmse_days": 0.8227716834614861,
-              "within_one_day": 0.9966978536048432
+              "mae_days": 0.6396882597453168,
+              "rmse_days": 0.8596596461266259,
+              "within_one_day": 0.9495725825425457
             }
           },
-          "ece": 0.010346496089846464,
+          "ece": 0.024503378860232305,
           "recall_at_fpr": {
-            "0.02": 0.170610897083104,
-            "0.05": 0.27077600440286187
+            "0.02": 0.23374637283350325,
+            "0.05": 0.3954983922829582
           }
         }
       ],
-      "mean_average_precision": 0.1250121016850504,
-      "mean_brier": 0.015599353440964817,
-      "mean_recall_at_2pct_fpr": 0.23755083063082405
+      "mean_average_precision": 0.5304793684666986,
+      "mean_brier": 0.12563427117118503,
+      "mean_recall_at_2pct_fpr": 0.22164810260252565
     },
     "quality_and_season": {
       "features": [
@@ -170,119 +170,119 @@
       "blocks": [
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-06-27",
-          "validation_start": "2025-07-11",
-          "validation_end": "2025-08-11",
+          "fit_end": "2025-12-07",
+          "validation_start": "2025-12-11",
+          "validation_end": "2026-02-13",
           "metrics": {
-            "samples": 138592,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 3259,
-              "actual_negative_windows": 135333,
-              "precision": 0.05,
-              "recall": 0.0003068425897514575,
-              "f1": 0.000609942055504727,
-              "false_positive_rate": 0.00014039443446905043,
-              "average_precision": 0.1640797702979527,
-              "roc_auc": 0.8174915079460323,
-              "brier_score": 0.02164172969280455,
-              "true_positive": 1,
-              "false_positive": 19,
-              "false_negative": 3258,
-              "true_negative": 135314
+              "actual_positive_windows": 55622,
+              "actual_negative_windows": 225893,
+              "precision": 0.5964676950592444,
+              "recall": 0.28779979144942647,
+              "f1": 0.3882609750181906,
+              "false_positive_rate": 0.04794305268423546,
+              "average_precision": 0.47840999852128163,
+              "roc_auc": 0.7484131119132734,
+              "brier_score": 0.1327998624126575,
+              "true_positive": 16008,
+              "false_positive": 10830,
+              "false_negative": 39614,
+              "true_negative": 215063
             },
             "timing": {
-              "samples": 3259,
+              "samples": 55622,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6951579224058951,
-              "rmse_days": 0.8464957910963442,
-              "within_one_day": 0.9585762503835532
+              "mae_days": 0.6689906882571872,
+              "rmse_days": 0.8100804046873937,
+              "within_one_day": 0.9853295458631477
             }
           },
-          "ece": 0.002587137985025027,
+          "ece": 0.014723263296607768,
           "recall_at_fpr": {
-            "0.02": 0.292420988033139,
-            "0.05": 0.4166922368824793
+            "0.02": 0.17579375067419367,
+            "0.05": 0.2946495990795009
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-08-08",
-          "validation_start": "2025-08-12",
-          "validation_end": "2025-09-21",
+          "fit_end": "2026-02-10",
+          "validation_start": "2026-02-14",
+          "validation_end": "2026-04-19",
           "metrics": {
-            "samples": 134261,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1844,
-              "actual_negative_windows": 132417,
-              "precision": 0.3053435114503817,
-              "recall": 0.08676789587852494,
-              "f1": 0.13513513513513514,
-              "false_positive_rate": 0.0027488917586110545,
-              "average_precision": 0.12458832764273564,
-              "roc_auc": 0.8044645762383761,
-              "brier_score": 0.013553605465909902,
-              "true_positive": 160,
-              "false_positive": 364,
-              "false_negative": 1684,
-              "true_negative": 132053
+              "actual_positive_windows": 100427,
+              "actual_negative_windows": 181088,
+              "precision": 0.5731588431656377,
+              "recall": 0.7727802284246268,
+              "f1": 0.658166229206508,
+              "false_positive_rate": 0.3191597455380809,
+              "average_precision": 0.7271301272220518,
+              "roc_auc": 0.8090675784448118,
+              "brier_score": 0.19120648543117152,
+              "true_positive": 77608,
+              "false_positive": 57796,
+              "false_negative": 22819,
+              "true_negative": 123292
             },
             "timing": {
-              "samples": 1844,
+              "samples": 100427,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.7767142290901773,
-              "rmse_days": 0.898085116990226,
-              "within_one_day": 0.9126898047722343
+              "mae_days": 0.5737029570963519,
+              "rmse_days": 0.7962115957259059,
+              "within_one_day": 0.9292520935604967
             }
           },
-          "ece": 0.010543855572836163,
+          "ece": 0.15430912389522758,
           "recall_at_fpr": {
-            "0.02": 0.2993492407809111,
-            "0.05": 0.4436008676789588
+            "0.02": 0.25601680822886275,
+            "0.05": 0.37915102512272597
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-09-18",
-          "validation_start": "2025-09-22",
-          "validation_end": "2025-11-02",
+          "fit_end": "2026-04-16",
+          "validation_start": "2026-04-20",
+          "validation_end": "2026-06-24",
           "metrics": {
-            "samples": 138592,
+            "samples": 285846,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1817,
-              "actual_negative_windows": 136775,
-              "precision": 0.0,
-              "recall": 0.0,
-              "f1": 0.0,
-              "false_positive_rate": 7.3112776457685984e-06,
-              "average_precision": 0.05092288071766147,
-              "roc_auc": 0.6120001484788911,
-              "brier_score": 0.012812071217737503,
-              "true_positive": 0,
-              "false_positive": 1,
-              "false_negative": 1817,
-              "true_negative": 136774
+              "actual_positive_windows": 25502,
+              "actual_negative_windows": 260344,
+              "precision": 0.4822997303644429,
+              "recall": 0.21743392675084308,
+              "f1": 0.29973783075218247,
+              "false_positive_rate": 0.022862059429063084,
+              "average_precision": 0.3629714700113953,
+              "roc_auc": 0.8186826697404367,
+              "brier_score": 0.06934582397123164,
+              "true_positive": 5545,
+              "false_positive": 5952,
+              "false_negative": 19957,
+              "true_negative": 254392
             },
             "timing": {
-              "samples": 1817,
+              "samples": 25502,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.697704621291686,
-              "rmse_days": 0.8324214004364204,
-              "within_one_day": 0.9873417721518988
+              "mae_days": 0.6430177439043757,
+              "rmse_days": 0.8678283750646686,
+              "within_one_day": 0.941690847776645
             }
           },
-          "ece": 0.00619084393336035,
+          "ece": 0.01445389394605075,
           "recall_at_fpr": {
-            "0.02": 0.1728123280132086,
-            "0.05": 0.259768849752339
+            "0.02": 0.19908242490785036,
+            "0.05": 0.3588346012077484
           }
         }
       ],
-      "mean_average_precision": 0.11319699288611662,
-      "mean_brier": 0.016002468792150653,
-      "mean_recall_at_2pct_fpr": 0.2548608522757529
+      "mean_average_precision": 0.5228371985849096,
+      "mean_brier": 0.13111739060502023,
+      "mean_recall_at_2pct_fpr": 0.21029766127030225
     },
     "land_cover": {
       "features": [
@@ -318,119 +318,119 @@
       "blocks": [
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-06-27",
-          "validation_start": "2025-07-11",
-          "validation_end": "2025-08-11",
+          "fit_end": "2025-12-07",
+          "validation_start": "2025-12-11",
+          "validation_end": "2026-02-13",
           "metrics": {
-            "samples": 138592,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 3259,
-              "actual_negative_windows": 135333,
-              "precision": 0.5211267605633803,
-              "recall": 0.011353175820803928,
-              "f1": 0.022222222222222223,
-              "false_positive_rate": 0.00025123214589198496,
-              "average_precision": 0.1843078638039201,
-              "roc_auc": 0.8266512783519652,
-              "brier_score": 0.021011983115299726,
-              "true_positive": 37,
-              "false_positive": 34,
-              "false_negative": 3222,
-              "true_negative": 135299
+              "actual_positive_windows": 55622,
+              "actual_negative_windows": 225893,
+              "precision": 0.5321965063365465,
+              "recall": 0.3910862608320449,
+              "f1": 0.4508580666556127,
+              "false_positive_rate": 0.08464627057943362,
+              "average_precision": 0.4896613905885818,
+              "roc_auc": 0.7734708924370162,
+              "brier_score": 0.13874683060072063,
+              "true_positive": 21753,
+              "false_positive": 19121,
+              "false_negative": 33869,
+              "true_negative": 206772
             },
             "timing": {
-              "samples": 3259,
+              "samples": 55622,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6835365529444793,
-              "rmse_days": 0.8429795722341458,
-              "within_one_day": 0.9742252224608776
+              "mae_days": 0.6726245294281918,
+              "rmse_days": 0.8149083866255444,
+              "within_one_day": 0.981769803315235
             }
           },
-          "ece": 0.004572266092608974,
+          "ece": 0.07826755150836154,
           "recall_at_fpr": {
-            "0.02": 0.26879410862227676,
-            "0.05": 0.39367904265111997
+            "0.02": 0.1753982237244256,
+            "0.05": 0.29802955665024633
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-08-08",
-          "validation_start": "2025-08-12",
-          "validation_end": "2025-09-21",
+          "fit_end": "2026-02-10",
+          "validation_start": "2026-02-14",
+          "validation_end": "2026-04-19",
           "metrics": {
-            "samples": 134261,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1844,
-              "actual_negative_windows": 132417,
-              "precision": 0.21739130434782608,
-              "recall": 0.005422993492407809,
-              "f1": 0.010582010582010581,
-              "false_positive_rate": 0.0002718684156868076,
-              "average_precision": 0.11357467502593714,
-              "roc_auc": 0.8091170014951616,
-              "brier_score": 0.012902072929175662,
-              "true_positive": 10,
-              "false_positive": 36,
-              "false_negative": 1834,
-              "true_negative": 132381
+              "actual_positive_windows": 100427,
+              "actual_negative_windows": 181088,
+              "precision": 0.8019547705269381,
+              "recall": 0.4322044868411881,
+              "f1": 0.5616916098892922,
+              "false_positive_rate": 0.059192215939211874,
+              "average_precision": 0.7403289791170693,
+              "roc_auc": 0.8194048550709763,
+              "brier_score": 0.16475499374571428,
+              "true_positive": 43405,
+              "false_positive": 10719,
+              "false_negative": 57022,
+              "true_negative": 170369
             },
             "timing": {
-              "samples": 1844,
+              "samples": 100427,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6533967744921004,
-              "rmse_days": 0.8058211388905925,
-              "within_one_day": 1.0
+              "mae_days": 0.561065679655105,
+              "rmse_days": 0.7790226763913644,
+              "within_one_day": 0.9478427116213767
             }
           },
-          "ece": 0.008937704082145673,
+          "ece": 0.04958669523394004,
           "recall_at_fpr": {
-            "0.02": 0.2727765726681128,
-            "0.05": 0.40455531453362253
+            "0.02": 0.2715604369342906,
+            "0.05": 0.402580979218736
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-09-18",
-          "validation_start": "2025-09-22",
-          "validation_end": "2025-11-02",
+          "fit_end": "2026-04-16",
+          "validation_start": "2026-04-20",
+          "validation_end": "2026-06-24",
           "metrics": {
-            "samples": 138592,
+            "samples": 285846,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1817,
-              "actual_negative_windows": 136775,
-              "precision": 0.4166666666666667,
-              "recall": 0.00275178866263071,
-              "f1": 0.005467468562055768,
-              "false_positive_rate": 5.117894352038018e-05,
-              "average_precision": 0.08610463269317964,
-              "roc_auc": 0.7601435597733665,
-              "brier_score": 0.012808528424628395,
-              "true_positive": 5,
-              "false_positive": 7,
-              "false_negative": 1812,
-              "true_negative": 136768
+              "actual_positive_windows": 25502,
+              "actual_negative_windows": 260344,
+              "precision": 0.5427774873671372,
+              "recall": 0.2442945651321465,
+              "f1": 0.33693888588426174,
+              "false_positive_rate": 0.020157944872937344,
+              "average_precision": 0.39532552210778193,
+              "roc_auc": 0.8301386907466309,
+              "brier_score": 0.06732130264735722,
+              "true_positive": 6230,
+              "false_positive": 5248,
+              "false_negative": 19272,
+              "true_negative": 255096
             },
             "timing": {
-              "samples": 1817,
+              "samples": 25502,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6830986121044281,
-              "rmse_days": 0.821010810726584,
-              "within_one_day": 0.9983489268024216
+              "mae_days": 0.6361461846139818,
+              "rmse_days": 0.8505576741116998,
+              "within_one_day": 0.9561603011528508
             }
           },
-          "ece": 0.013352755738462098,
+          "ece": 0.022902835682261237,
           "recall_at_fpr": {
-            "0.02": 0.2058337919647771,
-            "0.05": 0.2988442487616951
+            "0.02": 0.24331424986275585,
+            "0.05": 0.4056152458630696
           }
         }
       ],
-      "mean_average_precision": 0.1279957238410123,
-      "mean_brier": 0.015574194823034593,
-      "mean_recall_at_2pct_fpr": 0.24913482441838888
+      "mean_average_precision": 0.541771963937811,
+      "mean_brier": 0.12360770899793072,
+      "mean_recall_at_2pct_fpr": 0.230090970173824
     },
     "terrain": {
       "features": [
@@ -458,119 +458,119 @@
       "blocks": [
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-06-27",
-          "validation_start": "2025-07-11",
-          "validation_end": "2025-08-11",
+          "fit_end": "2025-12-07",
+          "validation_start": "2025-12-11",
+          "validation_end": "2026-02-13",
           "metrics": {
-            "samples": 138592,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 3259,
-              "actual_negative_windows": 135333,
-              "precision": 0.6904761904761905,
-              "recall": 0.008898435102792267,
-              "f1": 0.017570433202059983,
-              "false_positive_rate": 9.60593498998766e-05,
-              "average_precision": 0.23468112803736035,
-              "roc_auc": 0.8638278350176278,
-              "brier_score": 0.020630462584612118,
-              "true_positive": 29,
-              "false_positive": 13,
-              "false_negative": 3230,
-              "true_negative": 135320
+              "actual_positive_windows": 55622,
+              "actual_negative_windows": 225893,
+              "precision": 0.5309284619688162,
+              "recall": 0.392416669663083,
+              "f1": 0.4512834296465529,
+              "false_positive_rate": 0.08536785115076607,
+              "average_precision": 0.48579753104539697,
+              "roc_auc": 0.7665422887538293,
+              "brier_score": 0.1395274049948798,
+              "true_positive": 21827,
+              "false_positive": 19284,
+              "false_negative": 33795,
+              "true_negative": 206609
             },
             "timing": {
-              "samples": 3259,
+              "samples": 55622,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6955681646020813,
-              "rmse_days": 0.8305953398021481,
-              "within_one_day": 0.9901810371279534
+              "mae_days": 0.6735232704295383,
+              "rmse_days": 0.8246186520087214,
+              "within_one_day": 0.9867318686850527
             }
           },
-          "ece": 0.004198515220194742,
+          "ece": 0.07998879334764315,
           "recall_at_fpr": {
-            "0.02": 0.3163547100337527,
-            "0.05": 0.45259281988339983
+            "0.02": 0.17395994390708713,
+            "0.05": 0.296447448851174
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-08-08",
-          "validation_start": "2025-08-12",
-          "validation_end": "2025-09-21",
+          "fit_end": "2026-02-10",
+          "validation_start": "2026-02-14",
+          "validation_end": "2026-04-19",
           "metrics": {
-            "samples": 134261,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1844,
-              "actual_negative_windows": 132417,
-              "precision": 0.3230769230769231,
-              "recall": 0.0113882863340564,
-              "f1": 0.022001047668936617,
-              "false_positive_rate": 0.0003322836191727648,
-              "average_precision": 0.1299427412790095,
-              "roc_auc": 0.8464281443963334,
-              "brier_score": 0.012722009085035933,
-              "true_positive": 21,
-              "false_positive": 44,
-              "false_negative": 1823,
-              "true_negative": 132373
+              "actual_positive_windows": 100427,
+              "actual_negative_windows": 181088,
+              "precision": 0.8196985129354247,
+              "recall": 0.4006791002419668,
+              "f1": 0.538253175224222,
+              "false_positive_rate": 0.04887678918536844,
+              "average_precision": 0.7405593136040982,
+              "roc_auc": 0.8194705092731681,
+              "brier_score": 0.16703041904672877,
+              "true_positive": 40239,
+              "false_positive": 8851,
+              "false_negative": 60188,
+              "true_negative": 172237
             },
             "timing": {
-              "samples": 1844,
+              "samples": 100427,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6544785226731241,
-              "rmse_days": 0.8072370516845135,
-              "within_one_day": 0.9989154013015185
+              "mae_days": 0.5565224280639124,
+              "rmse_days": 0.7820978515814497,
+              "within_one_day": 0.9579694703615561
             }
           },
-          "ece": 0.007543748564113593,
+          "ece": 0.0612631543348269,
           "recall_at_fpr": {
-            "0.02": 0.28524945770065074,
-            "0.05": 0.4121475054229935
+            "0.02": 0.2707439234468818,
+            "0.05": 0.40448285819550517
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-09-18",
-          "validation_start": "2025-09-22",
-          "validation_end": "2025-11-02",
+          "fit_end": "2026-04-16",
+          "validation_start": "2026-04-20",
+          "validation_end": "2026-06-24",
           "metrics": {
-            "samples": 138592,
+            "samples": 285846,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1817,
-              "actual_negative_windows": 136775,
-              "precision": 0.0,
-              "recall": 0.0,
-              "f1": 0.0,
-              "false_positive_rate": 7.3112776457685984e-06,
-              "average_precision": 0.06870074660041037,
-              "roc_auc": 0.7786924522324998,
-              "brier_score": 0.012882587623271477,
-              "true_positive": 0,
-              "false_positive": 1,
-              "false_negative": 1817,
-              "true_negative": 136774
+              "actual_positive_windows": 25502,
+              "actual_negative_windows": 260344,
+              "precision": 0.5420841683366734,
+              "recall": 0.25456826915536035,
+              "f1": 0.3464432467047334,
+              "false_positive_rate": 0.021064437820729497,
+              "average_precision": 0.39929407001302125,
+              "roc_auc": 0.8291974465066692,
+              "brier_score": 0.06733891648358636,
+              "true_positive": 6492,
+              "false_positive": 5484,
+              "false_negative": 19010,
+              "true_negative": 254860
             },
             "timing": {
-              "samples": 1817,
+              "samples": 25502,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6815078335107225,
-              "rmse_days": 0.8222389236911127,
-              "within_one_day": 0.9988992845349477
+              "mae_days": 0.6375357815083347,
+              "rmse_days": 0.8469066470414874,
+              "within_one_day": 0.9592580974041252
             }
           },
-          "ece": 0.012954923049708555,
+          "ece": 0.02351904442273303,
           "recall_at_fpr": {
-            "0.02": 0.18657127132636214,
-            "0.05": 0.3037974683544304
+            "0.02": 0.24735314877264528,
+            "0.05": 0.4070661124617677
           }
         }
       ],
-      "mean_average_precision": 0.14444153863892675,
-      "mean_brier": 0.015411686430973176,
-      "mean_recall_at_2pct_fpr": 0.2627251463535885
+      "mean_average_precision": 0.5418836382208388,
+      "mean_brier": 0.12463224684173164,
+      "mean_recall_at_2pct_fpr": 0.23068567204220472
     },
     "drying": {
       "features": [
@@ -599,119 +599,119 @@
       "blocks": [
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-06-27",
-          "validation_start": "2025-07-11",
-          "validation_end": "2025-08-11",
+          "fit_end": "2025-12-07",
+          "validation_start": "2025-12-11",
+          "validation_end": "2026-02-13",
           "metrics": {
-            "samples": 138592,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 3259,
-              "actual_negative_windows": 135333,
-              "precision": 0.5,
-              "recall": 0.001841055538508745,
-              "f1": 0.0036686028737389176,
-              "false_positive_rate": 4.4335084569173816e-05,
-              "average_precision": 0.1493068608086366,
-              "roc_auc": 0.8063712318927689,
-              "brier_score": 0.021539876109555253,
-              "true_positive": 6,
-              "false_positive": 6,
-              "false_negative": 3253,
-              "true_negative": 135327
+              "actual_positive_windows": 55622,
+              "actual_negative_windows": 225893,
+              "precision": 0.48892141318046917,
+              "recall": 0.432418827082809,
+              "f1": 0.4589375667836971,
+              "false_positive_rate": 0.11130048297202658,
+              "average_precision": 0.4699254746759365,
+              "roc_auc": 0.7464233628709169,
+              "brier_score": 0.15022722920322776,
+              "true_positive": 24052,
+              "false_positive": 25142,
+              "false_negative": 31570,
+              "true_negative": 200751
             },
             "timing": {
-              "samples": 3259,
+              "samples": 55622,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6871480472625491,
-              "rmse_days": 0.8369411290667386,
-              "within_one_day": 0.9858852408714329
+              "mae_days": 0.6711148065871625,
+              "rmse_days": 0.8200775776799959,
+              "within_one_day": 0.9831181906439898
             }
           },
-          "ece": 0.0043316114456191405,
+          "ece": 0.11247249603530377,
           "recall_at_fpr": {
-            "0.02": 0.21847192390303774,
-            "0.05": 0.3347652654188401
+            "0.02": 0.16860235158750134,
+            "0.05": 0.286828952572723
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-08-08",
-          "validation_start": "2025-08-12",
-          "validation_end": "2025-09-21",
+          "fit_end": "2026-02-10",
+          "validation_start": "2026-02-14",
+          "validation_end": "2026-04-19",
           "metrics": {
-            "samples": 134261,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1844,
-              "actual_negative_windows": 132417,
-              "precision": 0.8,
-              "recall": 0.0021691973969631237,
-              "f1": 0.004326663061114116,
-              "false_positive_rate": 7.551900435744655e-06,
-              "average_precision": 0.128157215048144,
-              "roc_auc": 0.7881133152667631,
-              "brier_score": 0.012871886407539423,
-              "true_positive": 4,
-              "false_positive": 1,
-              "false_negative": 1840,
-              "true_negative": 132416
+              "actual_positive_windows": 100427,
+              "actual_negative_windows": 181088,
+              "precision": 0.7843604782707068,
+              "recall": 0.44875382118354623,
+              "f1": 0.5708874870157837,
+              "false_positive_rate": 0.06841977381162749,
+              "average_precision": 0.7329920482068799,
+              "roc_auc": 0.8133668956618062,
+              "brier_score": 0.16593651174915067,
+              "true_positive": 45067,
+              "false_positive": 12390,
+              "false_negative": 55360,
+              "true_negative": 168698
             },
             "timing": {
-              "samples": 1844,
+              "samples": 100427,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6560389949844303,
-              "rmse_days": 0.8150328768144168,
-              "within_one_day": 0.9907809110629068
+              "mae_days": 0.5573504217210561,
+              "rmse_days": 0.8079403886201239,
+              "within_one_day": 0.941629243131827
             }
           },
-          "ece": 0.011791740778795915,
+          "ece": 0.04510095529824127,
           "recall_at_fpr": {
-            "0.02": 0.2928416485900217,
-            "0.05": 0.40563991323210413
+            "0.02": 0.26073665448534755,
+            "0.05": 0.39510291057185815
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-09-18",
-          "validation_start": "2025-09-22",
-          "validation_end": "2025-11-02",
+          "fit_end": "2026-04-16",
+          "validation_start": "2026-04-20",
+          "validation_end": "2026-06-24",
           "metrics": {
-            "samples": 138592,
+            "samples": 285846,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1817,
-              "actual_negative_windows": 136775,
-              "precision": 0.0,
-              "recall": 0.0,
-              "f1": 0.0,
-              "false_positive_rate": 7.3112776457685984e-06,
-              "average_precision": 0.06377264449967406,
-              "roc_auc": 0.67853078930111,
-              "brier_score": 0.01273924882933952,
-              "true_positive": 0,
-              "false_positive": 1,
-              "false_negative": 1817,
-              "true_negative": 136774
+              "actual_positive_windows": 25502,
+              "actual_negative_windows": 260344,
+              "precision": 0.5360144600090375,
+              "recall": 0.2325699945102345,
+              "f1": 0.32439084420379033,
+              "false_positive_rate": 0.01972006268629198,
+              "average_precision": 0.38582680839361405,
+              "roc_auc": 0.8206662802120466,
+              "brier_score": 0.06790432048202401,
+              "true_positive": 5931,
+              "false_positive": 5134,
+              "false_negative": 19571,
+              "true_negative": 255210
             },
             "timing": {
-              "samples": 1817,
+              "samples": 25502,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.6797493924552034,
-              "rmse_days": 0.8219246139227113,
-              "within_one_day": 0.9966978536048432
+              "mae_days": 0.6395557211208965,
+              "rmse_days": 0.8610012378143539,
+              "within_one_day": 0.9481609285546232
             }
           },
-          "ece": 0.0077537232180171535,
+          "ece": 0.022438808028919118,
           "recall_at_fpr": {
-            "0.02": 0.18051733626857458,
-            "0.05": 0.2845349477160154
+            "0.02": 0.23468747549211827,
+            "0.05": 0.3960081562230413
           }
         }
       ],
-      "mean_average_precision": 0.11374557345215154,
-      "mean_brier": 0.015717003782144735,
-      "mean_recall_at_2pct_fpr": 0.23061030292054466
+      "mean_average_precision": 0.5295814437588101,
+      "mean_brier": 0.1280226871448008,
+      "mean_recall_at_2pct_fpr": 0.22134216052165576
     },
     "all_context": {
       "features": [
@@ -759,119 +759,119 @@
       "blocks": [
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-06-27",
-          "validation_start": "2025-07-11",
-          "validation_end": "2025-08-11",
+          "fit_end": "2025-12-07",
+          "validation_start": "2025-12-11",
+          "validation_end": "2026-02-13",
           "metrics": {
-            "samples": 138592,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 3259,
-              "actual_negative_windows": 135333,
-              "precision": 0.1951219512195122,
-              "recall": 0.00245474071801166,
-              "f1": 0.0048484848484848485,
-              "false_positive_rate": 0.000243842965130456,
-              "average_precision": 0.10777301794303412,
-              "roc_auc": 0.8307312205178291,
-              "brier_score": 0.022096141249404868,
-              "true_positive": 8,
-              "false_positive": 33,
-              "false_negative": 3251,
-              "true_negative": 135300
+              "actual_positive_windows": 55622,
+              "actual_negative_windows": 225893,
+              "precision": 0.5462742609339468,
+              "recall": 0.3714177843299414,
+              "f1": 0.4421875,
+              "false_positive_rate": 0.07596074247541978,
+              "average_precision": 0.4890578427241388,
+              "roc_auc": 0.7720327246405705,
+              "brier_score": 0.13486753968664392,
+              "true_positive": 20659,
+              "false_positive": 17159,
+              "false_negative": 34963,
+              "true_negative": 208734
             },
             "timing": {
-              "samples": 3259,
+              "samples": 55622,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.7000585955029895,
-              "rmse_days": 0.8232362064774922,
-              "within_one_day": 0.996624731512734
+              "mae_days": 0.672305904355703,
+              "rmse_days": 0.8158886348675896,
+              "within_one_day": 0.9866779331919024
             }
           },
-          "ece": 0.005978539647596573,
+          "ece": 0.05324846726900444,
           "recall_at_fpr": {
-            "0.02": 0.1552623504142375,
-            "0.05": 0.31297944154648666
+            "0.02": 0.1762791701125454,
+            "0.05": 0.2969508467872425
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-08-08",
-          "validation_start": "2025-08-12",
-          "validation_end": "2025-09-21",
+          "fit_end": "2026-02-10",
+          "validation_start": "2026-02-14",
+          "validation_end": "2026-04-19",
           "metrics": {
-            "samples": 134261,
+            "samples": 281515,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1844,
-              "actual_negative_windows": 132417,
-              "precision": 0.2329136690647482,
-              "recall": 0.2809110629067245,
-              "f1": 0.25467059980334317,
-              "false_positive_rate": 0.012883542143380382,
-              "average_precision": 0.1515181162840585,
-              "roc_auc": 0.8814971079907182,
-              "brier_score": 0.01761807106108806,
-              "true_positive": 518,
-              "false_positive": 1706,
-              "false_negative": 1326,
-              "true_negative": 130711
+              "actual_positive_windows": 100427,
+              "actual_negative_windows": 181088,
+              "precision": 0.5735040682563002,
+              "recall": 0.8085375446841985,
+              "f1": 0.6710356140836573,
+              "false_positive_rate": 0.33345666195440893,
+              "average_precision": 0.7474970943247736,
+              "roc_auc": 0.8273690898035999,
+              "brier_score": 0.18431486877255837,
+              "true_positive": 81199,
+              "false_positive": 60385,
+              "false_negative": 19228,
+              "true_negative": 120703
             },
             "timing": {
-              "samples": 1844,
+              "samples": 100427,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.8204290712991263,
-              "rmse_days": 0.9592062039574879,
-              "within_one_day": 0.8226681127982647
+              "mae_days": 0.5631480888642107,
+              "rmse_days": 0.801450087668424,
+              "within_one_day": 0.9478427116213767
             }
           },
-          "ece": 0.0333128603175794,
+          "ece": 0.14990036835893242,
           "recall_at_fpr": {
-            "0.02": 0.35900216919739697,
-            "0.05": 0.5227765726681128
+            "0.02": 0.27735569119858206,
+            "0.05": 0.40648431198781204
           }
         },
         {
           "fit_start": "2025-03-02",
-          "fit_end": "2025-09-18",
-          "validation_start": "2025-09-22",
-          "validation_end": "2025-11-02",
+          "fit_end": "2026-04-16",
+          "validation_start": "2026-04-20",
+          "validation_end": "2026-06-24",
           "metrics": {
-            "samples": 138592,
+            "samples": 285846,
             "classification": {
               "threshold": 0.5,
-              "actual_positive_windows": 1817,
-              "actual_negative_windows": 136775,
-              "precision": 0.0,
-              "recall": 0.0,
-              "f1": 0.0,
-              "false_positive_rate": 4.3867665874611586e-05,
-              "average_precision": 0.06549472605635386,
-              "roc_auc": 0.7677354242970414,
-              "brier_score": 0.01274404378907765,
-              "true_positive": 0,
-              "false_positive": 6,
-              "false_negative": 1817,
-              "true_negative": 136769
+              "actual_positive_windows": 25502,
+              "actual_negative_windows": 260344,
+              "precision": 0.523044356778601,
+              "recall": 0.2131597521762999,
+              "f1": 0.30288340994567486,
+              "false_positive_rate": 0.01904019297544787,
+              "average_precision": 0.3851931986512557,
+              "roc_auc": 0.8356766056613409,
+              "brier_score": 0.06722939049492839,
+              "true_positive": 5436,
+              "false_positive": 4957,
+              "false_negative": 20066,
+              "true_negative": 255387
             },
             "timing": {
-              "samples": 1817,
+              "samples": 25502,
               "scope": "All windows with a recorded future detection, including classifier misses",
-              "mae_days": 0.7220922047742985,
-              "rmse_days": 0.8529846590339192,
-              "within_one_day": 0.9867914144193726
+              "mae_days": 0.6390591669290723,
+              "rmse_days": 0.8595724100904014,
+              "within_one_day": 0.94765116461454
             }
           },
-          "ece": 0.006966121340246239,
+          "ece": 0.013218730604243532,
           "recall_at_fpr": {
-            "0.02": 0.17721518987341772,
-            "0.05": 0.2955421023665383
+            "0.02": 0.22037487255901497,
+            "0.05": 0.3859305152537056
           }
         }
       ],
-      "mean_average_precision": 0.10826195342781549,
-      "mean_brier": 0.01748608536652353,
-      "mean_recall_at_2pct_fpr": 0.2304932364950174
+      "mean_average_precision": 0.540582711900056,
+      "mean_brier": 0.12880393298471024,
+      "mean_recall_at_2pct_fpr": 0.22466991129004746
     }
   },
   "note": "ROC budget points are descriptive validation metrics, not deployed thresholds; the display/model threshold is unchanged"

@@ -1,0 +1,8 @@
+metric,value,definition
+ROC-AUC,0.7800356902498424,Risk ranking; not classification accuracy
+Recall,0.38422906139947943,TP / (TP + FN)
+Precision,0.3941259619915188,TP / (TP + FP)
+False positive rate,0.0848924979643934,FP / (FP + TN)
+Average precision,0.36246609981070177,Scikit-learn average_precision_score; not trapezoidal PR area
+Event prevalence,0.12566381897945048,Positive grid-day windows / all grid-day windows
+Threshold,0.5,Alert if probability >= threshold

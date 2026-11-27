@@ -68,6 +68,34 @@ class WeatherTests(unittest.TestCase):
             self.assertEqual(first["request"]["wind_speed_unit"], "ms")
             self.assertEqual(len(first["sha256"]), 64)
 
+    def test_cache_reuses_archived_history_and_fetches_only_missing_tail(self):
+        import gzip, json
+        from pathlib import Path
+        history = weather_record()["response"]
+        params = dict(latitude=13.5, longitude=101.0, start_date="2025-01-01", end_date="2025-01-20",
+                      hourly=",".join(HOURLY), models="gfs_seamless", timezone="GMT", wind_speed_unit="ms")
+        old = {"request": params, "downloaded_at": "2025-01-15T00:00:00+00:00", "sha256": "a" * 64, "response": history}
+        times = pd.date_range("2025-01-13", "2025-01-25 23:00", freq="h")
+        tail = {"time": times.strftime("%Y-%m-%dT%H:%M").tolist()}
+        for name in ["temperature_2m", "relative_humidity_2m", "precipitation", "wind_speed_10m"]:
+            tail[name] = [100.] * len(times)
+            tail[name + "_previous_day5"] = [100.] * len(times)
+        response = Mock(status_code=200, content=b"tail")
+        response.json.return_value = {"hourly": tail}
+        with tempfile.TemporaryDirectory() as directory, patch("src.weather_features.requests.get", return_value=response) as get:
+            with gzip.open(Path(directory) / "old.json.gz", "wt") as handle:
+                json.dump(old, handle)
+            record = WeatherCache(directory, min_interval=0).fetch_range(13.5, 101, "2025-01-01", "2025-01-25")
+            # Downloaded on the 15th: only dates up to the 13th are trusted.
+            self.assertEqual(get.call_args.kwargs["params"]["start_date"], "2025-01-14")
+            hourly = pd.DataFrame(record["response"]["hourly"]).set_index("time")
+            self.assertFalse(hourly.index.has_duplicates)
+            self.assertEqual(len(hourly), 25 * 24)
+            self.assertEqual(hourly.loc["2025-01-13T23:00", HOURLY[0]], 13.)
+            self.assertEqual(hourly.loc["2025-01-14T00:00", HOURLY[0]], 100.)
+            self.assertEqual(record["request"]["end_date"], "2025-01-25")
+            self.assertEqual(len(record["composed_from"]), 2)
+
     def test_rate_limit_stops_subsequent_requests(self):
         with tempfile.TemporaryDirectory() as directory, patch("src.weather_features.requests.get", return_value=Mock(status_code=429)) as get:
             cache = WeatherCache(directory, min_interval=0)

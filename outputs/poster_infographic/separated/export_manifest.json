@@ -1,0 +1,128 @@
+[
+  {
+    "name": "01_overall_performance",
+    "figure_bounds": [
+      0.04,
+      0.585,
+      0.445,
+      0.275
+    ],
+    "size_inches": [
+      7.376,
+      4.947000000000001
+    ],
+    "dpi": 300
+  },
+  {
+    "name": "02_confusion_matrix",
+    "figure_bounds": [
+      0.515,
+      0.585,
+      0.445,
+      0.275
+    ],
+    "size_inches": [
+      7.376,
+      4.947000000000001
+    ],
+    "dpi": 300
+  },
+  {
+    "name": "03_roc_curve",
+    "figure_bounds": [
+      0.04,
+      0.27,
+      0.445,
+      0.29
+    ],
+    "size_inches": [
+      7.376,
+      5.202
+    ],
+    "dpi": 300
+  },
+  {
+    "name": "04_precision_recall_curve",
+    "figure_bounds": [
+      0.515,
+      0.27,
+      0.445,
+      0.29
+    ],
+    "size_inches": [
+      7.376,
+      5.202
+    ],
+    "dpi": 300
+  },
+  {
+    "name": "05_key_results",
+    "figure_bounds": [
+      0.04,
+      0.133,
+      0.92,
+      0.107
+    ],
+    "size_inches": [
+      14.976,
+      2.091
+    ],
+    "dpi": 300
+  },
+  {
+    "name": "06_evaluation_information",
+    "figure_bounds": [
+      0.04,
+      0.055,
+      0.92,
+      0.057
+    ],
+    "size_inches": [
+      14.976,
+      1.241
+    ],
+    "dpi": 300
+  },
+  {
+    "name": "07_roc_auc_card",
+    "figure_bounds": [
+      0.04,
+      0.133,
+      0.29,
+      0.107
+    ],
+    "size_inches": [
+      4.896,
+      2.091
+    ],
+    "dpi": 300
+  },
+  {
+    "name": "08_recall_card",
+    "figure_bounds": [
+      0.355,
+      0.133,
+      0.29,
+      0.107
+    ],
+    "size_inches": [
+      4.896,
+      2.091
+    ],
+    "dpi": 300
+  },
+  {
+    "name": "09_precision_card",
+    "figure_bounds": [
+      0.67,
+      0.133,
+      0.29,
+      0.107
+    ],
+    "size_inches": [
+      4.896,
+      2.091
+    ],
+    "dpi": 300
+  }
+]
